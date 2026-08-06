@@ -1,0 +1,9 @@
+.DS_Store
+hermes-agent-main/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+.build/
+*.swiftpm/xcode/package.xcworkspace/xcuserdata/
