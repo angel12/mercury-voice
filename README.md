@@ -99,6 +99,12 @@ Milestones 3–5 — voice:
 - [ ] Stop button ends speech and does *not* re-arm; mute/unmute behaves
 - [ ] iOS: conversation survives screen lock (background audio) and AirPods route changes
 
+macOS mute hotkey (Settings, ⌘,):
+- [ ] ⌘⇧M toggles mute during a conversation (default, app focused); Conversation menu shows the shortcut and flips Mute/Unmute
+- [ ] Recording a new combo in Settings updates the menu item; Esc cancels; bare letters beep (modifier required, F-keys exempt)
+- [ ] "Use shortcut system-wide" mutes while another app is frontmost (Carbon hotkey; no accessibility prompt) and doesn't double-toggle when the app is frontmost
+- [ ] Disabling the shortcut removes both the key equivalent and the global registration; settings persist across relaunch
+
 ## Known deviations from the desktop client (deliberate)
 
 - The streaming TTS path sends raw deltas (the server strips markdown per sentence); the desktop does the same — the client-side sanitizer is applied on the whole-clip fallback path, matching `playSpeechText`.
