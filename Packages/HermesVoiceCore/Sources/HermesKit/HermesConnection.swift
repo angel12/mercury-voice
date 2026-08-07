@@ -32,6 +32,7 @@ public actor HermesConnection {
     private var supervisor: Task<Void, Never>?
     private var everConnected = false
     private var reconnectPoke: CheckedContinuation<Void, Never>?
+    private var backoffTimer: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<Update>.Continuation] = [:]
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
@@ -80,6 +81,8 @@ public actor HermesConnection {
     public func stop() {
         supervisor?.cancel()
         supervisor = nil
+        backoffTimer?.cancel()
+        backoffTimer = nil
         reconnectPoke?.resume()
         reconnectPoke = nil
         let gateway = gateway
@@ -91,6 +94,8 @@ public actor HermesConnection {
     /// Skip the current backoff delay — call on app-foreground or
     /// network-path change.
     public func pokeReconnect() {
+        backoffTimer?.cancel()
+        backoffTimer = nil
         reconnectPoke?.resume()
         reconnectPoke = nil
     }
@@ -116,6 +121,7 @@ public actor HermesConnection {
                 try await client.connect()
             } catch {
                 await client.close(reason: nil)
+                if Task.isCancelled { return }  // stop() already published .stopped
                 if case HermesError.sessionExpired = error {
                     // The refresh token is dead — every redial would fail the
                     // same way. Stop; the user must sign in again.
@@ -130,6 +136,14 @@ public actor HermesConnection {
                 continue
             }
 
+            // stop() during the handshake only sees the published `gateway`
+            // (still nil here) — the local client must be closed explicitly
+            // or its socket and receive loop outlive the connection.
+            if Task.isCancelled {
+                await client.close(reason: "stopped")
+                return
+            }
+
             gateway = client
             attempt = 0
             publish(.phase(.ready(isReconnect: everConnected)))
@@ -142,7 +156,10 @@ public actor HermesConnection {
                 publish(.event(event))
             }
             gateway = nil
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                await client.close(reason: "stopped")
+                break
+            }
 
             let reason = await closeReason(of: client)
             publish(.phase(.disconnected(reason: reason)))
@@ -164,14 +181,19 @@ public actor HermesConnection {
         let delay = Double.random(in: 0...cap)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             reconnectPoke = cont
-            Task {
+            // The timer must die with the wait it belongs to: a stale timer
+            // surviving a pokeReconnect() would resume the NEXT backoff's
+            // continuation early and collapse the exponential delay.
+            backoffTimer = Task {
                 try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { return }
                 self.finishBackoff()
             }
         }
     }
 
     private func finishBackoff() {
+        backoffTimer = nil
         reconnectPoke?.resume()
         reconnectPoke = nil
     }

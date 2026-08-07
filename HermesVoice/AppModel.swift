@@ -41,6 +41,13 @@ final class AppModel {
     private let tokenStore = KeychainTokenStore()
     private var updatePump: Task<Void, Never>?
 
+    /// Monotonic guard for the connect flow: `connect()` suspends across the
+    /// status/validation probes, so an overlapping connect (second saved-server
+    /// tap) or a disconnect can land mid-flight. Only the newest generation may
+    /// publish state; stale tasks bail at each resume point instead of
+    /// overwriting `connection` and orphaning a live gateway.
+    private var connectGeneration = 0
+
     // MARK: Saved servers
 
     struct SavedServer: Codable, Identifiable {
@@ -109,6 +116,8 @@ final class AppModel {
 
     func connect(endpoint: ServerEndpoint, credentials: ServerCredentials?) async {
         disconnect()
+        connectGeneration += 1
+        let generation = connectGeneration
         connectError = nil
         pendingPasswordLogin = nil
         self.endpoint = endpoint
@@ -125,6 +134,7 @@ final class AppModel {
         let probe = HermesRESTClient(endpoint: endpoint, authenticator: authenticator)
         do {
             let status = try await probe.status()
+            guard generation == connectGeneration else { return }
             serverStatus = status
 
             var isPasswordMode = false
@@ -132,19 +142,24 @@ final class AppModel {
             if status.authRequired, !isPasswordMode {
                 // Gated bind — a loopback session token can't authenticate.
                 // Offer username/password sign-in when the server supports it.
-                await presentGatedLogin(endpoint: endpoint)
+                await presentGatedLogin(endpoint: endpoint, generation: generation)
                 return
             }
             try await probe.validateToken()
+            guard generation == connectGeneration else { return }
         } catch HermesError.sessionExpired {
+            guard generation == connectGeneration else { return }
             await presentGatedLogin(
                 endpoint: endpoint,
-                note: HermesError.sessionExpired.errorDescription)
+                note: HermesError.sessionExpired.errorDescription,
+                generation: generation)
             return
         } catch let error as HermesError {
+            guard generation == connectGeneration else { return }
             connectError = error.errorDescription
             return
         } catch {
+            guard generation == connectGeneration else { return }
             connectError = "Could not reach \(endpoint.displayName): \(error.localizedDescription)"
             return
         }
@@ -189,9 +204,14 @@ final class AppModel {
 
     /// Look up the gated server's sign-in options; surface the password form
     /// when available, else explain that OAuth-only servers aren't supported.
-    private func presentGatedLogin(endpoint: ServerEndpoint, note: String? = nil) async {
+    /// `generation` ties the mutation to the connect attempt that asked for it;
+    /// pass nil when there is no competing connect flow (auth-expiry pump).
+    private func presentGatedLogin(
+        endpoint: ServerEndpoint, note: String? = nil, generation: Int? = nil
+    ) async {
         let providers =
             (try? await HermesAuthenticator.authProviders(endpoint: endpoint)) ?? []
+        if let generation, generation != connectGeneration { return }
         guard let passwordProvider = providers.first(where: \.supportsPassword) else {
             connectError =
                 "This server only offers browser (OAuth) sign-in, which this app doesn't support. Configure dashboard.basic_auth on the server for username/password access, or run it on loopback."
@@ -210,13 +230,21 @@ final class AppModel {
     }
 
     func disconnect() {
+        connectGeneration += 1  // invalidate any in-flight connect()
         updatePump?.cancel()
         updatePump = nil
-        if let connection {
-            Task { await connection.stop() }
+        let connection = connection
+        let conversation = conversation
+        self.connection = nil
+        self.conversation = nil
+        if connection != nil || conversation != nil {
+            // Teardown closes the backend session over the gateway, so it
+            // must complete before the connection stops.
+            Task {
+                await conversation?.teardown()
+                await connection?.stop()
+            }
         }
-        connection = nil
-        conversation = nil
         phase = .stopped
         profiles = []
         projectTree = nil
