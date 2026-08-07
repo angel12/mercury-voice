@@ -16,6 +16,13 @@ public actor SpeakStreamSession: SpeechStreaming {
     private var outcome: SpeechStreamOutcome?
     private var waiters: [CheckedContinuation<SpeechStreamOutcome, Never>] = []
     private var receiveTask: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
+
+    /// Max silence tolerated after `{"done": true}` before declaring the peer
+    /// wedged. Armed only post-`finish()` — mid-reply gaps are legitimate
+    /// (the agent may pause between sentences), but once the full text is in,
+    /// the server owes us frames until `end`.
+    private static let completionGrace: Duration = .seconds(30)
 
     public init(url: URL) {
         let config = URLSessionConfiguration.ephemeral
@@ -46,6 +53,7 @@ public actor SpeakStreamSession: SpeechStreaming {
         guard !finished, outcome == nil else { return }
         finished = true
         send(#"{"done": true}"#)
+        armWatchdog()
     }
 
     public func waitDone() async -> SpeechStreamOutcome {
@@ -69,6 +77,7 @@ public actor SpeakStreamSession: SpeechStreaming {
         while outcome == nil {
             do {
                 let message = try await task.receive()
+                if finished { armWatchdog() }  // any frame counts as liveness
                 switch message {
                 case .data(let data):
                     if !started { started = true }
@@ -110,6 +119,10 @@ public actor SpeakStreamSession: SpeechStreaming {
                 settle(.fallback)
             }
         case "end":
+            // Synthesis is complete; draining queued audio may legitimately
+            // outlast the grace window, so the watchdog stands down here.
+            watchdog?.cancel()
+            watchdog = nil
             Task {
                 await self.player.drain()
                 self.settleAfterDrain()
@@ -125,9 +138,27 @@ public actor SpeakStreamSession: SpeechStreaming {
         settle(.done)
     }
 
+    private func armWatchdog() {
+        watchdog?.cancel()
+        watchdog = Task {
+            try? await Task.sleep(for: Self.completionGrace)
+            guard !Task.isCancelled else { return }
+            self.watchdogFired()
+        }
+    }
+
+    private func watchdogFired() {
+        guard outcome == nil else { return }
+        // The peer went silent after `done`: salvage what played, or report
+        // fallback so the engine can speak the reply another way.
+        settle(started ? .done : .fallback)
+    }
+
     private func settle(_ result: SpeechStreamOutcome) {
         guard outcome == nil else { return }
         outcome = result
+        watchdog?.cancel()
+        watchdog = nil
         receiveTask?.cancel()
         task.cancel(with: .normalClosure, reason: nil)
         urlSession.invalidateAndCancel()
