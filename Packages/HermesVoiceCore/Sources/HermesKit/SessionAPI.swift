@@ -1,10 +1,24 @@
 import Foundation
+import os
+
+/// Outcome of `session.close`. The server replies `{"closed": true}` when the
+/// runtime session actually shut down; anything else means it may still be
+/// holding resources (sockets, profile DB handles) on the backend.
+public enum SessionCloseOutcome: Sendable, Equatable {
+    /// Server confirmed `closed: true`.
+    case closed
+    /// RPC succeeded but the server did not confirm (`closed` missing/false).
+    case unconfirmed
+    /// The request itself failed (transport error, timeout, not connected).
+    case failed(String)
+}
 
 /// Typed wrappers over the gateway RPC methods the app uses.
 extension HermesConnection {
     /// Column count reported to the backend; matches the desktop client.
     private static let cols = 96
     private static let source = "desktop"
+    private static let logger = Logger(subsystem: "HermesVoice", category: "HermesKit")
 
     // MARK: Sessions
 
@@ -79,9 +93,31 @@ extension HermesConnection {
         _ = try await request("session.interrupt", params: ["session_id": .string(sessionID)])
     }
 
-    /// Detach politely when leaving a session.
-    public func closeSession(sessionID: String) async {
-        _ = try? await request("session.close", params: ["session_id": .string(sessionID)])
+    /// Detach politely when leaving a session, verifying the server's answer:
+    /// an unconfirmed or failed close means the backend may still hold the
+    /// session's sockets and profile DB handles. Every outcome is logged so
+    /// leak investigations don't have to guess whether End reached the server.
+    @discardableResult
+    public func closeSession(sessionID: String) async -> SessionCloseOutcome {
+        do {
+            let result = try await request(
+                "session.close", params: ["session_id": .string(sessionID)])
+            if result["closed"]?.truthy == true {
+                Self.logger.info(
+                    "session.close confirmed for \(sessionID, privacy: .public)")
+                return .closed
+            }
+            Self.logger.error(
+                "session.close NOT confirmed for \(sessionID, privacy: .public): \("\(result)", privacy: .public)"
+            )
+            return .unconfirmed
+        } catch {
+            let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
+            Self.logger.error(
+                "session.close failed for \(sessionID, privacy: .public): \(reason, privacy: .public)"
+            )
+            return .failed(reason)
+        }
     }
 
     // MARK: Projects
