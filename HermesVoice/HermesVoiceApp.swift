@@ -3,6 +3,9 @@ import SwiftUI
 @main
 struct HermesVoiceApp: App {
     @State private var model = AppModel()
+    #if os(macOS)
+        @State private var muteHotkey = MuteHotkeyManager()
+    #endif
 
     var body: some Scene {
         WindowGroup {
@@ -10,13 +13,63 @@ struct HermesVoiceApp: App {
                 .environment(model)
                 #if os(macOS)
                     .frame(minWidth: 480, minHeight: 560)
+                    .onAppear {
+                        muteHotkey.onToggleMute = {
+                            model.conversation?.toggleMute()
+                        }
+                    }
                 #endif
         }
         #if os(macOS)
             .windowResizability(.contentSize)
+            .commands {
+                ConversationCommands(model: model, hotkey: muteHotkey)
+            }
+        #endif
+
+        #if os(macOS)
+            Settings {
+                SettingsView(hotkey: muteHotkey)
+            }
         #endif
     }
 }
+
+#if os(macOS)
+    /// Menu commands for the live conversation. The mute item carries the
+    /// user-configured key equivalent; in system-wide mode the Carbon
+    /// registration consumes the key first, so the equivalent doubles as a
+    /// menu hint without ever firing twice.
+    struct ConversationCommands: Commands {
+        let model: AppModel
+        let hotkey: MuteHotkeyManager
+
+        var body: some Commands {
+            CommandMenu("Conversation") {
+                Group {
+                    muteItem
+                    Button("End Turn") { model.conversation?.endTurnNow() }
+                        .keyboardShortcut(.return, modifiers: .command)
+                    Button("Stop Speaking") { model.conversation?.stopSpeech() }
+                        .keyboardShortcut(".", modifiers: .command)
+                }
+                .disabled(model.conversation == nil)
+            }
+        }
+
+        @ViewBuilder private var muteItem: some View {
+            let muted = model.conversation?.voiceState.muted == true
+            let mute = Button(muted ? "Unmute Microphone" : "Mute Microphone") {
+                model.conversation?.toggleMute()
+            }
+            if hotkey.enabled, let key = hotkey.combo.keyEquivalent {
+                mute.keyboardShortcut(key, modifiers: hotkey.combo.eventModifiers)
+            } else {
+                mute
+            }
+        }
+    }
+#endif
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
