@@ -8,6 +8,9 @@ struct ConversationView: View {
     @Environment(AppModel.self) private var model
     @Bindable var controller: ConversationController
     @State private var showDevChat = false
+    #if os(iOS)
+        @State private var showAudioDevices = false
+    #endif
 
     /// All presentations share ONE sheet modifier. Stacking several
     /// sheet/alert modifiers on the same node faults ("Invalid
@@ -18,12 +21,14 @@ struct ConversationView: View {
         case approval(ApprovalRequest)
         case clarify(ClarifyRequest)
         case dev
+        case audio
 
         var id: String {
             switch self {
             case .approval(let request): return "approval-\(request.sessionID)"
             case .clarify(let request): return "clarify-\(request.requestID)"
             case .dev: return "dev"
+            case .audio: return "audio"
             }
         }
     }
@@ -34,12 +39,21 @@ struct ConversationView: View {
                 if let approval = controller.approval { return .approval(approval) }
                 if let clarify = controller.clarify { return .clarify(clarify) }
                 if showDevChat { return .dev }
+                #if os(iOS)
+                    if showAudioDevices { return .audio }
+                #endif
                 return nil
             },
             set: { newValue in
-                // Only the dev sheet is interactively dismissible; the prompt
-                // sheets clear through their respond buttons.
-                if newValue == nil { showDevChat = false }
+                // Only the dev and audio sheets are interactively
+                // dismissible; the prompt sheets clear through their respond
+                // buttons.
+                if newValue == nil {
+                    showDevChat = false
+                    #if os(iOS)
+                        showAudioDevices = false
+                    #endif
+                }
             })
     }
 
@@ -85,6 +99,14 @@ struct ConversationView: View {
                     .interactiveDismissDisabled()
             case .dev:
                 DevChatView(controller: controller)
+            case .audio:
+                // Only reachable on iOS; macOS picks devices in Settings.
+                #if os(iOS)
+                    AudioDevicesSheet()
+                        .presentationDetents([.medium])
+                #else
+                    EmptyView()
+                #endif
             }
         }
         .onChange(of: controller.didEndByStopWord) { _, ended in
@@ -124,6 +146,17 @@ struct ConversationView: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
+            #if os(iOS)
+                // macOS picks devices in Settings (⌘,); iOS needs an
+                // in-conversation entry point.
+                Button {
+                    showAudioDevices = true
+                } label: {
+                    Image(systemName: "headphones")
+                }
+                .buttonStyle(.borderless)
+                .help("Audio devices")
+            #endif
             Button {
                 showDevChat = true
             } label: {
