@@ -131,6 +131,7 @@ final class FakeRecorder: VoiceRecording, @unchecked Sendable {
 final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     private let lock = NSLock()
     private var _startCount = 0
+    private var _suspended = false
     private var _onSpeech: (@Sendable () -> Void)?
     private var _onUtterance: (@Sendable (RecordedUtterance?) -> Void)?
 
@@ -142,6 +143,7 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
 
     var startCount: Int { locked { _startCount } }
     var isActive: Bool { locked { _onSpeech != nil } }
+    var isSuspended: Bool { locked { _suspended } }
 
     func start(
         isPlaying: @escaping @Sendable () async -> Bool,
@@ -150,6 +152,7 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     ) async throws {
         locked {
             _startCount += 1
+            _suspended = false
             _onSpeech = onSpeech
             _onUtterance = onUtterance
         }
@@ -157,9 +160,14 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
 
     func stop() async {
         locked {
+            _suspended = false
             _onSpeech = nil
             _onUtterance = nil
         }
+    }
+
+    func setSuspended(_ newValue: Bool) async {
+        locked { _suspended = newValue }
     }
 
     func trip() {
