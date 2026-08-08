@@ -37,12 +37,22 @@ public final class AudioCaptureService: @unchecked Sendable {
     private var engine: AVAudioEngine?
     private var streams: [UUID: AsyncStream<AudioChunk>.Continuation] = [:]
     private var levelHandler: (@Sendable (Double) -> Void)?
+    #if os(iOS)
+        // Input port UID the running engine was built on, to detect real
+        // input switches among the route-change noise.
+        private var engineInputUID: String?
+    #endif
 
     public init() {
         #if os(iOS)
-            // A device appearing/vanishing (e.g. a Bluetooth headset) changes
-            // the input route; the running tap keeps the old device and
-            // format unless the engine is rebuilt on the new route.
+            // The input route moves when a device appears/vanishes (e.g. a
+            // Bluetooth headset) or when the user picks another mic
+            // (`setPreferredInput` applies asynchronously, announced as
+            // `.routeConfigurationChange`). The running tap keeps the old
+            // device and format unless the engine is rebuilt on the new
+            // route — but only rebuild when the input port actually changed:
+            // enabling voice processing at engine start emits route churn of
+            // its own, and restarting on that would loop.
             NotificationCenter.default.addObserver(
                 forName: AVAudioSession.routeChangeNotification,
                 object: nil, queue: nil
@@ -52,11 +62,22 @@ public final class AudioCaptureService: @unchecked Sendable {
                         as? UInt,
                     let reason = AVAudioSession.RouteChangeReason(rawValue: raw),
                     reason == .newDeviceAvailable || reason == .oldDeviceUnavailable
+                        || reason == .override || reason == .routeConfigurationChange
                 else { return }
-                self?.restartEngineIfRunning()
+                self?.restartIfInputRouteChanged()
             }
         #endif
     }
+
+    #if os(iOS)
+        private func restartIfInputRouteChanged() {
+            let currentUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
+            lock.lock()
+            let changed = engine != nil && engineInputUID != currentUID
+            lock.unlock()
+            if changed { restartEngineIfRunning() }
+        }
+    #endif
 
     /// Live input level for the UI meter — set/cleared by the app.
     public func setLevelHandler(_ handler: (@Sendable (Double) -> Void)?) {
@@ -175,11 +196,17 @@ public final class AudioCaptureService: @unchecked Sendable {
             throw error
         }
 
+        #if os(iOS)
+            let inputUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
+        #endif
         lock.lock()
         // A route-change restart can race openStream's start; keep whichever
         // engine won and discard the loser.
         if self.engine == nil {
             self.engine = engine
+            #if os(iOS)
+                engineInputUID = inputUID
+            #endif
             lock.unlock()
         } else {
             lock.unlock()
