@@ -29,6 +29,11 @@ final class PCMStreamPlayer: @unchecked Sendable {
         engine.attach(node)
         // The engine resamples from the stream rate to the hardware rate.
         engine.connect(node, to: engine.mainMixerNode, format: format)
+        #if os(macOS)
+            // Pin playback to the user-selected output; on iOS the system
+            // route (or the route picker) decides.
+            MacAudioDevices.applyPreferredOutput(to: engine)
+        #endif
         engine.prepare()
         try engine.start()
         node.play()

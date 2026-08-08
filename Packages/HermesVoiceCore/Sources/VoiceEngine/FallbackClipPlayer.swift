@@ -19,6 +19,15 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, @unchecked Send
             lock.lock()
             do {
                 let player = try AVAudioPlayer(data: data)
+                #if os(macOS)
+                    // Honor the selected output; only pass UIDs that resolve
+                    // to a live device — a stale UID would fail playback.
+                    if let uid = AudioDevicePreference.outputUID,
+                        MacAudioDevices.resolve(uid: uid) != nil
+                    {
+                        player.currentDevice = uid
+                    }
+                #endif
                 player.delegate = self
                 self.player = player
                 self.finishContinuation = continuation
