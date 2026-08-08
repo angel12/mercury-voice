@@ -110,6 +110,10 @@ public final class AudioDeviceCatalog {
 
     private func applyInputSelection() {
         #if os(iOS)
+            // `setPreferredInput` applies asynchronously; restarting the
+            // engine here would rebuild it on the old route. The capture
+            // service watches for the resulting route change and rebuilds a
+            // running engine once the input has actually moved.
             let session = AVAudioSession.sharedInstance()
             if let uid = selectedInputUID,
                 let port = session.availableInputs?.first(where: { $0.uid == uid })
@@ -118,10 +122,11 @@ public final class AudioDeviceCatalog {
             } else {
                 try? session.setPreferredInput(nil)
             }
+        #else
+            // Rebuild a running capture engine on the newly selected device;
+            // a no-op when no conversation is active.
+            AudioCaptureService.shared.reconfigure()
         #endif
-        // Rebuild a running capture engine on the newly selected device; a
-        // no-op when no conversation is active.
-        AudioCaptureService.shared.reconfigure()
     }
 
     private func startObservingDeviceChanges() {
