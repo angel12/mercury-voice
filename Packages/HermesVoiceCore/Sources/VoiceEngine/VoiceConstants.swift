@@ -38,6 +38,9 @@ public enum VoiceConstants {
     /// A barge-in latch older than this no longer marks the next submit as
     /// `interrupted`.
     public static let interruptedLatchTTL: Duration = .seconds(120)
+    /// Cadence of the "still thinking" cue while status stays `.thinking`.
+    /// (No desktop counterpart — the cues are a mobile addition, issue #15.)
+    public static let thinkingChimeInterval: Duration = .seconds(5)
 
     // MARK: Barge-in monitor (voice-barge-in.ts)
 

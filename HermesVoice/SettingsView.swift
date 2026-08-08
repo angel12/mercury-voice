@@ -7,6 +7,7 @@
     struct SettingsView: View {
         @Bindable var hotkey: MuteHotkeyManager
         var devices = AudioDeviceCatalog.shared
+        @AppStorage(CuePreference.key) private var cuesEnabled = true
 
         var body: some View {
             Form {
@@ -15,6 +16,14 @@
                     AudioOutputPicker(devices: devices)
                     Text(
                         "A microphone change applies immediately, even mid-conversation. An output change applies from the next spoken reply."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Section("Sounds") {
+                    Toggle("Conversation cues", isOn: $cuesEnabled)
+                    Text(
+                        "A short blip confirms your speech was captured; a soft tick every few seconds means the agent is still thinking."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

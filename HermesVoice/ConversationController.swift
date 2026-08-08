@@ -50,6 +50,7 @@ final class ConversationController {
     private var engine: ConversationEngine<ContinuousClock>?
     private let speech: HermesSpeechOutput
     private let capture = AudioCaptureService.shared
+    private let cues = ConversationCuePlayer()
     private var stateTask: Task<Void, Never>?
     private var captionTask: Task<Void, Never>?
 
@@ -174,7 +175,9 @@ final class ConversationController {
                 },
                 onNotice: { [weak self] message in
                     Task { @MainActor in self?.notice = message }
-                }),
+                },
+                onTurnCaptured: { [cues] in cues.playTurnCaptured() },
+                onThinkingTick: { [cues] in cues.playThinkingTick() }),
             clock: ContinuousClock())
         self.engine = engine
 
