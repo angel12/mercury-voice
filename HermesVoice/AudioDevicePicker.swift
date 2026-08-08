@@ -55,6 +55,7 @@ struct AudioInputPicker: View {
     struct AudioDevicesSheet: View {
         var devices = AudioDeviceCatalog.shared
         @Environment(\.dismiss) private var dismiss
+        @AppStorage(CuePreference.key) private var cuesEnabled = true
 
         var body: some View {
             NavigationStack {
@@ -74,6 +75,14 @@ struct AudioInputPicker: View {
                         Text("Output is chosen with the system route picker.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    Section("Sounds") {
+                        Toggle("Conversation cues", isOn: $cuesEnabled)
+                        Text(
+                            "A short blip confirms your speech was captured; a soft tick every few seconds means the agent is still thinking."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
                 .navigationTitle("Audio")
