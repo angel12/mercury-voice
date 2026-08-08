@@ -17,6 +17,14 @@ public enum AudioSessionManager {
                 mode: .voiceChat,
                 options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
             try session.setActive(true)
+            // Re-assert the user's mic choice; preferred input resets when
+            // the session deactivates. Best-effort — a missing device just
+            // leaves the system's route.
+            if let uid = AudioDevicePreference.inputUID,
+                let port = session.availableInputs?.first(where: { $0.uid == uid })
+            {
+                try? session.setPreferredInput(port)
+            }
         }
 
         public static func deactivate() {
