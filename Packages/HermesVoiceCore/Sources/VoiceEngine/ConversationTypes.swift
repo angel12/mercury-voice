@@ -150,15 +150,26 @@ public struct ConversationCallbacks: Sendable {
     public var onStopWord: @Sendable () -> Void
     public var onFatalError: @Sendable (String) -> Void
     public var onNotice: @Sendable (String) -> Void
+    /// A listening turn closed with speech that is being sent for
+    /// transcription (both the VAD path and the barge-in capture path).
+    /// Fires before the transcript exists — silence-only turns never fire it.
+    public var onTurnCaptured: @Sendable () -> Void
+    /// Periodic tick while the agent is thinking (status == .thinking),
+    /// every `VoiceConstants.thinkingChimeInterval`; suppressed while paused.
+    public var onThinkingTick: @Sendable () -> Void
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
         onFatalError: @escaping @Sendable (String) -> Void = { _ in },
-        onNotice: @escaping @Sendable (String) -> Void = { _ in }
+        onNotice: @escaping @Sendable (String) -> Void = { _ in },
+        onTurnCaptured: @escaping @Sendable () -> Void = {},
+        onThinkingTick: @escaping @Sendable () -> Void = {}
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
         self.onNotice = onNotice
+        self.onTurnCaptured = onTurnCaptured
+        self.onThinkingTick = onThinkingTick
     }
 }
 

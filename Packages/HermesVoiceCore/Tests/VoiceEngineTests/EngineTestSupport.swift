@@ -32,6 +32,11 @@ final class TestClock: Clock, @unchecked Sendable {
     var now: Instant { locked { currentNow } }
     var minimumResolution: Duration { .zero }
 
+    /// How many tasks are currently parked in `sleep` — lets tests wait for a
+    /// timer to actually arm before advancing (advancing first would leave
+    /// the late sleeper with a pushed-out deadline).
+    var sleeperCount: Int { locked { sleepers.count } }
+
     func sleep(until deadline: Instant, tolerance: Duration?) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {
