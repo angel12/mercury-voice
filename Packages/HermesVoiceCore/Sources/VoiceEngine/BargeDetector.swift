@@ -20,6 +20,8 @@ public struct BargeDetector: Sendable {
 
     private var floorSamples: [Double] = []
     private var quietFloor: Double = 0
+    private var echoSamples: [Double] = []
+    private var echoFloor: Double = 0
     private var floorLocked = false
     private var calibratedSince: Duration?
     private var everSawPlayback = false
@@ -60,6 +62,12 @@ public struct BargeDetector: Sendable {
             }
             everSawPlayback = true
             lastPlayingAt = now
+            // Every playback-phase level feeds the echo median (issue #12):
+            // with output on a separate engine the system AEC has no
+            // reference, so the mic hears the speakers and the trigger must
+            // ride above that. User speech is brief relative to the window,
+            // so the median tracks the echo, not the interruption.
+            pushEchoSample(level)
         }
         wasQuietLastHop = !playing
 
@@ -69,6 +77,12 @@ public struct BargeDetector: Sendable {
             trigger = min(
                 max(trigger, VoiceConstants.bargePlaybackMinTrigger),
                 VoiceConstants.bargeTriggerCeiling)
+            // The echo term is deliberately not capped by the ceiling: when
+            // the speakers are loud enough that echo alone exceeds it, any
+            // lower trigger just loops the agent's voice back at itself.
+            if echoSamples.count >= VoiceConstants.bargeEchoMinSamples {
+                trigger = max(trigger, echoFloor * VoiceConstants.bargeEchoFloorMultiplier)
+            }
         }
 
         // Post-lock drift: quiet samples below the trigger keep feeding the
@@ -124,6 +138,15 @@ public struct BargeDetector: Sendable {
         // Upper median, matching the reference's `sorted[length >> 1]`.
         let sorted = floorSamples.sorted()
         quietFloor = sorted[sorted.count >> 1]
+    }
+
+    private mutating func pushEchoSample(_ level: Double) {
+        echoSamples.append(level)
+        if echoSamples.count > VoiceConstants.bargeEchoSampleCap {
+            echoSamples.removeFirst()
+        }
+        let sorted = echoSamples.sorted()
+        echoFloor = sorted[sorted.count >> 1]
     }
 }
 

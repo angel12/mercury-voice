@@ -161,6 +161,36 @@ struct WAVEncoderTests {
     }
 }
 
+@Suite("Echo guard")
+struct EchoGuardTests {
+    private let reply = "The weather today is sunny and warm, around seventy degrees."
+
+    @Test func verbatimEchoMatches() {
+        #expect(EchoGuard.isLikelyEcho(transcript: "the weather today is sunny", reply: reply))
+    }
+
+    @Test func echoWithOneMisheardWordMatches() {
+        // 4 of 5 words present (0.8): STT mangling a word must not defeat it.
+        #expect(
+            EchoGuard.isLikelyEcho(transcript: "the whether today is sunny", reply: reply))
+    }
+
+    @Test func genuineInterruptionDoesNotMatch() {
+        #expect(
+            !EchoGuard.isLikelyEcho(transcript: "no, do it differently please", reply: reply))
+    }
+
+    @Test func punctuationAndCaseAreIgnored() {
+        #expect(
+            EchoGuard.isLikelyEcho(transcript: "Sunny — and WARM!", reply: reply))
+    }
+
+    @Test func emptyTranscriptIsNotEcho() {
+        #expect(!EchoGuard.isLikelyEcho(transcript: "  ", reply: reply))
+        #expect(!EchoGuard.isLikelyEcho(transcript: "hello", reply: ""))
+    }
+}
+
 @Suite("Barge detector")
 struct BargeDetectorTests {
     private let hop = Duration.milliseconds(50)
@@ -213,8 +243,30 @@ struct BargeDetectorTests {
             #expect(verdict == .quiet)
             now += hop
         }
-        // After grace expires, sustained speech does trip.
-        let tripped = feed(&detector, level: 0.3, hops: 12, playing: true, from: now)
+        // After grace, speech OVER the learned 0.3 echo floor does trip.
+        let tripped = feed(&detector, level: 0.6, hops: 12, playing: true, from: now)
+        #expect(tripped?.verdict == .tripped)
+    }
+
+    @Test func sustainedPlaybackEchoNeverTrips() {
+        // Issue #12's loop scenario: speaker output leaking into the mic at a
+        // steady speech-like level for the whole reply must not barge.
+        var detector = BargeDetector()
+        _ = feed(&detector, level: 0.01, hops: 10, playing: false, from: .zero)
+        let result = feed(
+            &detector, level: 0.3, hops: 100, playing: true, from: .milliseconds(500))
+        #expect(result == nil)
+    }
+
+    @Test func speechOverPlaybackEchoTrips() {
+        var detector = BargeDetector()
+        _ = feed(&detector, level: 0.01, hops: 10, playing: false, from: .zero)
+        // A second of steady echo, then the user talks over it.
+        #expect(
+            feed(&detector, level: 0.2, hops: 20, playing: true, from: .milliseconds(500))
+                == nil)
+        let tripped = feed(
+            &detector, level: 0.5, hops: 12, playing: true, from: .milliseconds(1500))
         #expect(tripped?.verdict == .tripped)
     }
 
