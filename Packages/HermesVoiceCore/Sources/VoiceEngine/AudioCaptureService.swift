@@ -38,7 +38,25 @@ public final class AudioCaptureService: @unchecked Sendable {
     private var streams: [UUID: AsyncStream<AudioChunk>.Continuation] = [:]
     private var levelHandler: (@Sendable (Double) -> Void)?
 
-    public init() {}
+    public init() {
+        #if os(iOS)
+            // A device appearing/vanishing (e.g. a Bluetooth headset) changes
+            // the input route; the running tap keeps the old device and
+            // format unless the engine is rebuilt on the new route.
+            NotificationCenter.default.addObserver(
+                forName: AVAudioSession.routeChangeNotification,
+                object: nil, queue: nil
+            ) { [weak self] notification in
+                guard
+                    let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey]
+                        as? UInt,
+                    let reason = AVAudioSession.RouteChangeReason(rawValue: raw),
+                    reason == .newDeviceAvailable || reason == .oldDeviceUnavailable
+                else { return }
+                self?.restartEngineIfRunning()
+            }
+        #endif
+    }
 
     /// Live input level for the UI meter — set/cleared by the app.
     public func setLevelHandler(_ handler: (@Sendable (Double) -> Void)?) {
@@ -86,6 +104,38 @@ public final class AudioCaptureService: @unchecked Sendable {
         }
     }
 
+    /// Tear down and rebuild the engine on the current route, keeping every
+    /// consumer stream attached. Consumers see a brief gap and then chunks in
+    /// the new route's format (they already track sampleRate per chunk).
+    private func restartEngineIfRunning() {
+        lock.lock()
+        let engine = self.engine
+        self.engine = nil
+        lock.unlock()
+        guard let engine else { return }
+
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+
+        lock.lock()
+        let hasConsumers = !streams.isEmpty
+        lock.unlock()
+        guard hasConsumers else { return }
+        // Best-effort: if the new route can't start (e.g. no input mid-swap),
+        // finish the streams so consumers end their turn instead of hanging.
+        do {
+            try startEngine()
+        } catch {
+            lock.lock()
+            let continuations = Array(streams.values)
+            streams.removeAll()
+            lock.unlock()
+            for continuation in continuations {
+                continuation.finish()
+            }
+        }
+    }
+
     private func startEngine() throws {
         #if os(iOS)
             try AudioSessionManager.activateForVoice()
@@ -114,8 +164,16 @@ public final class AudioCaptureService: @unchecked Sendable {
         }
 
         lock.lock()
-        self.engine = engine
-        lock.unlock()
+        // A route-change restart can race openStream's start; keep whichever
+        // engine won and discard the loser.
+        if self.engine == nil {
+            self.engine = engine
+            lock.unlock()
+        } else {
+            lock.unlock()
+            input.removeTap(onBus: 0)
+            engine.stop()
+        }
     }
 
     private func deliver(buffer: AVAudioPCMBuffer) {
