@@ -244,6 +244,38 @@ struct ConversationEngineTests {
         #expect(await h.status(is: .idle))
     }
 
+    @Test func bargeCaptureEchoingTheReplyIsDroppedNotSubmitted() async {
+        // Issue #12: with speakers on, the mic hears the agent's own speech;
+        // its transcript must never be submitted back as a user turn.
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(
+            PendingSpeech(id: "0", text: "The weather today is sunny and warm.", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        // Wait for a feed tick so the engine has snapshotted the reply text.
+        #expect(await eventually { h.speech.currentStream?.appendedText.isEmpty == false })
+        h.agent.setBusy(false)
+
+        h.barge.trip()
+        #expect(await eventually { await h.speech.sequence >= 2 })  // playback stopped
+        h.transcriber.queue("the weather today is sunny")
+        h.barge.deliver(makeUtterance())
+
+        // The drop path re-arms the mic (a second recorder start) without
+        // ever submitting the echo.
+        #expect(await eventually { h.recorder.startCount == 2 })
+        #expect(await h.status(is: .listening))
+        #expect(h.agent.submissions.count == 1)  // only the kickoff turn
+
+        // A genuine turn still goes through afterwards.
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.queue("actually, what about tomorrow?")
+        h.recorder.fireAutoStop()
+        #expect(await eventually { h.agent.submissions.count == 2 })
+        #expect(h.agent.submissions.last?.text == "actually, what about tomorrow?")
+    }
+
     @Test func emptyBargeCaptureResumesListening() async {
         let h = Harness()
         await h.enterThinking()

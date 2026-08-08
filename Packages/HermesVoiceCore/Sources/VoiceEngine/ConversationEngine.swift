@@ -29,6 +29,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private var responseID: String?
     private var spokenSourceLength = 0
     private var speechSession: (any SpeechStreaming)?
+    /// The reply text being spoken this turn, kept for the self-echo check on
+    /// barge captures (issue #12).
+    private var spokenReplyText: String?
     private var bargeMonitorActive = false
     private var bargeCapturePending = false
     private var barged = false
@@ -446,6 +449,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         guard let session = speechSession, self.responseID == responseID else { return }
         let response = await agent.pendingSpeech()
         if let response, response.id == responseID {
+            spokenReplyText = response.text
             let count = response.text.count
             if count > spokenSourceLength {
                 let tail = String(response.text.dropFirst(spokenSourceLength))
@@ -472,6 +476,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                 return
             }
             if !response.pending, !(await agent.isBusy) {
+                spokenReplyText = response.text
                 await ensureBargeMonitor()
                 // Deviation from the desktop (deliberate): stop + capture the
                 // sequence BEFORE playback so a user Stop mid-clip is seen by
@@ -524,6 +529,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         bargeCapturePending = false
         barged = false
         speechSession = nil
+        spokenReplyText = nil
         responseID = nil
         spokenSourceLength = 0
     }
@@ -625,6 +631,14 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
         if StopWords.isStopCommand(trimmed) {
             await endConversationOnStopWord()
+            return
+        }
+        // Self-echo (issue #12): a capture that just repeats the reply being
+        // spoken is the speakers, not the user — submitting it would loop the
+        // agent's voice back at itself. Drop it and re-open the mic.
+        if let reply = spokenReplyText, EchoGuard.isLikelyEcho(transcript: trimmed, reply: reply) {
+            resumeListening()
+            await drive()
             return
         }
 
