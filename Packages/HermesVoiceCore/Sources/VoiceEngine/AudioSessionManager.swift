@@ -8,10 +8,14 @@ public enum AudioSessionManager {
     #if os(iOS)
         public static func activateForVoice() throws {
             let session = AVAudioSession.sharedInstance()
+            // HFP is the only Bluetooth profile with a mic channel; A2DP is
+            // output-only. With both allowed the system uses HFP while the
+            // mic is active, so headset input works at the cost of call-grade
+            // output quality during the conversation.
             try session.setCategory(
                 .playAndRecord,
                 mode: .voiceChat,
-                options: [.defaultToSpeaker, .allowBluetoothA2DP])
+                options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
             try session.setActive(true)
         }
 
