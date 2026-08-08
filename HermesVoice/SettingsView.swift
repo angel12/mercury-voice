@@ -1,13 +1,24 @@
 #if os(macOS)
     import Carbon.HIToolbox
     import SwiftUI
+    import VoiceEngine
 
-    /// App settings (⌘,): the microphone mute shortcut.
+    /// App settings (⌘,): audio devices and the microphone mute shortcut.
     struct SettingsView: View {
         @Bindable var hotkey: MuteHotkeyManager
+        var devices = AudioDeviceCatalog.shared
 
         var body: some View {
             Form {
+                Section("Audio Devices") {
+                    AudioInputPicker(devices: devices)
+                    AudioOutputPicker(devices: devices)
+                    Text(
+                        "A microphone change applies immediately, even mid-conversation. An output change applies from the next spoken reply."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
                 Section("Microphone") {
                     Toggle("Mute/unmute shortcut", isOn: $hotkey.enabled)
                     LabeledContent("Shortcut") {
@@ -27,6 +38,7 @@
             }
             .formStyle(.grouped)
             .frame(width: 420)
+            .onAppear { devices.refresh() }
         }
     }
 

@@ -104,6 +104,12 @@ public final class AudioCaptureService: @unchecked Sendable {
         }
     }
 
+    /// The selected input device changed: rebuild a running engine on it.
+    /// No-op when idle — the next start picks up the new selection anyway.
+    public func reconfigure() {
+        restartEngineIfRunning()
+    }
+
     /// Tear down and rebuild the engine on the current route, keeping every
     /// consumer stream attached. Consumers see a brief gap and then chunks in
     /// the new route's format (they already track sampleRate per chunk).
@@ -146,6 +152,12 @@ public final class AudioCaptureService: @unchecked Sendable {
         // Echo cancellation + noise suppression (mirrors the desktop's
         // getUserMedia constraints). Best-effort — barge-in never trusts it.
         try? input.setVoiceProcessingEnabled(true)
+
+        #if os(macOS)
+            // Pin the capture unit to the user-selected mic before the tap
+            // format is read; on iOS the session's preferred input routes it.
+            MacAudioDevices.applyPreferredInput(to: engine)
+        #endif
 
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
