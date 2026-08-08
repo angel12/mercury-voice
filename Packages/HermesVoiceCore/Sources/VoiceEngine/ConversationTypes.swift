@@ -68,6 +68,11 @@ public protocol BargeMonitoring: Sendable {
         onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
     ) async throws
     func stop() async
+    /// While suspended the monitor keeps its mic stream open but discards
+    /// audio and resets detection — mute must not tear down the capture
+    /// engine (a voice-processing unit stopping mid-TTS kills playback on
+    /// macOS), it must only make the monitor deaf.
+    func setSuspended(_ suspended: Bool) async
 }
 
 public protocol Transcribing: Sendable {
