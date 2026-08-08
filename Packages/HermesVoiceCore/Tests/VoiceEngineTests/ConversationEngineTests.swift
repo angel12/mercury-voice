@@ -288,6 +288,134 @@ struct ConversationEngineTests {
         #expect(h.recorder.startCount == 2)
     }
 
+    // MARK: Mute × barge-in (issue #7)
+
+    @Test func muteWhileSpeakingSuspendsBargeMonitorButNotPlayback() async {
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        _ = await eventually { h.barge.isActive }
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isSuspended })
+        // Playback is untouched — the monitor stays attached (tearing down
+        // the mic engine mid-TTS kills playback) but goes deaf.
+        #expect(h.barge.isActive)
+        #expect(await h.engine.status == .speaking)
+        #expect(await h.speech.isSpeaking)
+
+        // A trip that raced the mute must not interrupt or stop playback.
+        let seqBefore = await h.speech.sequence
+        h.barge.trip()
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(h.agent.interruptCount == 0)
+        #expect(await h.speech.sequence == seqBefore)
+        #expect(await h.speech.isSpeaking)
+    }
+
+    @Test func unmuteWhileSpeakingResumesBargeMonitorWithoutRestart() async {
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        _ = await eventually { h.barge.isActive }
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isSuspended })
+
+        await h.engine.toggleMute()
+        #expect(await eventually { !h.barge.isSuspended })
+        #expect(h.barge.startCount == 1)  // resumed, not restarted
+        #expect(await h.engine.status == .speaking)
+
+        // Barge-in works again end to end.
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
+    }
+
+    @Test func muteWhileThinkingSuspendsBargeMonitorAndUnmuteResumes() async {
+        let h = Harness()
+        await h.enterThinking()
+        _ = await eventually { h.barge.isActive }
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isSuspended })
+
+        await h.engine.toggleMute()
+        #expect(await eventually { !h.barge.isSuspended })
+        #expect(h.barge.startCount == 1)
+    }
+
+    @Test func pauseWhileSpeakingSuspendsBargeMonitorAndResumeResumes() async {
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        _ = await eventually { h.barge.isActive }
+
+        await h.engine.setPaused(true)
+        #expect(await eventually { h.barge.isSuspended })
+        #expect(await h.engine.status == .speaking)
+        #expect(await h.speech.isSpeaking)
+
+        await h.engine.setPaused(false)
+        #expect(await eventually { !h.barge.isSuspended })
+        #expect(h.barge.startCount == 1)
+    }
+
+    @Test func speakingEnteredWhileMutedArmsMonitorOnUnmute() async {
+        let h = Harness()
+        await h.enterThinking()
+        _ = await eventually { h.barge.isActive }
+
+        // Trip, mute, and let the racing capture detach the monitor; the
+        // turn then starts speaking while muted → monitor never armed.
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isSuspended })
+        h.barge.deliver(makeUtterance())
+        try? await Task.sleep(for: .milliseconds(50))
+
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        #expect(!h.barge.isActive)  // arming is refused while muted
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isActive && !h.barge.isSuspended })
+        #expect(h.barge.startCount == 2)
+    }
+
+    @Test func muteAfterBargeTripCancelsPendingCapture() async {
+        let h = Harness()
+        await h.enterThinking()
+        _ = await eventually { h.barge.isActive }
+
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isSuspended })
+
+        // A capture already in flight when the mute landed must be dropped,
+        // not submitted. (Let the engine process the delivery before the
+        // unmute lands, as a real capture would resolve before a user taps.)
+        h.transcriber.queue("should never be sent")
+        h.barge.deliver(makeUtterance())
+        try? await Task.sleep(for: .milliseconds(50))
+
+        // The interrupted turn settles; unmute recovers to plain listening.
+        h.agent.setBusy(false)
+        await h.engine.toggleMute()
+        #expect(await h.status(is: .listening))
+        #expect(h.agent.submissions.count == 1)
+    }
+
     // MARK: Fallback TTS path
 
     @Test func fallbackOutcomePlaysWholeClipAndRearms() async {
