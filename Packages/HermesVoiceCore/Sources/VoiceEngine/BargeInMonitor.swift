@@ -8,6 +8,7 @@ public actor BargeInMonitor: BargeMonitoring {
 
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
+    private var suspended = false
 
     public init(capture: AudioCaptureService = .shared) {
         self.capture = capture
@@ -19,6 +20,7 @@ public actor BargeInMonitor: BargeMonitoring {
         onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
     ) async throws {
         await stop()
+        suspended = false
 
         let (id, stream) = try capture.openStream()
         streamID = id
@@ -31,6 +33,10 @@ public actor BargeInMonitor: BargeMonitoring {
 
     public func stop() async {
         detach()
+    }
+
+    public func setSuspended(_ newValue: Bool) {
+        suspended = newValue
     }
 
     private func detach() {
@@ -58,6 +64,17 @@ public actor BargeInMonitor: BargeMonitoring {
         for await chunk in stream {
             if Task.isCancelled { return }
             sampleRate = chunk.sampleRate
+            if suspended {
+                // Deaf but attached: drop the audio and any half-built
+                // capture so nothing heard while muted can ever trip or
+                // be delivered.
+                detector = BargeDetector()
+                preRoll.removeAll()
+                captured.removeAll()
+                tripped = false
+                elapsedSamples += chunk.samples.count
+                continue
+            }
             let now = Duration.seconds(Double(elapsedSamples) / sampleRate)
             elapsedSamples += chunk.samples.count
 
