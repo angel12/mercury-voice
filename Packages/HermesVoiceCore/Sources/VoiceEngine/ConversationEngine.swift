@@ -149,9 +149,13 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         if muted {
             clearTurnTimeout()
             await recorder.cancel()
+            await suspendBargeMonitor()
             if status == .listening { setStatus(.idle) } else { publishState() }
         } else {
             if enabled, status == .idle, !(await agent.isBusy) { pendingStart = true }
+            // drive() re-arms barge-in for the thinking case; mid-playback it
+            // never runs the barge branch, so re-arm here.
+            if status == .speaking { await ensureBargeMonitor() }
             publishState()
             await drive()
         }
@@ -165,9 +169,11 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         if paused {
             clearTurnTimeout()
             await recorder.cancel()
+            await suspendBargeMonitor()
             if status == .listening { setStatus(.idle) } else { publishState() }
         } else {
             if enabled, status == .idle, !(await agent.isBusy) { pendingStart = true }
+            if status == .speaking { await ensureBargeMonitor() }
             publishState()
             await drive()
         }
@@ -483,7 +489,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     // MARK: Barge-in
 
     private func ensureBargeMonitor() async {
-        guard !bargeMonitorActive else { return }
+        guard !bargeMonitorActive, !micBlocked else { return }
         bargeMonitorActive = true
         do {
             try await barge.start(
@@ -499,7 +505,22 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
     }
 
+    /// Mute/pause: take the barge mic offline without disturbing the speech
+    /// session — playback keeps going, interruption (and any in-flight
+    /// capture) stops. `ensureBargeMonitor` re-arms when the block lifts.
+    private func suspendBargeMonitor() async {
+        if bargeMonitorActive {
+            bargeMonitorActive = false
+            await barge.stop()
+        }
+        bargeCapturePending = false
+        barged = false
+    }
+
     private func bargeSpeechTripped() async {
+        // A trip can land after mute/pause already stopped the monitor (the
+        // callback hops actors); a silenced mic must not interrupt playback.
+        guard bargeMonitorActive, !micBlocked else { return }
         bargeCapturePending = true
         barged = true
         interruptedLatchAt = clock.now
@@ -512,6 +533,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private func bargeUtteranceCaptured(_ utterance: RecordedUtterance?) async {
         bargeCapturePending = false
         bargeMonitorActive = false  // the monitor cleaned itself up
+        // Muted/paused mid-capture: the audio was recorded from a mic the
+        // user believes is off — drop it, never submit it.
+        guard !micBlocked else { return }
         await submitCapturedUtterance(utterance)
     }
 
