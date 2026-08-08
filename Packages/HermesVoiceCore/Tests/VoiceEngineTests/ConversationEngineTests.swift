@@ -15,9 +15,11 @@ struct ConversationEngineTests {
         let transcriber: FakeTranscriber
         let speech: FakeSpeech
         let agent: FakeAgent
-        let stopWords: StopWordBox
+        let stopWords: CountBox
+        let turnCues: CountBox
+        let thinkingTicks: CountBox
 
-        final class StopWordBox: @unchecked Sendable {
+        final class CountBox: @unchecked Sendable {
             private let lock = NSLock()
             private var _count = 0
             var count: Int {
@@ -39,7 +41,9 @@ struct ConversationEngineTests {
             let transcriber = FakeTranscriber()
             let speech = FakeSpeech()
             let agent = FakeAgent()
-            let stopWords = StopWordBox()
+            let stopWords = CountBox()
+            let turnCues = CountBox()
+            let thinkingTicks = CountBox()
             self.clock = clock
             self.recorder = recorder
             self.barge = barge
@@ -47,13 +51,18 @@ struct ConversationEngineTests {
             self.speech = speech
             self.agent = agent
             self.stopWords = stopWords
+            self.turnCues = turnCues
+            self.thinkingTicks = thinkingTicks
             self.engine = ConversationEngine(
                 recorder: recorder,
                 bargeMonitor: barge,
                 transcriber: transcriber,
                 speech: speech,
                 agent: agent,
-                callbacks: ConversationCallbacks(onStopWord: { stopWords.bump() }),
+                callbacks: ConversationCallbacks(
+                    onStopWord: { stopWords.bump() },
+                    onTurnCaptured: { turnCues.bump() },
+                    onThinkingTick: { thinkingTicks.bump() }),
                 clock: clock)
         }
 

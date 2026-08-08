@@ -40,6 +40,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private var turnTimeoutTask: Task<Void, Never>?
     private var turnTimeoutGeneration = 0
     private var speechTask: Task<Void, Never>?
+    private var thinkingChimeTask: Task<Void, Never>?
+    private var thinkingChimeGeneration = 0
 
     private var stateSubscribers: [UUID: AsyncStream<ConversationUIState>.Continuation] = [:]
 
@@ -85,7 +87,13 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     }
 
     private func setStatus(_ new: ConversationStatus) {
+        let old = status
         status = new
+        if new == .thinking, old != .thinking {
+            startThinkingChime()
+        } else if new != .thinking, old == .thinking {
+            stopThinkingChime()
+        }
         publishState()
     }
 
@@ -236,6 +244,41 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         turnTimeoutTask = nil
     }
 
+    // MARK: Thinking chime (issue #15)
+
+    /// While status stays `.thinking`, tick `onThinkingTick` on a fixed
+    /// cadence so the user can hear the agent is still working. First tick
+    /// lands one full interval in — fast replies never chime.
+    private func startThinkingChime() {
+        stopThinkingChime()
+        thinkingChimeGeneration += 1
+        let generation = thinkingChimeGeneration
+        thinkingChimeTask = Task { [clock] in
+            while !Task.isCancelled {
+                try? await clock.sleep(
+                    for: VoiceConstants.thinkingChimeInterval, tolerance: nil)
+                guard !Task.isCancelled else { return }
+                guard await self.thinkingChimeTicked(generation: generation) else { return }
+            }
+        }
+    }
+
+    /// Returns false when the tick is stale and the loop should die.
+    private func thinkingChimeTicked(generation: Int) -> Bool {
+        guard generation == thinkingChimeGeneration, status == .thinking else { return false }
+        // Paused = an approval/clarify sheet or an audio interruption — the
+        // agent is waiting on the user, not thinking; stay quiet but keep the
+        // loop alive for the resume.
+        if !paused { callbacks.onThinkingTick() }
+        return true
+    }
+
+    private func stopThinkingChime() {
+        thinkingChimeGeneration += 1
+        thinkingChimeTask?.cancel()
+        thinkingChimeTask = nil
+    }
+
     // MARK: Turn close (listening → transcribing → thinking)
 
     private func handleTurn(forceTranscribe: Bool) async {
@@ -257,6 +300,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             await drive()
             return
         }
+        callbacks.onTurnCaptured()
 
         let transcript: String
         do {
@@ -561,6 +605,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             await drive()
             return
         }
+        callbacks.onTurnCaptured()
         setStatus(.transcribing)
 
         let transcript: String
