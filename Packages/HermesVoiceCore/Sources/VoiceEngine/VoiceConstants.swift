@@ -52,6 +52,17 @@ public enum VoiceConstants {
     /// While TTS is audibly playing, the trigger clamps into this band.
     public static let bargePlaybackMinTrigger: Double = 0.14
     public static let bargeTriggerCeiling: Double = 0.37
+    /// Self-echo floor (no desktop counterpart — issue #12): playback runs on
+    /// a separate engine from capture, so the system echo canceller has no
+    /// reference for it and speaker output can leak into the mic above the
+    /// static trigger band. While playing, the trigger also adapts to the
+    /// rolling median of observed levels — a trip must exceed it by this
+    /// factor, i.e. the user must speak over the echo.
+    public static let bargeEchoFloorMultiplier: Double = 1.5
+    /// Echo median over at most this many playback-phase samples (~3 s at
+    /// the 50 ms hop), applied only once this many have accumulated.
+    public static let bargeEchoSampleCap = 60
+    public static let bargeEchoMinSamples = 3
     /// Ignore the onset transient right after playback starts.
     public static let bargePlaybackGrace: Duration = .milliseconds(500)
     /// A playback gap must exceed this before a new grace window is armed
