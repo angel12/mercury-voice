@@ -296,9 +296,7 @@ final class AppModel {
 
     func loadBrowseData() async {
         guard let connection else { return }
-        browseLoading = true
         browseError = nil
-        defer { browseLoading = false }
 
         // Profiles are slow (walks skill trees) — load independently.
         if profiles.isEmpty {
@@ -319,12 +317,14 @@ final class AppModel {
 
     func refreshProjects() async {
         guard let connection else { return }
+        browseLoading = true
+        defer { browseLoading = false }
         do {
-            let tree = try await connection.projectsTree()
-            projectTree = tree
+            projectTree = try await connection.projectsTree()
             let profile = selectedProfile ?? "all"
-            let sessions = try await connection.rest.profileSessions(profile: profile, limit: 30)
-            recentSessions = sessions.filter { !tree.scopedSessionIDs.contains($0.storedID) }
+            // The full recent list for the profile; the workspace page shows
+            // the project-scoped grouping, so no de-duplication needed here.
+            recentSessions = try await connection.rest.profileSessions(profile: profile, limit: 30)
             browseError = nil
         } catch let error as HermesError {
             if case .rpcError(HermesError.RPCCode.methodNotFound, _) = error {
@@ -368,7 +368,10 @@ final class AppModel {
     func selectProfile(_ name: String) async {
         guard selectedProfile != name else { return }
         selectedProfile = name
-        // A profile is a whole isolated HERMES_HOME — refresh everything.
+        // A profile is a whole isolated HERMES_HOME — drop the stale rows so
+        // the sessions page shows its loading state, then refresh everything.
+        recentSessions = []
+        projectTree = nil
         await refreshProjects()
     }
 
