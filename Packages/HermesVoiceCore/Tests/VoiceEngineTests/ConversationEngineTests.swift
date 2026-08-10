@@ -18,6 +18,7 @@ struct ConversationEngineTests {
         let stopWords: CountBox
         let turnCues: CountBox
         let thinkingTicks: CountBox
+        let micParks: CountBox
 
         final class CountBox: @unchecked Sendable {
             private let lock = NSLock()
@@ -34,7 +35,7 @@ struct ConversationEngineTests {
             }
         }
 
-        init() {
+        init(micFailureIsFatal: Bool = true) {
             let clock = TestClock()
             let recorder = FakeRecorder()
             let barge = FakeBargeMonitor()
@@ -44,6 +45,7 @@ struct ConversationEngineTests {
             let stopWords = CountBox()
             let turnCues = CountBox()
             let thinkingTicks = CountBox()
+            let micParks = CountBox()
             self.clock = clock
             self.recorder = recorder
             self.barge = barge
@@ -53,6 +55,7 @@ struct ConversationEngineTests {
             self.stopWords = stopWords
             self.turnCues = turnCues
             self.thinkingTicks = thinkingTicks
+            self.micParks = micParks
             self.engine = ConversationEngine(
                 recorder: recorder,
                 bargeMonitor: barge,
@@ -62,7 +65,9 @@ struct ConversationEngineTests {
                 callbacks: ConversationCallbacks(
                     onStopWord: { stopWords.bump() },
                     onTurnCaptured: { turnCues.bump() },
-                    onThinkingTick: { thinkingTicks.bump() }),
+                    onThinkingTick: { thinkingTicks.bump() },
+                    micFailureIsFatal: { micFailureIsFatal },
+                    onMicParked: { micParks.bump() }),
                 clock: clock)
         }
 
@@ -313,6 +318,38 @@ struct ConversationEngineTests {
         await h.engine.stopSpeech()
         #expect(await h.status(is: .idle))
         #expect(h.recorder.startCount == 1)
+    }
+
+    // MARK: Mic-start failures (issue #31)
+
+    struct MicError: Error {}
+
+    @Test func micStartFailureIsFatalByDefault() async {
+        let h = Harness()
+        h.recorder.startError = MicError()
+        await h.engine.start()
+        #expect(await h.status(is: .idle))
+        #expect(await h.engine.uiState.enabled == false)
+        #expect(h.micParks.count == 0)
+    }
+
+    @Test func micStartFailureParksWhenNotFatalAndResumes() async {
+        let h = Harness(micFailureIsFatal: false)
+        h.recorder.startError = MicError()
+        await h.engine.start()
+
+        // Parked: idle + paused, still enabled, park signal fired.
+        #expect(await h.status(is: .idle))
+        let parked = await h.engine.uiState
+        #expect(parked.enabled)
+        #expect(parked.paused)
+        #expect(await eventually { h.micParks.count == 1 })
+
+        // Foreground again: the refusal clears and the resume re-arms.
+        h.recorder.startError = nil
+        h.recorder.nextResult = makeUtterance()
+        await h.engine.setPaused(false)
+        #expect(await h.status(is: .listening))
     }
 
     // MARK: Listen after Stop (issue #17)

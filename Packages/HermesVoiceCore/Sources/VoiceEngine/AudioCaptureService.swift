@@ -66,6 +66,23 @@ public final class AudioCaptureService: @unchecked Sendable {
                 else { return }
                 self?.restartIfInputRouteChanged()
             }
+            // An interruption (call, Siri, another app's session) stops the
+            // running engine silently — the object survives but no audio
+            // flows (issue #31). Rebuild for the attached consumers when the
+            // interruption ends; if the rebuild is refused (still
+            // backgrounded), the streams finish and consumers end their
+            // turn instead of hanging on a dead mic.
+            NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: nil, queue: nil
+            ) { [weak self] notification in
+                guard
+                    let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
+                        as? UInt,
+                    AVAudioSession.InterruptionType(rawValue: raw) == .ended
+                else { return }
+                self?.restartEngineIfRunning()
+            }
         #endif
     }
 
@@ -128,6 +145,18 @@ public final class AudioCaptureService: @unchecked Sendable {
     /// The selected input device changed: rebuild a running engine on it.
     /// No-op when idle — the next start picks up the new selection anyway.
     public func reconfigure() {
+        restartEngineIfRunning()
+    }
+
+    /// Recover from a silently-dead engine: an interruption stops audio I/O
+    /// without any promise of an `.ended` notification (issue #31 follow-up).
+    /// Rebuilds when the engine object exists but is no longer running;
+    /// no-op otherwise. Call on any "the app is usable again" signal.
+    public func ensureRunning() {
+        lock.lock()
+        let engine = self.engine
+        lock.unlock()
+        guard let engine, !engine.isRunning else { return }
         restartEngineIfRunning()
     }
 
