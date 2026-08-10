@@ -262,8 +262,10 @@ final class AppModel {
         selectedProfile = nil
     }
 
-    /// Immediate re-dial on foreground (backoff skip).
+    /// Immediate re-dial on foreground (backoff skip), and a mic re-arm for
+    /// an engine parked by a background start refusal (issue #31).
     func appBecameActive() {
+        conversation?.appBecameActive()
         guard let connection else { return }
         Task { await connection.pokeReconnect() }
     }

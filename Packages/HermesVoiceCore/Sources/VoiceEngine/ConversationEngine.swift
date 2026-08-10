@@ -221,6 +221,16 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                     Task { await self?.handleTurn(forceTranscribe: false) }
                 })
         } catch {
+            guard await callbacks.micFailureIsFatal() else {
+                // Transient refusal (backgrounded / interrupted on iOS,
+                // issue #31): park paused with the start latched — the
+                // owner's setPaused(false) on foreground re-arms.
+                paused = true
+                pendingStart = true
+                setStatus(.idle)
+                callbacks.onMicParked()
+                return
+            }
             callbacks.onNotice("Microphone unavailable: \(error.localizedDescription)")
             setStatus(.idle)
             enabled = false
