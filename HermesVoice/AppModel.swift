@@ -12,6 +12,12 @@ final class AppModel {
     /// App Intents (Siri Shortcuts, issue #23) reach it here.
     static let shared = AppModel()
 
+    init() {
+        #if os(iOS)
+            ConversationActivityHooks.install(model: self)
+        #endif
+    }
+
     // MARK: Connection
 
     private(set) var connection: HermesConnection?
