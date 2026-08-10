@@ -57,6 +57,8 @@ struct HermesVoiceApp: App {
                         .keyboardShortcut(.return, modifiers: .command)
                     Button("Stop Speaking") { model.conversation?.stopSpeech() }
                         .keyboardShortcut(".", modifiers: .command)
+                    Button("Start Listening") { model.conversation?.listenNow() }
+                        .keyboardShortcut("l", modifiers: .command)
                 }
                 .disabled(model.conversation == nil)
             }
