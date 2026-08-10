@@ -90,6 +90,7 @@ struct RootView: View {
                 ConnectView()
             }
         }
+        .keepScreenAwake(while: model.conversation != nil)
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 model.appBecameActive()
