@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 struct HermesVoiceApp: App {
-    @State private var model = AppModel()
+    @State private var model = AppModel.shared
     @AppStorage(ThemePreference.key) private var theme = ThemePreference.system
     #if os(macOS)
         @State private var muteHotkey = MuteHotkeyManager()
