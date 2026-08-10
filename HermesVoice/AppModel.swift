@@ -8,6 +8,10 @@ import SwiftUI
 @MainActor
 @Observable
 final class AppModel {
+    /// One instance for the whole process: the scenes render it, and the
+    /// App Intents (Siri Shortcuts, issue #23) reach it here.
+    static let shared = AppModel()
+
     // MARK: Connection
 
     private(set) var connection: HermesConnection?
@@ -309,6 +313,7 @@ final class AppModel {
                         selectedProfile =
                             loaded.first(where: \.isDefault)?.name ?? loaded.first?.name
                     }
+                    Self.cacheProfileNames(loaded.map(\.name))
                 }
             }
         }
@@ -401,5 +406,63 @@ final class AppModel {
             await conversation?.teardown()
             await refreshProjects()
         }
+    }
+
+    // MARK: Siri Shortcuts (issue #23)
+
+    private nonisolated static let cachedProfileNamesKey = "cachedProfileNames"
+
+    /// Profile names last seen from the server, persisted so the Shortcuts
+    /// profile picker has options while the app isn't connected.
+    nonisolated static func cachedProfileNames() -> [String] {
+        UserDefaults.standard.stringArray(forKey: cachedProfileNamesKey) ?? []
+    }
+
+    private static func cacheProfileNames(_ names: [String]) {
+        UserDefaults.standard.set(names, forKey: cachedProfileNamesKey)
+    }
+
+    enum ShortcutStartError: LocalizedError {
+        case notConfigured
+        case connectFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .notConfigured:
+                return "Open Hermes Voice and connect to your server once first."
+            case .connectFailed(let reason):
+                return reason
+            }
+        }
+    }
+
+    /// Entry point for the start-a-session App Intent: connect with the
+    /// saved server if needed, wait for the gateway, then open a new
+    /// conversation with the requested profile. The launch task's
+    /// autoConnect may already be mid-flight — both guard on `connection`,
+    /// and `connect()`'s generation counter settles any overlap, so this
+    /// just waits for a ready phase either way.
+    func startSessionFromShortcut(profileName: String?) async throws {
+        if connection == nil {
+            await autoConnectOnLaunch()
+        }
+        guard connection != nil else { throw ShortcutStartError.notConfigured }
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+        while ContinuousClock.now < deadline {
+            if case .ready = phase { break }
+            if let error = connectError {
+                throw ShortcutStartError.connectFailed(error)
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard case .ready = phase else {
+            throw ShortcutStartError.connectFailed(
+                "Timed out reaching \(endpoint?.displayName ?? "the server").")
+        }
+
+        if let profileName { selectedProfile = profileName }
+        if conversation != nil { endConversation() }
+        await startConversation(cwd: nil)
     }
 }
