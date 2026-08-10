@@ -51,15 +51,25 @@ struct AudioInputPicker: View {
         func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
     }
 
-    /// The audio sheet opened from the conversation header.
+    /// The settings sheet opened from the conversation header: audio
+    /// devices, sounds, and appearance.
     struct AudioDevicesSheet: View {
         var devices = AudioDeviceCatalog.shared
         @Environment(\.dismiss) private var dismiss
         @AppStorage(CuePreference.key) private var cuesEnabled = true
+        @AppStorage(ThemePreference.key) private var theme = ThemePreference.system
 
         var body: some View {
             NavigationStack {
                 Form {
+                    Section("Appearance") {
+                        Picker("Theme", selection: $theme) {
+                            ForEach(ThemePreference.allCases) { choice in
+                                Text(choice.label).tag(choice)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
                     Section("Microphone") {
                         AudioInputPicker(devices: devices)
                             .pickerStyle(.inline)
@@ -85,7 +95,7 @@ struct AudioInputPicker: View {
                         .foregroundStyle(.secondary)
                     }
                 }
-                .navigationTitle("Audio")
+                .navigationTitle("Settings")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
