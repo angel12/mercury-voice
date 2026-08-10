@@ -216,7 +216,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
         do {
             try await recorder.start(
-                vad: VADParameters(),
+                vad: VADParameters(endOfTurnSilence: TurnSilencePreference.duration),
                 onAutoStop: { [weak self] in
                     Task { await self?.handleTurn(forceTranscribe: false) }
                 })

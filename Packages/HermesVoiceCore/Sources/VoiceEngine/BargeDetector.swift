@@ -31,8 +31,13 @@ public struct BargeDetector: Sendable {
     private var tripped = false
     private var trippedAt: Duration = .zero
     private var quietSince: Duration?
+    /// Post-trip trailing silence that endpoints the capture — injectable so
+    /// the user's end-of-turn setting (issue #24) also governs barge turns.
+    private let utteranceSilence: Duration
 
-    public init() {}
+    public init(utteranceSilence: Duration = VoiceConstants.bargeUtteranceSilence) {
+        self.utteranceSilence = utteranceSilence
+    }
 
     public var hasTripped: Bool { tripped }
 
@@ -121,7 +126,7 @@ public struct BargeDetector: Sendable {
         } else if quietSince == nil {
             quietSince = now
         }
-        if let quiet = quietSince, now - quiet >= VoiceConstants.bargeUtteranceSilence {
+        if let quiet = quietSince, now - quiet >= utteranceSilence {
             return .captureEnded
         }
         if now - trippedAt >= VoiceConstants.bargeUtteranceMax {
