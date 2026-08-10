@@ -54,7 +54,7 @@ public actor BargeInMonitor: BargeMonitoring {
         onSpeech: @escaping @Sendable () -> Void,
         onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
     ) async {
-        var detector = BargeDetector()
+        var detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
         var preRoll: [Float] = []
         var captured: [Float] = []
         var sampleRate: Double = 48000
@@ -68,7 +68,7 @@ public actor BargeInMonitor: BargeMonitoring {
                 // Deaf but attached: drop the audio and any half-built
                 // capture so nothing heard while muted can ever trip or
                 // be delivered.
-                detector = BargeDetector()
+                detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
                 preRoll.removeAll()
                 captured.removeAll()
                 tripped = false

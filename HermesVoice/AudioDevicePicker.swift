@@ -21,6 +21,37 @@ struct AudioInputPicker: View {
     }
 }
 
+/// End-of-turn pause control shared by the macOS Settings pane and the iOS
+/// settings sheet (issue #24). Binds the preference the voice engine reads
+/// at each mic arm, so a change applies from the next turn.
+struct TurnSilenceSlider: View {
+    @AppStorage(TurnSilencePreference.key) private var silence =
+        TurnSilencePreference.defaultSeconds
+
+    var body: some View {
+        LabeledContent("End-of-turn pause") {
+            Text("\(silence, format: .number.precision(.fractionLength(0...2))) s")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+        Slider(
+            value: $silence, in: TurnSilencePreference.range, step: 0.25
+        ) {
+            Text("End-of-turn pause")
+        } minimumValueLabel: {
+            Text("0.5 s").font(.caption2)
+        } maximumValueLabel: {
+            Text("4 s").font(.caption2)
+        }
+        .labelsHidden()
+        Text(
+            "How long you can stay quiet before the app decides you're done talking. Also applies when you interrupt the agent mid-reply."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+
 #if os(macOS)
     /// Speaker selector — macOS only; iOS output routing belongs to the
     /// system route picker.
@@ -85,6 +116,9 @@ struct AudioInputPicker: View {
                         Text("Output is chosen with the system route picker.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    Section("Listening") {
+                        TurnSilenceSlider()
                     }
                     Section("Sounds") {
                         Toggle("Conversation cues", isOn: $cuesEnabled)
