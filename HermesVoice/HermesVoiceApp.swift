@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct HermesVoiceApp: App {
     @State private var model = AppModel()
+    @AppStorage(ThemePreference.key) private var theme = ThemePreference.system
     #if os(macOS)
         @State private var muteHotkey = MuteHotkeyManager()
     #endif
@@ -11,6 +12,7 @@ struct HermesVoiceApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
+                .preferredColorScheme(theme.colorScheme)
                 #if os(macOS)
                     .frame(minWidth: 480, minHeight: 560)
                     .onAppear {
@@ -29,7 +31,10 @@ struct HermesVoiceApp: App {
 
         #if os(macOS)
             Settings {
+                // The Settings scene is its own window; the WindowGroup's
+                // color scheme doesn't reach it.
                 SettingsView(hotkey: muteHotkey)
+                    .preferredColorScheme(theme.colorScheme)
             }
         #endif
     }
