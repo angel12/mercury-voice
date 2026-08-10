@@ -93,6 +93,9 @@ struct RootView: View {
             }
         }
         .keepScreenAwake(while: model.conversation != nil)
+        #if os(iOS)
+            .modifier(ConversationLiveActivityModifier(model: model))
+        #endif
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 model.appBecameActive()
