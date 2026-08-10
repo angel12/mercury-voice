@@ -214,20 +214,36 @@ struct ConversationView: View {
                 controller.toggleMute()
             }
 
-            ControlButton(
-                symbol: "checkmark.circle.fill",
-                label: "End turn",
-                tint: controller.voiceState.status == .listening ? .green : .secondary
-            ) {
-                controller.endTurnNow()
+            if canListen {
+                // After Stop the loop idles on purpose; this is the way back
+                // to listening without cycling mute (issue #17).
+                ControlButton(symbol: "waveform.circle.fill", label: "Listen", tint: .green) {
+                    controller.listenNow()
+                }
+            } else {
+                ControlButton(
+                    symbol: "checkmark.circle.fill",
+                    label: "End turn",
+                    tint: controller.voiceState.status == .listening ? .green : .secondary
+                ) {
+                    controller.endTurnNow()
+                }
+                .disabled(controller.voiceState.status != .listening)
             }
-            .disabled(controller.voiceState.status != .listening)
 
             ControlButton(symbol: "stop.circle.fill", label: "Stop", tint: .orange) {
                 controller.stopSpeech()
             }
         }
         .padding(.bottom, 8)
+    }
+
+    /// The idle-but-armed lull (typically right after Stop): the middle
+    /// button flips from End turn to Listen.
+    private var canListen: Bool {
+        controller.voiceState.status == .idle
+            && !controller.voiceState.muted
+            && !controller.voiceState.paused
     }
 
     private var statusLabel: String {

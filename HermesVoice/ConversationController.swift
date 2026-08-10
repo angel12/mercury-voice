@@ -338,6 +338,10 @@ final class ConversationController {
         Task { await engine?.stopSpeech() }
     }
 
+    func listenNow() {
+        Task { await engine?.listenNow() }
+    }
+
     func respondApproval(choice: String) {
         guard let request = approval else { return }
         approval = nil
