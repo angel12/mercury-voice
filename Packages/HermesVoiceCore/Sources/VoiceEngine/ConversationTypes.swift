@@ -157,19 +157,31 @@ public struct ConversationCallbacks: Sendable {
     /// Periodic tick while the agent is thinking (status == .thinking),
     /// every `VoiceConstants.thinkingChimeInterval`; suppressed while paused.
     public var onThinkingTick: @Sendable () -> Void
+    /// Whether a mic-start failure should end the conversation (default) or
+    /// park the engine paused for a later resume. iOS refuses to START audio
+    /// I/O from the background or during an interruption (issue #31) — those
+    /// refusals are transient, unlike a missing device or permission.
+    public var micFailureIsFatal: @Sendable () async -> Bool
+    /// Fired when a mic-start failure parked the engine instead of ending
+    /// the conversation; the owner resumes with `setPaused(false)`.
+    public var onMicParked: @Sendable () -> Void
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
         onFatalError: @escaping @Sendable (String) -> Void = { _ in },
         onNotice: @escaping @Sendable (String) -> Void = { _ in },
         onTurnCaptured: @escaping @Sendable () -> Void = {},
-        onThinkingTick: @escaping @Sendable () -> Void = {}
+        onThinkingTick: @escaping @Sendable () -> Void = {},
+        micFailureIsFatal: @escaping @Sendable () async -> Bool = { true },
+        onMicParked: @escaping @Sendable () -> Void = {}
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
         self.onNotice = onNotice
         self.onTurnCaptured = onTurnCaptured
         self.onThinkingTick = onThinkingTick
+        self.micFailureIsFatal = micFailureIsFatal
+        self.onMicParked = onMicParked
     }
 }
 
