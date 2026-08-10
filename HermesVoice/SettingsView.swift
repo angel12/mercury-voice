@@ -8,9 +8,18 @@
         @Bindable var hotkey: MuteHotkeyManager
         var devices = AudioDeviceCatalog.shared
         @AppStorage(CuePreference.key) private var cuesEnabled = true
+        @AppStorage(ThemePreference.key) private var theme = ThemePreference.system
 
         var body: some View {
             Form {
+                Section("Appearance") {
+                    Picker("Theme", selection: $theme) {
+                        ForEach(ThemePreference.allCases) { choice in
+                            Text(choice.label).tag(choice)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
                 Section("Audio Devices") {
                     AudioInputPicker(devices: devices)
                     AudioOutputPicker(devices: devices)

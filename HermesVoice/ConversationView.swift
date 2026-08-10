@@ -147,15 +147,15 @@ struct ConversationView: View {
             }
             Spacer()
             #if os(iOS)
-                // macOS picks devices in Settings (⌘,); iOS needs an
-                // in-conversation entry point.
+                // macOS has Settings (⌘,); iOS needs an in-conversation
+                // entry point.
                 Button {
                     showAudioDevices = true
                 } label: {
-                    Image(systemName: "headphones")
+                    Image(systemName: "gearshape")
                 }
                 .buttonStyle(.borderless)
-                .help("Audio devices")
+                .help("Settings")
             #endif
             Button {
                 showDevChat = true
