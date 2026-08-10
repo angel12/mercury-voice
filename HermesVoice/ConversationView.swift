@@ -238,12 +238,17 @@ struct ConversationView: View {
         .padding(.bottom, 8)
     }
 
-    /// The idle-but-armed lull (typically right after Stop): the middle
-    /// button flips from End turn to Listen.
+    /// The idle lull (after Stop, or a paused screen left behind by an
+    /// audio interruption whose end never announced itself — issue #31):
+    /// the middle button flips from End turn to Listen. Hidden while an
+    /// approval/clarify prompt owns the pause; their sheets cover the
+    /// controls anyway, but a dismissal race must not offer a resume that
+    /// fights the prompt.
     private var canListen: Bool {
         controller.voiceState.status == .idle
             && !controller.voiceState.muted
-            && !controller.voiceState.paused
+            && controller.approval == nil
+            && controller.clarify == nil
     }
 
     private var statusLabel: String {

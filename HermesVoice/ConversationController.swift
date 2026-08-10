@@ -3,6 +3,12 @@ import HermesKit
 import Observation
 import VoiceEngine
 
+#if os(iOS)
+    import AVFoundation
+    import CallKit
+    import UIKit
+#endif
+
 /// Glue for one voice conversation: owns the session, routes gateway events
 /// into the turn tracker, drives the voice engine, and surfaces
 /// approval/clarify prompts to the UI.
@@ -53,6 +59,27 @@ final class ConversationController {
     private let cues = ConversationCuePlayer()
     private var stateTask: Task<Void, Never>?
     private var captionTask: Task<Void, Never>?
+
+    #if os(iOS)
+        // Background-audio lifecycle (issue #31). The keepalive stream pins
+        // the capture engine on for the whole conversation, so iOS never
+        // sees a stopped-audio gap to suspend into, and audio only ever
+        // CONTINUES in the background (allowed) rather than STARTING
+        // (refused). Recorder/monitor consumers still decide what is heard.
+        private var keepaliveStreamID: UUID?
+        private var keepaliveDrain: Task<Void, Never>?
+        private var interruptionObserver: (any NSObjectProtocol)?
+        /// Observation-only CallKit: a phone call's interruption `.ended` is
+        /// often never delivered, but CXCallObserver reports the call ending
+        /// reliably — that's the auto-resume trigger.
+        private var callObserver: CXCallObserver?
+        private var callObserverDelegate: CallEndWatcher?
+        /// True between an interruption's begin and end notifications.
+        private var audioInterrupted = false
+        /// True when the engine parked after a refused mic start; cleared by
+        /// the foreground/interruption-ended resume.
+        private var parkedForBackground = false
+    #endif
 
     /// Runtime session id lives in a box the tracker's submit closure reads,
     /// so a reconnect-resume transparently re-routes prompts.
@@ -177,7 +204,25 @@ final class ConversationController {
                     Task { @MainActor in self?.notice = message }
                 },
                 onTurnCaptured: { [cues] in cues.playTurnCaptured() },
-                onThinkingTick: { [cues] in cues.playThinkingTick() }),
+                onThinkingTick: { [cues] in cues.playThinkingTick() },
+                micFailureIsFatal: { @MainActor [weak self] in
+                    // Background / interruption refusals are transient
+                    // (issue #31); real device or permission problems in the
+                    // foreground stay fatal.
+                    #if os(iOS)
+                        guard let self else { return true }
+                        if self.audioInterrupted { return false }
+                        if UIApplication.shared.applicationState != .active { return false }
+                    #endif
+                    return true
+                },
+                onMicParked: { [weak self] in
+                    Task { @MainActor in
+                        #if os(iOS)
+                            self?.parkedForBackground = true
+                        #endif
+                    }
+                }),
             clock: ContinuousClock())
         self.engine = engine
 
@@ -194,6 +239,10 @@ final class ConversationController {
         capture.setLevelHandler { [weak self] level in
             Task { @MainActor in self?.micLevel = level }
         }
+        #if os(iOS)
+            startAudioKeepalive()
+            observeAudioInterruptions()
+        #endif
 
         await engine.start()
     }
@@ -204,12 +253,101 @@ final class ConversationController {
         stateTask?.cancel()
         captionTask?.cancel()
         capture.setLevelHandler(nil)
+        #if os(iOS)
+            stopAudioKeepalive()
+            if let interruptionObserver {
+                NotificationCenter.default.removeObserver(interruptionObserver)
+                self.interruptionObserver = nil
+            }
+            callObserver?.setDelegate(nil, queue: nil)
+            callObserver = nil
+            callObserverDelegate = nil
+        #endif
         await tracker.setOnChange(nil)
         if let engine { await engine.end() }
         if let sid = sessionBox.runtimeID {
             await connection.closeSession(sessionID: sid)
         }
     }
+
+    /// AppModel forwards scene-active. Foregrounding is authoritative: an
+    /// interruption's `.ended` notification is NOT guaranteed (a phone call
+    /// can end without one), so clear the flag, revive a silently-dead
+    /// capture engine, and resume — every branch no-ops when nothing is
+    /// actually paused or stopped.
+    func appBecameActive() {
+        #if os(iOS)
+            audioInterrupted = false
+            capture.ensureRunning()
+            resumeIfUnprompted()
+        #endif
+    }
+
+    #if os(iOS)
+        private func startAudioKeepalive() {
+            guard keepaliveStreamID == nil,
+                let opened = try? capture.openStream()
+            else { return }
+            keepaliveStreamID = opened.id
+            keepaliveDrain = Task.detached {
+                for await _ in opened.stream {}  // discard; consumers decide what's heard
+            }
+        }
+
+        private func stopAudioKeepalive() {
+            if let keepaliveStreamID {
+                capture.closeStream(keepaliveStreamID)
+                self.keepaliveStreamID = nil
+            }
+            keepaliveDrain?.cancel()
+            keepaliveDrain = nil
+        }
+
+        /// Pause the loop for the interruption's duration; the capture
+        /// service separately rebuilds its engine on the ended signal.
+        private func observeAudioInterruptions() {
+            interruptionObserver = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: nil, queue: .main
+            ) { notification in
+                guard
+                    let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
+                        as? UInt,
+                    let type = AVAudioSession.InterruptionType(rawValue: raw)
+                else { return }
+                MainActor.assumeIsolated {
+                    AppModel.shared.conversation?.audioInterruption(began: type == .began)
+                }
+            }
+
+            let watcher = CallEndWatcher {
+                MainActor.assumeIsolated {
+                    AppModel.shared.conversation?.systemCallsEnded()
+                }
+            }
+            let observer = CXCallObserver()
+            observer.setDelegate(watcher, queue: .main)
+            callObserver = observer
+            callObserverDelegate = watcher
+        }
+
+        /// Every system call is over — the reliable stand-in for the
+        /// unreliable interruption `.ended`. Same recovery as foregrounding.
+        private func systemCallsEnded() {
+            audioInterrupted = false
+            capture.ensureRunning()
+            resumeIfUnprompted()
+        }
+
+        private func audioInterruption(began: Bool) {
+            audioInterrupted = began
+            if began {
+                Task { await engine?.setPaused(true) }
+            } else {
+                resumeIfUnprompted()
+            }
+        }
+    #endif
 
     private func agentChanged() async {
         await engine?.agentStateChanged()
@@ -338,8 +476,23 @@ final class ConversationController {
         Task { await engine?.stopSpeech() }
     }
 
+    /// The Listen button doubles as the manual escape hatch from a stranded
+    /// interruption pause (a phone call whose `.ended` never arrived): clear
+    /// the interruption state, revive the capture engine if the system
+    /// killed it, unpause, and re-arm.
     func listenNow() {
-        Task { await engine?.listenNow() }
+        #if os(iOS)
+            audioInterrupted = false
+            parkedForBackground = false
+            capture.ensureRunning()
+        #endif
+        Task {
+            guard let engine else { return }
+            if approval == nil, clarify == nil {
+                await engine.setPaused(false)
+            }
+            await engine.listenNow()
+        }
     }
 
     func respondApproval(choice: String) {
@@ -363,6 +516,10 @@ final class ConversationController {
 
     private func resumeIfUnprompted() {
         guard approval == nil, clarify == nil else { return }
+        #if os(iOS)
+            guard !audioInterrupted else { return }
+            parkedForBackground = false
+        #endif
         Task { await engine?.setPaused(false) }
     }
 
@@ -391,3 +548,22 @@ final class ConversationController {
         if devMessages.count > 100 { devMessages.removeFirst(devMessages.count - 100) }
     }
 }
+
+#if os(iOS)
+    /// CXCallObserver delegate reporting the moment no system call remains
+    /// (phone, FaceTime, or VoIP). Observation-only CallKit — review-safe,
+    /// no entitlement. Delegate callbacks arrive on the queue given to
+    /// setDelegate (main).
+    private final class CallEndWatcher: NSObject, CXCallObserverDelegate {
+        private let onAllCallsEnded: () -> Void
+
+        init(onAllCallsEnded: @escaping () -> Void) {
+            self.onAllCallsEnded = onAllCallsEnded
+        }
+
+        func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+            guard call.hasEnded, callObserver.calls.allSatisfy(\.hasEnded) else { return }
+            onAllCallsEnded()
+        }
+    }
+#endif
