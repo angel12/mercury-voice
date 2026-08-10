@@ -301,4 +301,57 @@ struct BargeDetectorTests {
         #expect(end - trippedAt >= .milliseconds(1250))
         #expect(end - trippedAt <= .milliseconds(1500))
     }
+
+    @Test func endpointHonorsCustomUtteranceSilence() {
+        // Issue #24: the user's end-of-turn setting stretches the barge
+        // capture endpoint too.
+        var detector = BargeDetector(utteranceSilence: .milliseconds(2500))
+        _ = feed(&detector, level: 0.01, hops: 10, playing: false, from: .zero)
+        let tripped = feed(
+            &detector, level: 0.3, hops: 12, playing: false, from: .milliseconds(500))
+        let trippedAt = try! #require(tripped).at
+        var now = trippedAt + hop
+        var ended: Duration?
+        for _ in 0..<80 {
+            if detector.process(level: 0.01, at: now, playing: false) == .captureEnded {
+                ended = now
+                break
+            }
+            now += hop
+        }
+        let end = try! #require(ended)
+        #expect(end - trippedAt >= .milliseconds(2500))
+        #expect(end - trippedAt <= .milliseconds(2750))
+    }
+}
+
+@Suite("Turn silence preference")
+struct TurnSilencePreferenceTests {
+    /// Serialized through one test to avoid parallel writers on the shared
+    /// UserDefaults key; restores whatever was stored before.
+    @Test func defaultsAndClamping() {
+        let defaults = UserDefaults.standard
+        let saved = defaults.object(forKey: TurnSilencePreference.key)
+        defer {
+            if let saved {
+                defaults.set(saved, forKey: TurnSilencePreference.key)
+            } else {
+                defaults.removeObject(forKey: TurnSilencePreference.key)
+            }
+        }
+
+        defaults.removeObject(forKey: TurnSilencePreference.key)
+        #expect(TurnSilencePreference.seconds == TurnSilencePreference.defaultSeconds)
+        #expect(TurnSilencePreference.duration == VoiceConstants.endOfTurnSilence)
+
+        TurnSilencePreference.seconds = 2.0
+        #expect(TurnSilencePreference.seconds == 2.0)
+        #expect(TurnSilencePreference.duration == .seconds(2))
+
+        // Out-of-range values clamp on both write and read.
+        TurnSilencePreference.seconds = 99
+        #expect(TurnSilencePreference.seconds == TurnSilencePreference.range.upperBound)
+        defaults.set(0.01, forKey: TurnSilencePreference.key)
+        #expect(TurnSilencePreference.seconds == TurnSilencePreference.range.lowerBound)
+    }
 }

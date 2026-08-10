@@ -29,6 +29,9 @@
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
+                Section("Listening") {
+                    TurnSilenceSlider()
+                }
                 Section("Sounds") {
                     Toggle("Conversation cues", isOn: $cuesEnabled)
                     Text(
