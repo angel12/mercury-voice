@@ -315,6 +315,78 @@ struct ConversationEngineTests {
         #expect(h.recorder.startCount == 1)
     }
 
+    // MARK: Listen after Stop (issue #17)
+
+    @Test func listenNowRearmsAfterStop() async {
+        let h = Harness()
+        h.recorder.nextResult = makeUtterance()
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        await h.engine.stopSpeech()
+        #expect(await h.status(is: .idle))
+
+        await h.engine.listenNow()
+        #expect(await h.status(is: .listening))
+        #expect(h.recorder.startCount == 2)
+    }
+
+    @Test func listenNowWhileMutedOrBusyDoesNothing() async {
+        let h = Harness()
+        h.recorder.nextResult = makeUtterance()
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        await h.engine.stopSpeech()
+        await h.engine.toggleMute()
+        #expect(await h.status(is: .idle))
+
+        await h.engine.listenNow()
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(await h.engine.status == .idle)
+        #expect(h.recorder.startCount == 1)
+    }
+
+    @Test func listenNowDuringBusyTurnLatchesUntilTurnCompletes() async {
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply text", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+
+        // Stop mid-reply while the turn is still busy, then ask to listen.
+        await h.engine.stopSpeech()
+        #expect(await h.status(is: .idle))
+        await h.engine.listenNow()
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(h.recorder.startCount == 1)  // busy — not yet
+
+        // The turn finishing re-arms via the latched start.
+        h.agent.setBusy(false)
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .listening))
+        #expect(h.recorder.startCount == 2)
+    }
+
+    @Test func stopDuringThinkingSettlesIdleWhenTurnCompletes() async {
+        let h = Harness()
+        await h.enterThinking()
+
+        await h.engine.stopSpeech()
+        #expect(await h.engine.status == .thinking)  // turn still running
+
+        // Turn completes with a reply nobody is waiting to speak: the engine
+        // must settle to idle (not stick on thinking) and drop the reply.
+        h.agent.setPending(PendingSpeech(id: "0", text: "too late", pending: false))
+        h.agent.setBusy(false)
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .idle))
+        #expect(await h.agent.pendingSpeech() == nil)
+        #expect(h.speech.currentStream == nil)
+
+        await h.engine.listenNow()
+        #expect(await h.status(is: .listening))
+        #expect(h.recorder.startCount == 2)
+    }
+
     @Test func muteCancelsMicAndUnmuteRearms() async {
         let h = Harness()
         h.recorder.nextResult = makeUtterance()

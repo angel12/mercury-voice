@@ -138,7 +138,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     }
 
     /// Stop button: end speech, don't re-arm the mic (conversation stays on;
-    /// the user speaks again by unmuting/tapping).
+    /// the user speaks again via `listenNow()` or by unmuting).
     public func stopSpeech() async {
         pendingStart = false
         if status == .listening {
@@ -152,6 +152,16 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             awaitingSpokenResponse = false
         }
         await speech.stopPlayback()
+        await drive()
+    }
+
+    /// The explicit way back to listening after Stop leaves the loop idle
+    /// (issue #17): latch a mic start without touching mute. If the agent is
+    /// still finishing the stopped turn, the latch holds until drive()
+    /// re-arms on the busy flip.
+    public func listenNow() async {
+        guard enabled, !micBlocked, status == .idle else { return }
+        pendingStart = true
         await drive()
     }
 
@@ -372,6 +382,17 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                 pendingStart = true
                 setStatus(.idle)
             }
+        }
+        if !awaitingSpokenResponse, status == .thinking, !bargeCapturePending,
+            !(await agent.isBusy)
+        {
+            // Stop landed while thinking, disowning this turn's reply. Settle
+            // to idle when the turn completes — without this the status (and
+            // its chime) stays "thinking" forever, and even unmute can't
+            // recover. No auto re-arm: the user asked for quiet; listenNow()
+            // or unmute is the way back.
+            await agent.consumePendingSpeech()
+            setStatus(.idle)
         }
         if await agent.isBusy { return }
         if status != .idle { return }
