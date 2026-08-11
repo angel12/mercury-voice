@@ -16,6 +16,9 @@ final class AppModel {
         #if os(iOS)
             ConversationActivityHooks.install(model: self)
         #endif
+        #if os(iOS) || os(watchOS)
+            CredentialSync.shared.activate()
+        #endif
     }
 
     // MARK: Connection
@@ -181,6 +184,9 @@ final class AppModel {
             savedServers.append(SavedServer(urlString: endpoint.key))
             persistServers()
         }
+        #if os(iOS)
+            CredentialSync.shared.push(endpoint: endpoint, credentials: credentials)
+        #endif
 
         let connection = HermesConnection(endpoint: endpoint, authenticator: authenticator)
         self.connection = connection
@@ -238,6 +244,23 @@ final class AppModel {
             prefillUsername: prefill)
         connectError = note
     }
+
+    #if os(watchOS)
+        /// A server arrived from the paired iPhone (issue #34): store it like
+        /// a locally validated connect would, and dial it when idle so the
+        /// watch is usable the moment sync lands.
+        func adoptSyncedServer(endpoint: ServerEndpoint, credentials: ServerCredentials?) {
+            tokenStore.setCredentials(credentials, for: endpoint)
+            UserDefaults.standard.set(endpoint.key, forKey: "lastServer")
+            if !savedServers.contains(where: { $0.urlString == endpoint.key }) {
+                savedServers.append(SavedServer(urlString: endpoint.key))
+                persistServers()
+            }
+            if connection == nil, conversation == nil {
+                Task { await connect(endpoint: endpoint, credentials: credentials) }
+            }
+        }
+    #endif
 
     func disconnect() {
         connectGeneration += 1  // invalidate any in-flight connect()

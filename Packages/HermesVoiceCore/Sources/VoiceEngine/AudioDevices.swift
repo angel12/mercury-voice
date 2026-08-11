@@ -81,11 +81,16 @@ public final class AudioDeviceCatalog {
         #if os(macOS)
             inputs = MacAudioDevices.devices(scope: kAudioObjectPropertyScopeInput)
             outputs = MacAudioDevices.devices(scope: kAudioObjectPropertyScopeOutput)
-        #else
+        #elseif os(iOS)
             let session = AVAudioSession.sharedInstance()
             inputs = (session.availableInputs ?? []).map {
                 AudioDeviceInfo(uid: $0.uid, name: $0.portName)
             }
+            outputs = []
+        #else
+            // watchOS: no per-device selection API — the system routes to
+            // paired Bluetooth headphones or the built-in speaker/mic.
+            inputs = []
             outputs = []
         #endif
     }
@@ -109,7 +114,9 @@ public final class AudioDeviceCatalog {
     }
 
     private func applyInputSelection() {
-        #if os(iOS)
+        #if os(watchOS)
+            // No selection to apply — the lists above are always empty.
+        #elseif os(iOS)
             // `setPreferredInput` applies asynchronously; restarting the
             // engine here would rebuild it on the old route. The capture
             // service watches for the resulting route change and rebuilds a
@@ -134,7 +141,7 @@ public final class AudioDeviceCatalog {
             MacAudioDevices.onDeviceListChange { [weak self] in
                 self?.refresh()
             }
-        #else
+        #elseif os(iOS)
             NotificationCenter.default.addObserver(
                 forName: AVAudioSession.routeChangeNotification,
                 object: nil, queue: .main

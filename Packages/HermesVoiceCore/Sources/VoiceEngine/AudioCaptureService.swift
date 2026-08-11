@@ -37,14 +37,14 @@ public final class AudioCaptureService: @unchecked Sendable {
     private var engine: AVAudioEngine?
     private var streams: [UUID: AsyncStream<AudioChunk>.Continuation] = [:]
     private var levelHandler: (@Sendable (Double) -> Void)?
-    #if os(iOS)
+    #if os(iOS) || os(watchOS)
         // Input port UID the running engine was built on, to detect real
         // input switches among the route-change noise.
         private var engineInputUID: String?
     #endif
 
     public init() {
-        #if os(iOS)
+        #if os(iOS) || os(watchOS)
             // The input route moves when a device appears/vanishes (e.g. a
             // Bluetooth headset) or when the user picks another mic
             // (`setPreferredInput` applies asynchronously, announced as
@@ -86,7 +86,7 @@ public final class AudioCaptureService: @unchecked Sendable {
         #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(watchOS)
         private func restartIfInputRouteChanged() {
             let currentUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
             lock.lock()
@@ -193,7 +193,7 @@ public final class AudioCaptureService: @unchecked Sendable {
     }
 
     private func startEngine() throws {
-        #if os(iOS)
+        #if os(iOS) || os(watchOS)
             try AudioSessionManager.activateForVoice()
         #endif
 
@@ -225,7 +225,7 @@ public final class AudioCaptureService: @unchecked Sendable {
             throw error
         }
 
-        #if os(iOS)
+        #if os(iOS) || os(watchOS)
             let inputUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
         #endif
         lock.lock()
@@ -233,7 +233,7 @@ public final class AudioCaptureService: @unchecked Sendable {
         // engine won and discard the loser.
         if self.engine == nil {
             self.engine = engine
-            #if os(iOS)
+            #if os(iOS) || os(watchOS)
                 engineInputUID = inputUID
             #endif
             lock.unlock()

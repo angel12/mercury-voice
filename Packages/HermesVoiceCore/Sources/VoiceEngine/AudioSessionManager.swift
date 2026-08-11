@@ -1,9 +1,9 @@
 import AVFoundation
 import Foundation
 
-/// Platform audio-session shims. On macOS this is a no-op; on iOS the
-/// conversation needs `.playAndRecord` + `.voiceChat` (which also enables the
-/// system echo canceller and noise suppressor).
+/// Platform audio-session shims. On macOS this is a no-op; on iOS and
+/// watchOS the conversation needs `.playAndRecord` + `.voiceChat` (which also
+/// enables the system echo canceller and noise suppressor).
 public enum AudioSessionManager {
     #if os(iOS)
         public static func activateForVoice() throws {
@@ -25,6 +25,24 @@ public enum AudioSessionManager {
             {
                 try? session.setPreferredInput(port)
             }
+        }
+
+        public static func deactivate() {
+            try? AVAudioSession.sharedInstance().setActive(
+                false, options: [.notifyOthersOnDeactivation])
+        }
+    #elseif os(watchOS)
+        public static func activateForVoice() throws {
+            // Same voice-chat session as iOS, minus the iOS-only speaker
+            // override and preferred-input plumbing — watchOS owns routing:
+            // paired Bluetooth headphones take over automatically, otherwise
+            // the built-in speaker + mic carry the conversation (issue #34).
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetoothHFP, .allowBluetoothA2DP])
+            try session.setActive(true)
         }
 
         public static func deactivate() {
