@@ -57,13 +57,18 @@ public actor BargeInMonitor: BargeMonitoring {
         var detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
         var preRoll: [Float] = []
         var captured: [Float] = []
-        var sampleRate: Double = 48000
+        // Locks to the first chunk's rate; route-change chunks at other rates
+        // are resampled into it so the sample-count timeline stays monotonic
+        // and the capture buffer holds one format (issue #43).
+        var resampler = RateLockedResampler()
         var elapsedSamples = 0
         var tripped = false
 
         for await chunk in stream {
             if Task.isCancelled { return }
-            sampleRate = chunk.sampleRate
+            let samples = resampler.normalize(chunk)
+            let sampleRate = resampler.sampleRate
+            guard sampleRate > 0 else { continue }
             if suspended {
                 // Deaf but attached: drop the audio and any half-built
                 // capture so nothing heard while muted can ever trip or
@@ -72,19 +77,19 @@ public actor BargeInMonitor: BargeMonitoring {
                 preRoll.removeAll()
                 captured.removeAll()
                 tripped = false
-                elapsedSamples += chunk.samples.count
+                elapsedSamples += samples.count
                 continue
             }
             let now = Duration.seconds(Double(elapsedSamples) / sampleRate)
-            elapsedSamples += chunk.samples.count
+            elapsedSamples += samples.count
 
             let playing = await isPlaying()
-            let level = AudioLevel.normalizedRMS(chunk.samples)
+            let level = AudioLevel.normalizedRMS(samples)
             let verdict = detector.process(level: level, at: now, playing: playing)
 
             switch verdict {
             case .quiet:
-                preRoll.append(contentsOf: chunk.samples)
+                preRoll.append(contentsOf: samples)
                 // Bounded pre-roll: keep the trailing window only while quiet
                 // (trimming mid-speech would lose the onset — the loudness
                 // check keeps loud-but-not-yet-tripped audio intact).
@@ -97,14 +102,14 @@ public actor BargeInMonitor: BargeMonitoring {
             case .tripped:
                 tripped = true
                 onSpeech()
-                captured = preRoll + chunk.samples
+                captured = preRoll + samples
                 preRoll.removeAll()
 
             case .capturing:
-                captured.append(contentsOf: chunk.samples)
+                captured.append(contentsOf: samples)
 
             case .captureEnded:
-                captured.append(contentsOf: chunk.samples)
+                captured.append(contentsOf: samples)
                 detach()  // clean up before delivering, like the reference
                 let utterance = RecordedUtterance(
                     audio: WAVEncoder.encode(samples: captured, sampleRate: sampleRate),
@@ -118,11 +123,11 @@ public actor BargeInMonitor: BargeMonitoring {
 
         // Stream ended without an endpoint (external stop): if we had tripped
         // deliver what we have, else vanish silently.
-        if tripped, !captured.isEmpty, !Task.isCancelled {
+        if tripped, !captured.isEmpty, !Task.isCancelled, resampler.sampleRate > 0 {
             let utterance = RecordedUtterance(
-                audio: WAVEncoder.encode(samples: captured, sampleRate: sampleRate),
+                audio: WAVEncoder.encode(samples: captured, sampleRate: resampler.sampleRate),
                 mimeType: WAVEncoder.mimeType,
-                duration: .seconds(Double(captured.count) / sampleRate),
+                duration: .seconds(Double(captured.count) / resampler.sampleRate),
                 heardSpeech: true)
             onUtterance(utterance)
         }

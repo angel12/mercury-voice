@@ -12,7 +12,13 @@ public actor MicRecorder: VoiceRecording {
     private var pump: Task<Void, Never>?
 
     private var samples: [Float] = []
-    private var sampleRate: Double = 48000
+    /// Rate is locked by the first chunk; route-change chunks at other rates
+    /// are resampled into it (issue #43). Falls back to 48 kHz only for the
+    /// degenerate no-chunks case, where the buffer is empty anyway.
+    private var resampler = RateLockedResampler()
+    private var sampleRate: Double {
+        resampler.sampleRate > 0 ? resampler.sampleRate : 48000
+    }
     private var heardSpeech = false
     private var silenceStartedAtSample: Int?
     private var autoStopFired = false
@@ -60,8 +66,8 @@ public actor MicRecorder: VoiceRecording {
 
     private func process(_ chunk: AudioChunk) {
         guard streamID != nil else { return }
-        sampleRate = chunk.sampleRate
-        samples.append(contentsOf: chunk.samples)
+        let normalized = resampler.normalize(chunk)
+        samples.append(contentsOf: normalized)
 
         let level = AudioLevel.normalizedRMS(chunk.samples)
         let elapsed = seconds(samples.count)
@@ -112,6 +118,7 @@ public actor MicRecorder: VoiceRecording {
 
     private func resetBuffers() {
         samples.removeAll()
+        resampler.reset()
         heardSpeech = false
         silenceStartedAtSample = nil
         autoStopFired = false
