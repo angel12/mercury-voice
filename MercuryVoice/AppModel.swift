@@ -292,6 +292,15 @@ final class AppModel {
                 switch update {
                 case .phase(let phase):
                     self.phase = phase
+                    // The gateway's redial loop surfaces as disconnected →
+                    // connecting → ready; the conversation UI shows its
+                    // reconnecting indicator off this flag (issue #44).
+                    if case .disconnected = phase {
+                        self.conversation?.connectionLost()
+                    }
+                    if case .connecting = phase {
+                        self.conversation?.connectionLost()
+                    }
                     if case .ready(let isReconnect) = phase {
                         if !isReconnect {
                             await self.loadBrowseData()
