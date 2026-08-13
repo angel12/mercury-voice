@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "HermesVoiceCore",
+    name: "MercuryVoiceCore",
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "HermesKit", targets: ["HermesKit"]),

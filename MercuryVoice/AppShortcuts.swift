@@ -50,7 +50,7 @@ struct StartSessionIntent: AppIntent {
     }
 }
 
-struct HermesVoiceShortcuts: AppShortcutsProvider {
+struct MercuryVoiceShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
             intent: StartSessionIntent(),

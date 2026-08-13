@@ -211,7 +211,7 @@ public final class AudioCaptureService: @unchecked Sendable {
 
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw HermesAudioError.noInputDevice
+            throw MercuryAudioError.noInputDevice
         }
 
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
@@ -263,7 +263,7 @@ public final class AudioCaptureService: @unchecked Sendable {
     }
 }
 
-public enum HermesAudioError: Error, LocalizedError {
+public enum MercuryAudioError: Error, LocalizedError {
     case noInputDevice
     case playbackSetupFailed
 

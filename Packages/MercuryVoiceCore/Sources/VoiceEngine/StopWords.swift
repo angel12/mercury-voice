@@ -28,6 +28,8 @@ public enum StopWords {
     /// Address prefixes stripped before matching; order significant, only the
     /// first hit is stripped.
     static let addressPrefixes = [
+        "hey mercury",
+        "mercury",
         "hey hermes",
         "hermes",
         "ok",

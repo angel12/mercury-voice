@@ -437,7 +437,7 @@ final class AppModel {
         var errorDescription: String? {
             switch self {
             case .notConfigured:
-                return "Open Hermes Voice and connect to your server once first."
+                return "Open Mercury Voice and connect to your server once first."
             case .connectFailed(let reason):
                 return reason
             }

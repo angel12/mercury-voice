@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct HermesVoiceApp: App {
+struct MercuryVoiceApp: App {
     @State private var model = AppModel.shared
     @AppStorage(ThemePreference.key) private var theme = ThemePreference.system
     #if os(macOS)

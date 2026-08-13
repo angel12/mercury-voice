@@ -3,7 +3,7 @@ import SwiftUI
 import WidgetKit
 
 @main
-struct HermesVoiceWidgetsBundle: WidgetBundle {
+struct MercuryVoiceWidgetsBundle: WidgetBundle {
     var body: some Widget {
         ConversationLiveActivity()
     }
@@ -30,7 +30,7 @@ struct ConversationLiveActivity: Widget {
                         .padding(.trailing, 4)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    Text(context.state.title ?? "Hermes Voice")
+                    Text(context.state.title ?? "Mercury Voice")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -58,7 +58,7 @@ private struct LockScreenCard: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(state.title ?? "Hermes Voice")
+                Text(state.title ?? "Mercury Voice")
                     .font(.headline)
                     .lineLimit(1)
                 StatusBadge(state: state)

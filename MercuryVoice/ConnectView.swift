@@ -21,7 +21,7 @@ struct ConnectView: View {
                     Image(systemName: "waveform.circle.fill")
                         .font(.system(size: 56))
                         .foregroundStyle(.tint)
-                    Text("Hermes Voice")
+                    Text("Mercury Voice")
                         .font(.largeTitle.bold())
                     Text("Voice conversations with your Hermes agent")
                         .foregroundStyle(.secondary)

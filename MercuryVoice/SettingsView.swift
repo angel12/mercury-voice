@@ -50,8 +50,8 @@
                         .disabled(!hotkey.enabled)
                     Text(
                         hotkey.isGlobal
-                            ? "The shortcut mutes the microphone from any app, even while Hermes Voice is in the background. Other apps won't receive the key."
-                            : "The shortcut works while Hermes Voice is the active app."
+                            ? "The shortcut mutes the microphone from any app, even while Mercury Voice is in the background. Other apps won't receive the key."
+                            : "The shortcut works while Mercury Voice is the active app."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

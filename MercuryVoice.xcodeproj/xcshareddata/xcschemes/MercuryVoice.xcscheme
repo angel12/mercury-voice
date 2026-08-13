@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "AA00000000000000000000E1"
-               BuildableName = "HermesVoice.app"
-               BlueprintName = "HermesVoice"
-               ReferencedContainer = "container:HermesVoice.xcodeproj">
+               BuildableName = "MercuryVoice.app"
+               BlueprintName = "MercuryVoice"
+               ReferencedContainer = "container:MercuryVoice.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -45,9 +45,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "AA00000000000000000000E1"
-            BuildableName = "HermesVoice.app"
-            BlueprintName = "HermesVoice"
-            ReferencedContainer = "container:HermesVoice.xcodeproj">
+            BuildableName = "MercuryVoice.app"
+            BlueprintName = "MercuryVoice"
+            ReferencedContainer = "container:MercuryVoice.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -62,9 +62,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "AA00000000000000000000E1"
-            BuildableName = "HermesVoice.app"
-            BlueprintName = "HermesVoice"
-            ReferencedContainer = "container:HermesVoice.xcodeproj">
+            BuildableName = "MercuryVoice.app"
+            BlueprintName = "MercuryVoice"
+            ReferencedContainer = "container:MercuryVoice.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

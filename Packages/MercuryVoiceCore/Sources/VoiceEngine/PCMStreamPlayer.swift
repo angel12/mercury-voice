@@ -24,7 +24,7 @@ final class PCMStreamPlayer: @unchecked Sendable {
         guard
             let format = AVAudioFormat(
                 standardFormatWithSampleRate: sampleRate, channels: 1)
-        else { throw HermesAudioError.playbackSetupFailed }
+        else { throw MercuryAudioError.playbackSetupFailed }
 
         engine.attach(node)
         // The engine resamples from the stream rate to the hardware rate.
