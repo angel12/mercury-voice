@@ -38,7 +38,7 @@ public actor HermesAuthenticator {
     /// client holding tokens in the keychain instead. Never store or replay
     /// cookies — a stale cookie silently overriding the Bearer header would
     /// be undebuggable.
-    private static func cookieFreeConfig() -> URLSessionConfiguration {
+    static func cookieFreeConfig() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 30
         config.httpShouldSetCookies = false
@@ -260,7 +260,7 @@ public actor HermesAuthenticator {
 
     // MARK: Shared HTTP plumbing
 
-    private static func perform(
+    static func perform(
         _ request: URLRequest, on session: URLSession
     ) async throws -> JSONValue {
         let (data, response) = try await session.data(for: request)

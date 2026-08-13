@@ -99,15 +99,16 @@ final class AppModel {
 
     // MARK: Connect flow
 
-    /// Set when a gated server advertises a username/password provider and
-    /// the user must sign in before the gateway can open.
-    struct PendingPasswordLogin: Equatable {
+    /// Set when a gated server requires sign-in before the gateway can
+    /// open. Carries whichever options the server advertises: a password
+    /// provider, native-OAuth providers (issue #51), or both.
+    struct PendingLogin: Equatable {
         var endpoint: ServerEndpoint
-        var providerName: String
-        var providerDisplayName: String
+        var passwordProvider: AuthProviderInfo?
+        var oauthProviders: [AuthProviderInfo] = []
         var prefillUsername: String = ""
     }
-    private(set) var pendingPasswordLogin: PendingPasswordLogin?
+    private(set) var pendingLogin: PendingLogin?
 
     func autoConnectOnLaunch() async {
         guard connection == nil,
@@ -138,7 +139,7 @@ final class AppModel {
         connectGeneration += 1
         let generation = connectGeneration
         connectError = nil
-        pendingPasswordLogin = nil
+        pendingLogin = nil
         self.endpoint = endpoint
 
         // One authenticator shared by the probe and the connection, so a
@@ -200,12 +201,13 @@ final class AppModel {
     /// Sign in to a gated server with the pending password provider, then
     /// connect with the minted tokens.
     func signIn(username: String, password: String) async {
-        guard let pending = pendingPasswordLogin else { return }
+        guard let pending = pendingLogin, let provider = pending.passwordProvider
+        else { return }
         connectError = nil
         do {
             let session = try await HermesAuthenticator.logIn(
                 endpoint: pending.endpoint,
-                provider: pending.providerName,
+                provider: provider.name,
                 username: username,
                 password: password)
             await connect(endpoint: pending.endpoint, credentials: .password(session))
@@ -216,34 +218,59 @@ final class AppModel {
         }
     }
 
+    /// Sign in via the system browser against a native-OAuth provider
+    /// (issue #51), then connect with the minted tokens.
+    func signIn(oauthProvider provider: AuthProviderInfo) async {
+        guard let pending = pendingLogin else { return }
+        connectError = nil
+        do {
+            let session = try await NativeOAuthSignIn().signIn(
+                endpoint: pending.endpoint, provider: provider)
+            await connect(endpoint: pending.endpoint, credentials: .password(session))
+        } catch LoopbackRedirectListener.RedirectError.cancelled {
+            // User closed the browser sheet — stay on the sign-in form.
+        } catch let error as HermesError {
+            connectError = error.errorDescription
+        } catch {
+            connectError = error.localizedDescription
+        }
+    }
+
     func cancelPasswordLogin() {
-        pendingPasswordLogin = nil
+        pendingLogin = nil
         connectError = nil
     }
 
-    /// Look up the gated server's sign-in options; surface the password form
-    /// when available, else explain that OAuth-only servers aren't supported.
-    /// `generation` ties the mutation to the connect attempt that asked for it;
-    /// pass nil when there is no competing connect flow (auth-expiry pump).
+    /// Look up the gated server's sign-in options and surface whichever the
+    /// server advertises: the password form, native-OAuth browser sign-in
+    /// (issue #51), or both. `generation` ties the mutation to the connect
+    /// attempt that asked for it; pass nil when there is no competing
+    /// connect flow (auth-expiry pump).
     private func presentGatedLogin(
         endpoint: ServerEndpoint, note: String? = nil, generation: Int? = nil
     ) async {
         let providers =
             (try? await HermesAuthenticator.authProviders(endpoint: endpoint)) ?? []
         if let generation, generation != connectGeneration { return }
-        guard let passwordProvider = providers.first(where: \.supportsPassword) else {
+        let passwordProvider = providers.first(where: \.supportsPassword)
+        // OAuth buttons need the RFC 8252 broker: an older gateway can
+        // register OAuth providers it only serves via browser cookies,
+        // which this app can't use — require the native_pkce advertisement.
+        let nativePKCE = serverStatus?.authFlows.contains("native_pkce") ?? false
+        let oauthProviders = nativePKCE ? providers.filter { !$0.supportsPassword } : []
+        guard passwordProvider != nil || !oauthProviders.isEmpty else {
             connectError =
-                "This server only offers browser (OAuth) sign-in, which this app doesn't support. Configure dashboard.basic_auth on the server for username/password access, or run it on loopback."
+                "This server's sign-in methods aren't supported by this app. Configure dashboard.basic_auth or an OAuth provider on a current Hermes gateway, or run it on loopback."
             return
         }
         var prefill = ""
         if case .password(let saved)? = tokenStore.credentials(for: endpoint) {
             prefill = saved.username
         }
-        pendingPasswordLogin = PendingPasswordLogin(
+        pendingLogin = PendingLogin(
             endpoint: endpoint,
-            providerName: passwordProvider.name,
-            providerDisplayName: passwordProvider.displayName,
+            passwordProvider: passwordProvider,
+            oauthProviders: oauthProviders,
             prefillUsername: prefill)
         connectError = note
     }
