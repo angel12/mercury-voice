@@ -32,7 +32,7 @@ public actor GatewayClient {
     /// Backend contract version reported in gateway payloads (session.info's
     /// `desktop_contract`); the app warns when older than what it was built
     /// against.
-    public static let builtAgainstDesktopContract = 5
+    public static let builtAgainstDesktopContract = 6
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         self.endpoint = endpoint
