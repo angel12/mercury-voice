@@ -3,7 +3,8 @@ import Foundation
 /// A Hermes backend the app can talk to: normalized base URL + session token.
 ///
 /// Accepts the forms users actually paste:
-///   - `localhost:8080`, `192.168.1.5:8080`, `my-mac.tail1234.ts.net`
+///   - `localhost:8080`, `192.168.1.5:8080` (default to http),
+///     `my-mac.tail1234.ts.net` (DNS names default to https)
 ///   - `http://127.0.0.1:8080` / `https://hermes.example.com`
 ///   - a full dashboard URL `http://127.0.0.1:8080/?token=abc123` (hermes
 ///     prints/opens this on startup) — the token is lifted out automatically.
@@ -64,11 +65,18 @@ public struct ServerEndpoint: Sendable, Equatable, Codable, Identifiable {
         guard !trimmed.isEmpty else { throw ParseError.empty }
 
         // Prepend a scheme when missing so URLComponents can parse host:port.
+        // Qualified DNS names default to https:// — iOS ATS blocks plaintext
+        // HTTP to them anyway, and they're the case (Tailscale MagicDNS, real
+        // domains) where TLS is actually available. IP literals, loopback,
+        // `.local`, and single-label LAN names keep the http:// default;
+        // that's the home-lab case where HTTPS is rarely an option, and an
+        // explicit scheme is always honored (issue #41).
         let withScheme: String
         if trimmed.contains("://") {
             withScheme = trimmed
         } else {
-            withScheme = "http://" + trimmed
+            let probeHost = URLComponents(string: "http://" + trimmed)?.host ?? ""
+            withScheme = (defaultsToHTTPS(host: probeHost) ? "https://" : "http://") + trimmed
         }
 
         guard let components = URLComponents(string: withScheme),
@@ -91,6 +99,21 @@ public struct ServerEndpoint: Sendable, Equatable, Codable, Identifiable {
         return ParseResult(
             endpoint: ServerEndpoint(baseURL: baseURL),
             embeddedToken: token)
+    }
+
+    /// True when a schemeless input's host should default to `https://`:
+    /// a qualified DNS name that isn't loopback, `.local`, or an IP literal.
+    private static func defaultsToHTTPS(host: String) -> Bool {
+        let host = host.lowercased()
+        guard !host.isEmpty else { return false }
+        if host == "localhost" { return false }
+        if host.contains(":") { return false }  // IPv6 literal
+        if host.hasSuffix(".local") { return false }
+        guard host.contains(".") else { return false }  // single-label LAN name
+        let isIPv4 = host.split(separator: ".").allSatisfy {
+            !$0.isEmpty && $0.allSatisfy(\.isNumber)
+        }
+        return !isIPv4
     }
 
     // MARK: URL builders

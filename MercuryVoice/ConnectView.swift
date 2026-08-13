@@ -148,6 +148,14 @@ struct ConnectView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            if !pending.endpoint.isSecure, !pending.endpoint.isLoopbackHost {
+                Label(
+                    "This connection is unencrypted (HTTP): your password will be visible to anyone on the network path. Use an https:// address if the server supports it.",
+                    systemImage: "lock.open.trianglebadge.exclamationmark")
+                .font(.callout)
+                .foregroundStyle(.orange)
+            }
+
             Text("Username").font(.headline)
             TextField("Username", text: $usernameInput)
                 .textFieldStyle(.roundedBorder)

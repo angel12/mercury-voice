@@ -55,6 +55,42 @@ struct ServerEndpointTests {
         let b = try ServerEndpoint.parse("localhost:80").endpoint
         #expect(a.key == b.key)
     }
+
+    // MARK: Schemeless scheme defaults (issue #41)
+
+    /// Qualified DNS names default to https — ATS blocks plaintext HTTP to
+    /// them anyway, and it keeps passwords off the wire for the Tailscale /
+    /// real-domain case.
+    @Test func schemelessDNSNamesDefaultToHTTPS() throws {
+        #expect(
+            try ServerEndpoint.parse("my-mac.tail1234.ts.net").endpoint.baseURL.absoluteString
+                == "https://my-mac.tail1234.ts.net")
+        #expect(
+            try ServerEndpoint.parse("hermes.example.com:8443").endpoint.baseURL.absoluteString
+                == "https://hermes.example.com:8443")
+    }
+
+    /// The home-lab forms keep the http default — HTTPS is rarely available
+    /// on LAN IPs and Bonjour names.
+    @Test func schemelessLocalFormsKeepHTTP() throws {
+        for input in [
+            "localhost", "127.0.0.1:8080", "10.0.0.5:3000", "192.168.1.5",
+            "mymac", "mymac:9119", "my-mac.local:8080", "[::1]:8080",
+        ] {
+            let endpoint = try ServerEndpoint.parse(input).endpoint
+            #expect(endpoint.baseURL.scheme == "http", "\(input) should default to http")
+        }
+    }
+
+    /// An explicit scheme always wins over the host-based default.
+    @Test func explicitSchemeIsHonored() throws {
+        #expect(
+            try ServerEndpoint.parse("http://hermes.example.com").endpoint.baseURL.scheme
+                == "http")
+        #expect(
+            try ServerEndpoint.parse("https://192.168.1.5:8443").endpoint.baseURL.scheme
+                == "https")
+    }
 }
 
 @Suite("JSONValue")
