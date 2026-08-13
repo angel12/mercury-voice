@@ -399,6 +399,8 @@ struct ApprovalSheet: View {
                     .tint(choice == "deny" ? .red : .accentColor)
                 }
             }
+            .disabled(controller.promptResponseInFlight)
+            PromptSendStatus(controller: controller)
         }
         .padding(24)
         #if os(macOS)
@@ -406,6 +408,29 @@ struct ApprovalSheet: View {
         #else
             .presentationDetents([.medium])
         #endif
+    }
+}
+
+/// Shared footer for the prompt sheets: a spinner while the response RPC is
+/// in flight, or the send failure with a retry hint (the prompt stays up, so
+/// tapping a choice again retries — issue #40).
+struct PromptSendStatus: View {
+    let controller: ConversationController
+
+    var body: some View {
+        if controller.promptResponseInFlight {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Sending…").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if let error = controller.promptSendError {
+            Label(
+                "Couldn't send the response — try again. (\(error))",
+                systemImage: "wifi.exclamationmark"
+            )
+            .font(.caption)
+            .foregroundStyle(.red)
+        }
     }
 }
 
@@ -457,7 +482,9 @@ struct ClarifySheet: View {
 
             Button("Skip") { controller.respondClarify(answer: "") }
                 .buttonStyle(.borderless)
+            PromptSendStatus(controller: controller)
         }
+        .disabled(controller.promptResponseInFlight)
         .padding(24)
         #if os(macOS)
             .frame(minWidth: 420)
