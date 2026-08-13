@@ -70,8 +70,16 @@
             activationDidCompleteWith activationState: WCSessionActivationState,
             error: (any Error)?
         ) {
+            guard activationState == .activated else { return }
             #if os(iOS)
-                if activationState == .activated { pushCurrent() }
+                pushCurrent()
+            #endif
+            #if os(watchOS)
+                // A context pushed while the watch app wasn't running does
+                // NOT replay through didReceiveApplicationContext — it sits
+                // in receivedApplicationContext, so adopt it on every
+                // activation (idempotent).
+                adopt(context: session.receivedApplicationContext)
             #endif
         }
 
@@ -82,7 +90,11 @@
                 _ session: WCSession,
                 didReceiveApplicationContext applicationContext: [String: Any]
             ) {
-                guard let data = applicationContext[Self.contextKey] as? Data,
+                adopt(context: applicationContext)
+            }
+
+            private func adopt(context: [String: Any]) {
+                guard let data = context[Self.contextKey] as? Data,
                     let payload = try? JSONDecoder().decode(Payload.self, from: data),
                     let parsed = try? ServerEndpoint.parse(payload.endpointKey)
                 else { return }
