@@ -11,7 +11,7 @@ import Security
 public struct KeychainTokenStore: Sendable {
     private let service: String
 
-    public init(service: String = "com.hermes.voice.tokens") {
+    public init(service: String = "com.mercury.voice.tokens") {
         self.service = service
     }
 
