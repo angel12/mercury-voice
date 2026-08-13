@@ -6,6 +6,10 @@ public struct ServerStatus: Sendable, Equatable {
     public var version: String?
     public var authRequired: Bool
     public var activeSessions: Int?
+    /// Gated-mode capability advertisement: "cookie" always, "native_pkce"
+    /// when a brokerable OAuth provider is registered (RFC 8252 flow).
+    /// Empty on older gateways — treat as cookie-only.
+    public var authFlows: [String]
     public var raw: JSONValue
 
     public init(raw: JSONValue) {
@@ -13,6 +17,7 @@ public struct ServerStatus: Sendable, Equatable {
         self.version = raw["version"]?.stringValue
         self.authRequired = raw["auth_required"]?.truthy ?? false
         self.activeSessions = raw["active_sessions"]?.intValue
+        self.authFlows = raw["auth_flows"]?.arrayValue?.compactMap(\.stringValue) ?? []
     }
 }
 

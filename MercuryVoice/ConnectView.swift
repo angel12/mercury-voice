@@ -28,13 +28,13 @@ struct ConnectView: View {
                 }
                 .padding(.top, 40)
 
-                if let pending = model.pendingPasswordLogin {
-                    passwordLoginForm(pending)
+                if let pending = model.pendingLogin {
+                    loginForm(pending)
                 } else {
                     serverForm
                 }
 
-                if model.pendingPasswordLogin == nil, !model.savedServers.isEmpty {
+                if model.pendingLogin == nil, !model.savedServers.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Recent servers").font(.headline)
                         ForEach(model.savedServers) { server in
@@ -76,7 +76,7 @@ struct ConnectView: View {
             .padding()
         }
         .sheet(isPresented: $showHelp) { ConnectHelpView() }
-        .onChange(of: model.pendingPasswordLogin) { _, pending in
+        .onChange(of: model.pendingLogin) { _, pending in
             if let pending, usernameInput.isEmpty {
                 usernameInput = pending.prefillUsername
             }
@@ -138,40 +138,69 @@ struct ConnectView: View {
         .frame(maxWidth: 420)
     }
 
-    private func passwordLoginForm(_ pending: AppModel.PendingPasswordLogin) -> some View {
+    private func loginForm(_ pending: AppModel.PendingLogin) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Label(
                 "Sign in to \(pending.endpoint.displayName)",
                 systemImage: "lock.shield")
             .font(.headline)
-            Text("This server uses \(pending.providerDisplayName) authentication.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
 
-            if !pending.endpoint.isSecure, !pending.endpoint.isLoopbackHost {
-                Label(
-                    "This connection is unencrypted (HTTP): your password will be visible to anyone on the network path. Use an https:// address if the server supports it.",
-                    systemImage: "lock.open.trianglebadge.exclamationmark")
-                .font(.callout)
-                .foregroundStyle(.orange)
+            // Native-OAuth providers (issue #51): system-browser sign-in.
+            ForEach(pending.oauthProviders) { provider in
+                Button {
+                    startOAuth(provider)
+                } label: {
+                    if connecting {
+                        ProgressView().frame(maxWidth: .infinity)
+                    } else {
+                        Label(
+                            "Continue with \(provider.displayName)",
+                            systemImage: "person.crop.circle.badge.checkmark")
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(connecting)
             }
 
-            Text("Username").font(.headline)
-            TextField("Username", text: $usernameInput)
-                .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
-                #if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    .textContentType(.username)
-                #endif
+            if pending.passwordProvider != nil, !pending.oauthProviders.isEmpty {
+                HStack {
+                    VStack { Divider() }
+                    Text("or").font(.caption).foregroundStyle(.secondary)
+                    VStack { Divider() }
+                }
+            }
 
-            Text("Password").font(.headline)
-            SecureField("Password", text: $passwordInput)
-                .textFieldStyle(.roundedBorder)
-                #if os(iOS)
-                    .textContentType(.password)
-                #endif
-                .onSubmit { submitLogin() }
+            if let passwordProvider = pending.passwordProvider {
+                Text("This server uses \(passwordProvider.displayName) authentication.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                if !pending.endpoint.isSecure, !pending.endpoint.isLoopbackHost {
+                    Label(
+                        "This connection is unencrypted (HTTP): your password will be visible to anyone on the network path. Use an https:// address if the server supports it.",
+                        systemImage: "lock.open.trianglebadge.exclamationmark")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                }
+
+                Text("Username").font(.headline)
+                TextField("Username", text: $usernameInput)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .textContentType(.username)
+                    #endif
+
+                Text("Password").font(.headline)
+                SecureField("Password", text: $passwordInput)
+                    .textFieldStyle(.roundedBorder)
+                    #if os(iOS)
+                        .textContentType(.password)
+                    #endif
+                    .onSubmit { submitLogin() }
+            }
 
             if let error = model.connectError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -179,22 +208,33 @@ struct ConnectView: View {
                     .foregroundStyle(.red)
             }
 
-            Button {
-                submitLogin()
-            } label: {
-                if connecting {
-                    ProgressView().frame(maxWidth: .infinity)
-                } else {
-                    Text("Sign In").frame(maxWidth: .infinity)
+            if pending.passwordProvider != nil {
+                Button {
+                    submitLogin()
+                } label: {
+                    if connecting {
+                        ProgressView().frame(maxWidth: .infinity)
+                    } else {
+                        Text("Sign In").frame(maxWidth: .infinity)
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(usernameInput.isEmpty || passwordInput.isEmpty || connecting)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(usernameInput.isEmpty || passwordInput.isEmpty || connecting)
 
             Button("Back") { model.cancelPasswordLogin() }
                 .buttonStyle(.borderless)
         }
         .frame(maxWidth: 420)
+    }
+
+    private func startOAuth(_ provider: AuthProviderInfo) {
+        guard !connecting else { return }
+        connecting = true
+        Task {
+            await model.signIn(oauthProvider: provider)
+            connecting = false
+        }
     }
 
     private func submitLogin() {
