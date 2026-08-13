@@ -109,15 +109,39 @@ public struct ProjectInfo: Sendable, Equatable, Identifiable {
             return nil
         }
         self.id = id
-        self.name = json["name"]?.stringValue ?? json["title"]?.stringValue ?? id
+        // Contract v5 project nodes are camelCase with `label` for the
+        // display name (tui_gateway/project_tree.py `_project_node`); the
+        // snake_case spellings are kept as fallbacks for older servers.
+        self.name =
+            json["label"]?.stringValue
+            ?? json["name"]?.stringValue
+            ?? json["title"]?.stringValue
+            ?? id
         self.primaryPath =
-            json["primary_path"]?.stringValue
-            ?? json["path"]?.stringValue
+            json["path"]?.stringValue
+            ?? json["primary_path"]?.stringValue
             ?? json["root"]?.stringValue
         self.kind = json["kind"]?.stringValue ?? json["type"]?.stringValue
-        self.previewSessions = (json["sessions"] ?? json["preview_sessions"])?.arrayValue?
+        self.previewSessions =
+            (json["previewSessions"] ?? json["preview_sessions"] ?? json["sessions"])?
+            .arrayValue?
             .compactMap(SessionSummary.init(json:)) ?? []
-        self.sessionCount = json["session_count"]?.intValue
+        self.sessionCount = json["sessionCount"]?.intValue ?? json["session_count"]?.intValue
+    }
+
+    /// Session rows of a hydrated `projects.project_sessions` node. Contract
+    /// v5 nests them repo → lane → sessions (`repos[].groups[].sessions`);
+    /// lanes are already newest-first, so flatten in server order.
+    public static func hydratedSessions(in project: JSONValue) -> [SessionSummary] {
+        var rows: [SessionSummary] = []
+        for repo in project["repos"]?.arrayValue ?? [] {
+            for lane in repo["groups"]?.arrayValue ?? [] {
+                rows.append(
+                    contentsOf: lane["sessions"]?.arrayValue?
+                        .compactMap(SessionSummary.init(json:)) ?? [])
+            }
+        }
+        return rows
     }
 }
 
