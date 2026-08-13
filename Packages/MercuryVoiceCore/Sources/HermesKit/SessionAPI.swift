@@ -130,10 +130,13 @@ extension HermesConnection {
         return ProjectTree(json: result)
     }
 
+    /// `projects.project_sessions` — the fully hydrated rows for one
+    /// project, nested under `project` as repo → lane → sessions.
     public func projectSessions(projectID: String) async throws -> [SessionSummary] {
         let result = try await request(
             "projects.project_sessions", params: ["project_id": .string(projectID)])
-        return result["sessions"]?.arrayValue?.compactMap(SessionSummary.init(json:)) ?? []
+        guard let project = result["project"] else { return [] }
+        return ProjectInfo.hydratedSessions(in: project)
     }
 
     // MARK: Prompt-family responses
