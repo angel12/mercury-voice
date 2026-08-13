@@ -152,12 +152,27 @@ final class ConversationController {
 
     // MARK: Lifecycle
 
+    /// True once teardown() has run. begin() re-checks this after every
+    /// suspension point: the user can end the conversation while session
+    /// opening is still in flight (issue #38), and nothing may start after
+    /// that — teardown ran against a controller with no engine or session
+    /// yet, so a resumed begin() would otherwise arm the mic and hold a
+    /// backend session that nobody can reach anymore.
+    private var isTornDown = false
+
     func begin(mode: Mode) async {
         self.mode = mode
         do {
             try await openSession(mode: mode)
         } catch {
+            guard !isTornDown else { return }
             setupError = (error as? HermesError)?.errorDescription ?? error.localizedDescription
+            return
+        }
+        guard !isTornDown else {
+            // Torn down while the open was in flight: teardown couldn't see
+            // the session (the handle didn't exist yet), so close it here.
+            await closeSessionIfOpen()
             return
         }
         await startVoiceLoop()
@@ -229,6 +244,10 @@ final class ConversationController {
         await tracker.setOnChange { [weak self] in
             Task { await self?.agentChanged() }
         }
+        // Teardown may have interleaved during the hop above; it already
+        // ended the (never-started) engine and closed the session — bail
+        // before arming handlers, keepalive, or the mic.
+        guard !isTornDown else { return }
 
         stateTask = Task { [weak self] in
             for await state in await engine.uiStates() {
@@ -248,6 +267,7 @@ final class ConversationController {
     }
 
     func teardown() async {
+        isTornDown = true
         trackerEventContinuation?.finish()
         trackerEventPump?.cancel()
         stateTask?.cancel()
@@ -265,9 +285,15 @@ final class ConversationController {
         #endif
         await tracker.setOnChange(nil)
         if let engine { await engine.end() }
-        if let sid = sessionBox.runtimeID {
-            await connection.closeSession(sessionID: sid)
-        }
+        await closeSessionIfOpen()
+    }
+
+    /// Consumes the runtime session id so teardown and a torn-down begin()
+    /// can both call this without double-closing.
+    private func closeSessionIfOpen() async {
+        guard let sid = sessionBox.runtimeID else { return }
+        sessionBox.runtimeID = nil
+        await connection.closeSession(sessionID: sid)
     }
 
     /// AppModel forwards scene-active. Foregrounding is authoritative: an
