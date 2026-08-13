@@ -416,6 +416,7 @@ final class ConversationController {
         case GatewayEvent.Kind.approvalRequest:
             if let request = ApprovalRequest(event: event) {
                 approval = request
+                promptSendError = nil
                 Task {
                     await engine?.setPaused(true)
                     _ = await speech.playFallback(
@@ -426,6 +427,7 @@ final class ConversationController {
         case GatewayEvent.Kind.clarifyRequest:
             if let request = ClarifyRequest(event: event) {
                 clarify = request
+                promptSendError = nil
                 Task {
                     await engine?.setPaused(true)
                     _ = await speech.playFallback(text: "Hermes has a question for you.")
@@ -435,6 +437,7 @@ final class ConversationController {
         case GatewayEvent.Kind.clarifyExpire:
             if clarify?.requestID == event.payload["request_id"]?.stringValue {
                 clarify = nil
+                promptSendError = nil
                 resumeIfUnprompted()
             }
 
@@ -521,22 +524,50 @@ final class ConversationController {
         }
     }
 
+    /// The backend stays blocked until a prompt response actually arrives, so
+    /// the prompt is kept (and the sheet stays up) until the RPC confirms —
+    /// a transient send failure surfaces in the sheet and the same request
+    /// can be retried (issue #40). While a send is in flight this flag blocks
+    /// duplicate submissions, which the old clear-before-send did implicitly.
+    private(set) var promptResponseInFlight = false
+    /// Non-nil after a response failed to send; shown inside the prompt sheet.
+    private(set) var promptSendError: String?
+
     func respondApproval(choice: String) {
-        guard let request = approval else { return }
-        approval = nil
-        Task {
-            try? await connection.respondApproval(
-                sessionID: request.sessionID, choice: choice)
-            resumeIfUnprompted()
+        guard let request = approval, !promptResponseInFlight else { return }
+        sendPromptResponse {
+            try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+        } onConfirmed: { [weak self] in
+            self?.approval = nil
         }
     }
 
     func respondClarify(answer: String) {
-        guard let request = clarify else { return }
-        clarify = nil
+        guard let request = clarify, !promptResponseInFlight else { return }
+        sendPromptResponse {
+            try await $0.respondClarify(requestID: request.requestID, answer: answer)
+        } onConfirmed: { [weak self] in
+            self?.clarify = nil
+        }
+    }
+
+    private func sendPromptResponse(
+        _ send: @escaping (HermesConnection) async throws -> Void,
+        onConfirmed: @escaping @MainActor () -> Void
+    ) {
+        promptResponseInFlight = true
+        promptSendError = nil
         Task {
-            try? await connection.respondClarify(requestID: request.requestID, answer: answer)
-            resumeIfUnprompted()
+            defer { promptResponseInFlight = false }
+            do {
+                try await send(connection)
+                onConfirmed()
+                promptSendError = nil
+                resumeIfUnprompted()
+            } catch {
+                promptSendError =
+                    (error as? HermesError)?.errorDescription ?? error.localizedDescription
+            }
         }
     }
 
