@@ -58,6 +58,15 @@ final class AppModel {
     /// overwriting `connection` and orphaning a live gateway.
     private var connectGeneration = 0
 
+    /// Same pattern for browse loads (issue #42): every refresh (and
+    /// disconnect) bumps it, and in-flight loads re-check after each
+    /// suspension so a stale response — an old server's, an old profile's, or
+    /// just a superseded pull-to-refresh — can't overwrite newer browse state.
+    private var browseGeneration = 0
+    /// The profiles fetch is slow and unscoped-by-profile, so it lives in its
+    /// own task guarded by `connectGeneration` and cancelled on disconnect.
+    private var profilesTask: Task<Void, Never>?
+
     // MARK: Saved servers
 
     struct SavedServer: Codable, Identifiable {
@@ -241,8 +250,14 @@ final class AppModel {
 
     func disconnect() {
         connectGeneration += 1  // invalidate any in-flight connect()
+        browseGeneration += 1  // …and any in-flight browse load
         updatePump?.cancel()
         updatePump = nil
+        profilesTask?.cancel()
+        profilesTask = nil
+        profilesLoading = false
+        browseLoading = false
+        browseError = nil
         let connection = connection
         let conversation = conversation
         self.connection = nil
@@ -310,19 +325,28 @@ final class AppModel {
         guard let connection else { return }
         browseError = nil
 
-        // Profiles are slow (walks skill trees) — load independently.
+        // Profiles are slow (walks skill trees) — load independently. REST
+        // calls outlive connection.stop(), so a response from a previous
+        // server could land here mid-connect; the generation check drops it
+        // (it would otherwise satisfy the isEmpty gate above and block the
+        // new server's profiles for the whole session).
         if profiles.isEmpty {
             profilesLoading = true
-            Task {
-                defer { profilesLoading = false }
-                if let loaded = try? await connection.rest.profiles() {
-                    profiles = loaded
-                    if selectedProfile == nil {
-                        selectedProfile =
-                            loaded.first(where: \.isDefault)?.name ?? loaded.first?.name
-                    }
-                    Self.cacheProfileNames(loaded.map(\.name))
+            profilesTask?.cancel()
+            let generation = connectGeneration
+            profilesTask = Task {
+                defer {
+                    if generation == connectGeneration { profilesLoading = false }
                 }
+                guard let loaded = try? await connection.rest.profiles(),
+                    generation == connectGeneration
+                else { return }
+                profiles = loaded
+                if selectedProfile == nil {
+                    selectedProfile =
+                        loaded.first(where: \.isDefault)?.name ?? loaded.first?.name
+                }
+                Self.cacheProfileNames(loaded.map(\.name))
             }
         }
         await refreshProjects()
@@ -330,33 +354,46 @@ final class AppModel {
 
     func refreshProjects() async {
         guard let connection else { return }
+        browseGeneration += 1  // supersede any in-flight load
+        let generation = browseGeneration
         browseLoading = true
-        defer { browseLoading = false }
+        defer {
+            // A superseding refresh owns the flag now; only the newest
+            // generation may clear it (or publish anything below).
+            if generation == browseGeneration { browseLoading = false }
+        }
         do {
-            projectTree = try await connection.projectsTree()
+            let tree = try await connection.projectsTree()
+            guard generation == browseGeneration else { return }
+            projectTree = tree
             let profile = selectedProfile ?? "all"
             // The full recent list for the profile; the workspace page shows
             // the project-scoped grouping, so no de-duplication needed here.
-            recentSessions = try await connection.rest.profileSessions(profile: profile, limit: 30)
+            let sessions = try await connection.rest.profileSessions(profile: profile, limit: 30)
+            guard generation == browseGeneration else { return }
+            recentSessions = sessions
             browseError = nil
         } catch let error as HermesError {
+            guard generation == browseGeneration else { return }
             if case .rpcError(HermesError.RPCCode.methodNotFound, _) = error {
                 // Older backend without projects.* — degrade to grouping the
                 // flat list by repo root / cwd.
-                await degradeToFlatSessions()
+                await degradeToFlatSessions(generation: generation)
             } else {
                 browseError = error.errorDescription
             }
         } catch {
+            guard generation == browseGeneration else { return }
             browseError = error.localizedDescription
         }
     }
 
-    private func degradeToFlatSessions() async {
+    private func degradeToFlatSessions(generation: Int) async {
         guard let connection else { return }
         guard
             let sessions = try? await connection.rest.profileSessions(
-                profile: selectedProfile ?? "all", limit: 50)
+                profile: selectedProfile ?? "all", limit: 50),
+            generation == browseGeneration
         else { return }
         var groups: [String: [SessionSummary]] = [:]
         for session in sessions {
