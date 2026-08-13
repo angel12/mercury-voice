@@ -12,6 +12,30 @@
 		E6BD865F3024E38F00043250 /* VoiceEngine in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000102 /* VoiceEngine */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		AB00000000000000000000E3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA0000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AB00000000000000000000E1;
+			remoteInfo = HermesVoiceWidgets;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		AB00000000000000000000C4 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				AB0000000000000000000001 /* HermesVoiceWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		AA00000000000000000000A1 /* HermesVoice.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HermesVoice.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB00000000000000000000A1 /* HermesVoiceWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HermesVoiceWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -65,6 +89,13 @@
 			files = (
 				E6BD865F3024E38F00043250 /* VoiceEngine in Frameworks */,
 				E6BD865E3024E38F00043250 /* HermesKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AB00000000000000000000C1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -145,39 +176,6 @@
 		};
 /* End PBXNativeTarget section */
 
-/* Begin PBXTargetDependency section */
-		AB00000000000000000000E2 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			platformFilter = ios;
-			target = AB00000000000000000000E1 /* HermesVoiceWidgets */;
-			targetProxy = AB00000000000000000000E3 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
-
-/* Begin PBXContainerItemProxy section */
-		AB00000000000000000000E3 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = AA0000000000000000000001 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = AB00000000000000000000E1;
-			remoteInfo = HermesVoiceWidgets;
-		};
-/* End PBXContainerItemProxy section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		AB00000000000000000000C4 /* Embed Foundation Extensions */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 13;
-			files = (
-				AB0000000000000000000001 /* HermesVoiceWidgets.appex in Embed Foundation Extensions */,
-			);
-			name = "Embed Foundation Extensions";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
-
 /* Begin PBXProject section */
 		AA0000000000000000000001 /* Project object */ = {
 			isa = PBXProject;
@@ -251,15 +249,14 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
-/* Begin PBXFrameworksBuildPhase section (widgets) */
-		AB00000000000000000000C1 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
+/* Begin PBXTargetDependency section */
+		AB00000000000000000000E2 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = ios;
+			target = AB00000000000000000000E1 /* HermesVoiceWidgets */;
+			targetProxy = AB00000000000000000000E3 /* PBXContainerItemProxy */;
 		};
-/* End PBXFrameworksBuildPhase section (widgets) */
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		AA0000000000000000000011 /* Debug */ = {
@@ -513,15 +510,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		AB00000000000000000000F1 /* Build configuration list for PBXNativeTarget "HermesVoiceWidgets" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				AB0000000000000000000031 /* Debug */,
-				AB0000000000000000000032 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 		AA0000000000000000000002 /* Build configuration list for PBXProject "HermesVoice" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -536,6 +524,15 @@
 			buildConfigurations = (
 				AA0000000000000000000021 /* Debug */,
 				AA0000000000000000000022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AB00000000000000000000F1 /* Build configuration list for PBXNativeTarget "HermesVoiceWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB0000000000000000000031 /* Debug */,
+				AB0000000000000000000032 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
