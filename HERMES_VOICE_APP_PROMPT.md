@@ -11,7 +11,7 @@ Build a native SwiftUI app (macOS + iOS, one multiplatform Xcode project) that i
 - Show **recent projects and sessions** so the user can either attach to an existing session or start a new session bound to a project's directory.
 - Run a hands-free, full-duplex voice loop: listen → transcribe → submit → speak the streamed reply → re-arm the mic, with barge-in and spoken stop-words.
 
-A reference copy of the hermes-agent source is at `./hermes-agent-main/` (re-download from GitHub if missing: `curl -sL https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.tar.gz | tar xz`). All file references below are relative to that directory and were verified against `main` as of 2026-08-06; if line numbers have drifted, search for the symbols named. **When in doubt about protocol behavior, read the referenced source — it is the contract.**
+A reference copy of the hermes-agent source is at `./hermes-agent-main/` (re-download from GitHub if missing: `curl -sL https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.tar.gz | tar xz`). All file references below are relative to that directory and were verified against `main` as of 2026-08-13 (desktop contract v6); if line numbers have drifted, search for the symbols named. **When in doubt about protocol behavior, read the referenced source — it is the contract.**
 
 ---
 
