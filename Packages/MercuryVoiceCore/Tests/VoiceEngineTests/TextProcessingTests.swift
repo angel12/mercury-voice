@@ -20,6 +20,8 @@ struct StopWordTests {
     }
 
     @Test func stripsAddressPrefixes() {
+        #expect(StopWords.isStopCommand("hey mercury stop"))
+        #expect(StopWords.isStopCommand("Mercury, stop."))
         #expect(StopWords.isStopCommand("hey hermes stop"))
         #expect(StopWords.isStopCommand("Hermes, stop."))
         #expect(StopWords.isStopCommand("okay stop"))
@@ -41,6 +43,7 @@ struct StopWordTests {
     }
 
     @Test func doesNotMatchBareAddressOrEmpty() {
+        #expect(!StopWords.isStopCommand("mercury"))
         #expect(!StopWords.isStopCommand("hermes"))
         #expect(!StopWords.isStopCommand("hey"))
         #expect(!StopWords.isStopCommand(""))

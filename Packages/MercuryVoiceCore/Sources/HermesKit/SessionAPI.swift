@@ -18,7 +18,7 @@ extension HermesConnection {
     /// Column count reported to the backend; matches the desktop client.
     private static let cols = 96
     private static let source = "desktop"
-    private static let logger = Logger(subsystem: "HermesVoice", category: "HermesKit")
+    private static let logger = Logger(subsystem: "MercuryVoice", category: "HermesKit")
 
     // MARK: Sessions
 

@@ -1,5 +1,7 @@
 # Build "Hermes Voice" — a standalone macOS/iOS voice-conversation client for Hermes Agent
 
+> **Historical document** — the original prompt this app was built from. The app has since been renamed **Mercury Voice** (issue #35); it is still a client for Hermes Agent.
+
 ## Mission
 
 Build a native SwiftUI app (macOS + iOS, one multiplatform Xcode project) that is a **voice-only client for Hermes Agent** (https://github.com/NousResearch/hermes-agent). It replicates the desktop app's "voice conversation" feature as a standalone app:

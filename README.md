@@ -1,29 +1,29 @@
-# Hermes Voice
+# Mercury Voice
 
 A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated basic-auth mode with username/password) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words.
 
 ## Building
 
-Open `HermesVoice.xcodeproj` in Xcode 16+ and run the `HermesVoice` scheme, or:
+Open `MercuryVoice.xcodeproj` in Xcode 16+ and run the `MercuryVoice` scheme, or:
 
 ```bash
-xcodebuild -project HermesVoice.xcodeproj -scheme HermesVoice -destination 'platform=macOS' build
+xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'platform=macOS' build
 ```
 
 ```bash
-xcodebuild -project HermesVoice.xcodeproj -scheme HermesVoice -destination 'generic/platform=iOS Simulator' build
+xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
 Unit tests (65 tests: state machine, barge detector, sanitizer, stop words, protocol models):
 
 ```bash
-cd Packages/HermesVoiceCore && swift test
+cd Packages/MercuryVoiceCore && swift test
 ```
 
 ## Architecture
 
 ```
-Packages/HermesVoiceCore/
+Packages/MercuryVoiceCore/
 ├── HermesKit      # protocol layer — no UI, no audio
 │   ├── ServerEndpoint      URL/token parsing (accepts pasted dashboard URLs)
 │   ├── HermesAuthenticator credential state: token header vs Bearer, password
@@ -47,7 +47,7 @@ Packages/HermesVoiceCore/
 │   ├── HermesSpeechOutput  stream-first, POST /api/audio/speak fallback, stop/sequence
 │   ├── SpeechText          TTS sanitizer (tables/fences/links/emoji, desktop parity)
 │   └── StopWords           full-utterance match with address-prefix stripping
-HermesVoice/       # SwiftUI app: Connect → Browse (profiles+projects) → Conversation
+MercuryVoice/      # SwiftUI app: Connect → Browse (profiles+projects) → Conversation
 ```
 
 Key protocol facts honored (verified against the hermes-agent source):

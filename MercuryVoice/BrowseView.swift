@@ -51,7 +51,7 @@ struct BrowseView: View {
                 }
             }
         }
-        .navigationTitle("Hermes Voice")
+        .navigationTitle("Mercury Voice")
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Disconnect") { model.disconnect() }

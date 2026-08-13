@@ -1,4 +1,4 @@
-// Compiled into BOTH the app and the HermesVoiceWidgets extension: the
+// Compiled into BOTH the app and the MercuryVoiceWidgets extension: the
 // Live Activity's attributes and its button intents must be the same types
 // in each (issue #28). Keep this file free of HermesKit/VoiceEngine imports —
 // the widget extension does not link the packages.
