@@ -1,6 +1,8 @@
 # Mercury Voice
 
-A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated basic-auth mode with username/password) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words.
+A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated binds with basic-auth password login and/or native OAuth) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words. On iOS an active conversation also shows a lock-screen Live Activity with the current state and mute / stop / end controls.
+
+Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-13); a v5-or-older backend shows a "backend is older than the app was built for" notice.
 
 ## Building
 
@@ -14,7 +16,7 @@ xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'pl
 xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
-Unit tests (65 tests: state machine, barge detector, sanitizer, stop words, protocol models):
+Unit tests (128 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler):
 
 ```bash
 cd Packages/MercuryVoiceCore && swift test
@@ -28,6 +30,8 @@ Packages/MercuryVoiceCore/
 │   ├── ServerEndpoint      URL/token parsing (accepts pasted dashboard URLs)
 │   ├── HermesAuthenticator credential state: token header vs Bearer, password
 │   │                       login, /auth/native/refresh rotation, ws-tickets
+│   ├── NativeOAuth         RFC 8252 PKCE flow: S256 challenge, one-shot loopback
+│   │                       redirect listener, /auth/native/token exchange
 │   ├── GatewayClient       one /api/ws JSON-RPC socket: correlation + event demux
 │   ├── HermesConnection    reconnect supervisor (full-jitter backoff, stable event stream)
 │   ├── SessionAPI          session.create/resume, prompt.submit, projects.tree,
@@ -43,11 +47,14 @@ Packages/MercuryVoiceCore/
 │   ├── MicRecorder         AVAudioEngine capture + VAD (0.075 / 1250ms / 12s / 60s)
 │   ├── BargeDetector/-Monitor  noise-floor calibration, 300ms·80% majority trip,
 │   │                       playback clamp 0.14–0.37, 5s pre-roll, 1250ms endpoint
+│   ├── RateLockedResampler locks capture to one sample rate across route changes
+│   │                       (AirPods ↔ speaker) so VAD thresholds stay calibrated
 │   ├── SpeakStreamSession  /api/audio/speak-stream WS → int16 PCM → gap-free player
 │   ├── HermesSpeechOutput  stream-first, POST /api/audio/speak fallback, stop/sequence
 │   ├── SpeechText          TTS sanitizer (tables/fences/links/emoji, desktop parity)
 │   └── StopWords           full-utterance match with address-prefix stripping
 MercuryVoice/      # SwiftUI app: Connect → Browse (profiles+projects) → Conversation
+MercuryVoiceWidgets/  # widget extension: lock-screen / Dynamic Island Live Activity
 ```
 
 Key protocol facts honored (verified against the hermes-agent source):
@@ -64,8 +71,13 @@ Key protocol facts honored (verified against the hermes-agent source):
 
 1. On the machine running Hermes: `hermes serve` — it prints/opens `http://127.0.0.1:<port>/?token=...`.
 2. Paste that whole URL into the app's server field; the token is lifted out automatically. Credentials persist in the Keychain per server and the app auto-reconnects on next launch.
-3. **iPhone → Mac:** a loopback-bound backend refuses non-local peers. Use `tailscale serve` on the Mac (proxies from loopback, so token mode keeps working), an SSH tunnel, or a gated bind with basic auth (below).
-4. **Gated binds (username & password):** for a non-loopback bind, configure the backend's basic-auth provider (`dashboard.basic_auth.username` + `password` or `password_hash` in `config.yaml`, or the `HERMES_DASHBOARD_BASIC_AUTH_*` env vars). Connect with just the server address — the app detects the gate, prompts for the username/password, and signs in. Under the hood: `POST /auth/password-login` mints access/refresh tokens (lifted from the session cookies into the Keychain), REST authenticates with `Authorization: Bearer`, expired access tokens rotate via `/auth/native/refresh`, and each WebSocket dial mints a single-use 30 s ticket via `POST /api/auth/ws-ticket`. OAuth-only gated servers are still unsupported.
+3. **iPhone → Mac:** a loopback-bound backend refuses non-local peers. Use `tailscale serve` on the Mac (proxies from loopback, so token mode keeps working), an SSH tunnel, or a gated bind with sign-in (below).
+4. **Gated binds (sign-in):** for a non-loopback bind, connect with just the server address — the app detects the gate and renders whatever the server advertises (via `auth_flows`): a username/password form, "Continue with *provider*" OAuth buttons, or both.
+   - **Basic auth:** configure the backend's basic-auth provider (`dashboard.basic_auth.username` + `password` or `password_hash` in `config.yaml`, or the `HERMES_DASHBOARD_BASIC_AUTH_*` env vars). `POST /auth/password-login` mints access/refresh tokens (lifted from the session cookies into the Keychain).
+   - **Native OAuth:** providers advertising `native_pkce` sign in through `ASWebAuthenticationSession` with an RFC 8252 PKCE flow — the gateway only accepts loopback IP-literal redirect URIs, so the app catches the `?code=` redirect on a one-shot `127.0.0.1` listener and exchanges it at `/auth/native/token`.
+
+   Either way the plumbing is shared: REST authenticates with `Authorization: Bearer`, expired access tokens rotate via `/auth/native/refresh`, and each WebSocket dial mints a single-use 30 s ticket via `POST /api/auth/ws-ticket`.
+5. **Address parsing:** bare IPs and `localhost` default to `http`, DNS names default to `https`; the app warns before sending a password over plain HTTP.
 
 ## Manual verification checklist (live backend)
 
@@ -83,6 +95,11 @@ Milestone 1b — basic auth (gated bind, `dashboard.basic_auth` configured):
 - [ ] Voice conversation works end-to-end (WS + speak-stream mint per-dial tickets)
 - [ ] Backend restart (no configured `secret`) invalidates sessions → app returns to the sign-in form with "session expired", username prefilled
 - [ ] Loopback token servers still connect exactly as before (legacy keychain items migrate silently)
+
+Milestone 1c — native OAuth (gated bind with an OAuth provider advertising `native_pkce`):
+- [ ] Sign-in form shows "Continue with *provider*" only when the server advertises it (password form still shown iff basic auth is also configured)
+- [ ] Tapping the button opens the system browser sheet; completing sign-in lands on the browse screen; canceling returns to the form without an error toast
+- [ ] Kill + relaunch → auto-reconnects via the stored session; access-token expiry rotates silently through `/auth/native/refresh`
 
 Milestone 2 — text path (keyboard icon in the conversation header):
 - [ ] New conversation in a project → `session.info` shows the right cwd/project
@@ -113,4 +130,8 @@ macOS mute hotkey (Settings, ⌘,):
 
 ## Not in v1
 
-Text-chat UI beyond the dev screen, transcript history, wake-word detection, OAuth sign-in for gated remote backends (basic auth is supported; browser-redirect providers are not), editing profiles/config, voice-answered approvals.
+Text-chat UI beyond the dev screen, transcript history, wake-word detection, editing profiles/config, voice-answered approvals.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
