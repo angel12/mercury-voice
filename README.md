@@ -2,7 +2,7 @@
 
 A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated binds with basic-auth password login and/or native OAuth) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words. On iOS an active conversation also shows a lock-screen Live Activity with the current state and mute / stop / end controls.
 
-Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-13); a v5-or-older backend shows a "backend is older than the app was built for" notice.
+Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-18); a v5-or-older backend shows a "backend is older than the app was built for" notice.
 
 ## Building
 
@@ -16,7 +16,7 @@ xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'pl
 xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
-Unit tests (128 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler):
+Unit tests (138 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler):
 
 ```bash
 cd Packages/MercuryVoiceCore && swift test
@@ -34,8 +34,8 @@ Packages/MercuryVoiceCore/
 │   │                       redirect listener, /auth/native/token exchange
 │   ├── GatewayClient       one /api/ws JSON-RPC socket: correlation + event demux
 │   ├── HermesConnection    reconnect supervisor (full-jitter backoff, stable event stream)
-│   ├── SessionAPI          session.create/resume, prompt.submit, projects.tree,
-│   │                       approval.respond / clarify.respond
+│   ├── SessionAPI          session.create/resume (deferred history), prompt.submit,
+│   │                       projects.tree, approval.respond / clarify.respond
 │   ├── RESTClient          /api/status, /api/profiles, sessions, transcribe, speak
 │   └── KeychainTokenStore  per-server credentials (session token or password session)
 ├── VoiceEngine    # audio + the conversation state machine
@@ -64,6 +64,9 @@ Key protocol facts honored (verified against the hermes-agent source):
 - The speak-stream gets `{"done": true}` only when the reply is non-pending **and** the turn is no longer busy, so trailing narration isn't cut off; `{"type":"fallback"}` reroutes to whole-clip TTS.
 - Empty transcript = silence → quietly re-listen (never an error toast).
 - `approval.request` is session-keyed (no request_id); `clarify.request`/`clarify.expire` correlate by `request_id`; both pause the voice loop and speak a short notice.
+- `session.resume` replays a prompt the session is parked on (`pending_approval` / `pending_clarify`) — a question asked while the app was disconnected reappears on reconnect, and a stale local prompt (answered elsewhere or expired) is cleared.
+- Resumes send `defer_history: true`: the RPC answers immediately and the transcript hydrates in the background (`session.resume_progress` events; a "Loading session history…" notice while it runs). Older backends ignore the flag.
+- `session.usage` ticks (~1/s while a turn runs) drive a live context-window chip in the conversation header, settled by the authoritative `message.complete` usage; the chip hides when the backend reports no real occupancy.
 - Quiet sockets during a busy turn are healthy (server disables WS pings on loopback binds) — no read timeout.
 - First submit after a barge-in carries `interrupted: true` (120 s latch, like the desktop).
 
@@ -106,6 +109,9 @@ Milestone 2 — text path (keyboard icon in the conversation header):
 - [ ] Typed prompt streams a reply; tool ticker shows `tool.start` names
 - [ ] Approval-requiring command surfaces the sheet; each choice unblocks the turn
 - [ ] Backend restart mid-conversation → app reconnects and resumes by stored id ("Reconnected." notice)
+- [ ] Quit mid-approval, reopen and resume → the sheet reappears (spoken cue included) and is answerable; answer it from the desktop instead → on reconnect the stale sheet clears and listening resumes
+- [ ] Long multi-tool turn → the header context chip climbs mid-turn and settles at the end-of-turn value (hidden entirely on backends without context reporting)
+- [ ] Resume a session with a long transcript → the conversation screen appears immediately ("Loading session history…" while it hydrates); speaking right away still gets a full-context reply
 
 Milestones 3–5 — voice:
 - [ ] Reply is spoken via speak-stream (streaming TTS provider) with live captions
