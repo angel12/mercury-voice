@@ -32,6 +32,10 @@ final class ConversationController {
     private(set) var setupError: String?
     private(set) var notice: String?
     private(set) var connectionHealthy = true
+    /// Latest usage snapshot: live `session.usage` ticks mid-turn, settled by
+    /// the authoritative `message.complete` usage. nil until the first turn
+    /// reports, or when the backend doesn't report usage at all.
+    private(set) var usage: SessionUsage?
     var approval: ApprovalRequest?
     var clarify: ClarifyRequest?
     /// Ends the conversation view when the user speaks a stop word.
@@ -198,6 +202,7 @@ final class ConversationController {
             notice = "This Hermes backend is older than the app was built for (contract \(contract) < \(GatewayClient.builtAgainstDesktopContract)); some features may misbehave."
         }
         let running = handle.raw["running"]?.truthy ?? false
+        usage = nil  // new session identity; the first turn re-reports
         await tracker.reset(busy: running)
         // A resumed live session can be parked on a prompt that was emitted
         // while no client was attached; replay it. Nothing to clear on a
@@ -414,6 +419,16 @@ final class ConversationController {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")
                 toolTicker = nil
+                // End-of-turn usage is authoritative; the server guarantees no
+                // stale session.usage tick lands after this event.
+                if let complete = event.payload["usage"].flatMap(SessionUsage.init(json:)) {
+                    usage = complete
+                }
+            }
+
+        case GatewayEvent.Kind.sessionUsage:
+            if let tick = event.payload["usage"].flatMap(SessionUsage.init(json:)) {
+                usage = tick
             }
 
         case GatewayEvent.Kind.toolStart:

@@ -201,6 +201,35 @@ public struct SessionHandle: Sendable, Equatable {
     }
 }
 
+// MARK: - Usage
+
+/// The gateway's usage dict (`_get_usage` in tui_gateway/server.py), carried
+/// by `session.usage` ticks (~1/s while a turn runs) and authoritatively by
+/// `message.complete.usage`. The `context*` gauge fields are present only
+/// when the backend reports real current-window occupancy — absent means
+/// unknown, and no gauge should be rendered.
+public struct SessionUsage: Sendable, Equatable {
+    public var model: String?
+    public var totalTokens: Int?
+    public var apiCalls: Int?
+    public var contextUsed: Int?
+    public var contextMax: Int?
+    /// 0–100, already clamped server-side.
+    public var contextPercent: Int?
+    public var activeSubagents: Int?
+
+    public init?(json: JSONValue) {
+        guard case .object = json else { return nil }
+        self.model = json["model"]?.stringValue
+        self.totalTokens = json["total"]?.intValue
+        self.apiCalls = json["calls"]?.intValue
+        self.contextUsed = json["context_used"]?.intValue
+        self.contextMax = json["context_max"]?.intValue
+        self.contextPercent = json["context_percent"]?.intValue
+        self.activeSubagents = json["active_subagents"]?.intValue
+    }
+}
+
 // MARK: - Audio
 
 public struct TranscriptionResult: Sendable, Equatable {

@@ -137,6 +137,14 @@ struct ConversationView: View {
                     if let project = controller.projectName {
                         Label(project, systemImage: "folder")
                     }
+                    if let percent = controller.usage?.contextPercent {
+                        // Live context-window fill (session.usage ticks,
+                        // settled by message.complete). Hidden when the
+                        // backend reports no real occupancy.
+                        Label("\(percent)%", systemImage: "gauge.with.needle")
+                            .foregroundStyle(contextTint(percent: percent))
+                            .help("Context window used")
+                    }
                     if !controller.connectionHealthy {
                         Label("reconnecting", systemImage: "wifi.exclamationmark")
                             .foregroundStyle(.orange)
@@ -249,6 +257,14 @@ struct ConversationView: View {
             && !controller.voiceState.muted
             && controller.approval == nil
             && controller.clarify == nil
+    }
+
+    private func contextTint(percent: Int) -> some ShapeStyle {
+        switch percent {
+        case 95...: return AnyShapeStyle(.red)
+        case 80...: return AnyShapeStyle(.orange)
+        default: return AnyShapeStyle(.secondary)
+        }
     }
 
     private var statusLabel: String {

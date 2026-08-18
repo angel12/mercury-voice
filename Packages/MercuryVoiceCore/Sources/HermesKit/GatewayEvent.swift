@@ -24,6 +24,7 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let toolStart = "tool.start"
         public static let toolComplete = "tool.complete"
         public static let statusUpdate = "status.update"
+        public static let sessionUsage = "session.usage"
         public static let approvalRequest = "approval.request"
         public static let clarifyRequest = "clarify.request"
         public static let clarifyExpire = "clarify.expire"
