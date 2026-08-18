@@ -54,7 +54,13 @@ extension HermesConnection {
             "session_id": .string(storedID),
             "cols": .number(Double(Self.cols)),
             "source": .string(Self.source),
+            // This app never renders the transcript. defer_history makes a
+            // cold resume return immediately (`hydrating: true`) and load the
+            // history in a background worker (session.resume_progress events);
+            // omit_messages stays for older backends that ignore the newer
+            // flag but still trim the response.
             "omit_messages": .bool(true),
+            "defer_history": .bool(true),
         ]
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
 

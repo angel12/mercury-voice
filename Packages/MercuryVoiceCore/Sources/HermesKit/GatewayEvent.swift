@@ -29,6 +29,7 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let clarifyRequest = "clarify.request"
         public static let clarifyExpire = "clarify.expire"
         public static let sessionInfo = "session.info"
+        public static let sessionResumeProgress = "session.resume_progress"
         public static let sessionTitle = "session.title"
         public static let notificationShow = "notification.show"
         public static let error = "error"

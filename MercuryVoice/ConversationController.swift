@@ -208,6 +208,20 @@ final class ConversationController {
         // while no client was attached; replay it. Nothing to clear on a
         // fresh controller.
         adoptPendingPrompts(from: handle, clearStale: false)
+        noteHydration(from: handle)
+    }
+
+    /// A deferred cold resume answers immediately with `hydrating: true` and
+    /// loads the transcript in a background worker. The voice loop is usable
+    /// right away (the first prompt.submit waits server-side), but a slow
+    /// hydration should be visible; the resume_progress events clear or fail
+    /// it.
+    private static let hydrationNotice = "Loading session history…"
+
+    private func noteHydration(from handle: SessionHandle) {
+        if handle.raw["hydrating"]?.truthy == true {
+            notice = Self.hydrationNotice
+        }
     }
 
     private func startVoiceLoop() async {
@@ -474,6 +488,20 @@ final class ConversationController {
                 }
             }
 
+        case GatewayEvent.Kind.sessionResumeProgress:
+            switch event.payload["status"]?.stringValue {
+            case "complete":
+                if notice == Self.hydrationNotice { notice = nil }
+            case "failed":
+                // The gateway discards the session on hydration failure; the
+                // setup-error alert offers the way back to the session list.
+                setupError =
+                    event.payload["message"]?.stringValue
+                    ?? "Resuming the session's history failed."
+            default:
+                break  // "loading" — the resume handle already set the notice
+            }
+
         case GatewayEvent.Kind.notificationShow:
             notice = event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue
 
@@ -543,6 +571,7 @@ final class ConversationController {
             await tracker.reset(busy: running)
             adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
+            noteHydration(from: handle)
         } catch {
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
         }
