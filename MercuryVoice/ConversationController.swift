@@ -199,6 +199,10 @@ final class ConversationController {
         }
         let running = handle.raw["running"]?.truthy ?? false
         await tracker.reset(busy: running)
+        // A resumed live session can be parked on a prompt that was emitted
+        // while no client was attached; replay it. Nothing to clear on a
+        // fresh controller.
+        adoptPendingPrompts(from: handle, clearStale: false)
     }
 
     private func startVoiceLoop() async {
@@ -263,6 +267,12 @@ final class ConversationController {
             observeAudioInterruptions()
         #endif
 
+        // A prompt replayed from the resume payload arrived before the engine
+        // existed, so present() couldn't pause it — park the loop before the
+        // mic ever arms; answering the prompt unpauses via resumeIfUnprompted.
+        if approval != nil || clarify != nil {
+            await engine.setPaused(true)
+        }
         await engine.start()
     }
 
@@ -415,23 +425,12 @@ final class ConversationController {
 
         case GatewayEvent.Kind.approvalRequest:
             if let request = ApprovalRequest(event: event) {
-                approval = request
-                promptSendError = nil
-                Task {
-                    await engine?.setPaused(true)
-                    _ = await speech.playFallback(
-                        text: "Hermes is asking for approval to run a command.")
-                }
+                present(approval: request)
             }
 
         case GatewayEvent.Kind.clarifyRequest:
             if let request = ClarifyRequest(event: event) {
-                clarify = request
-                promptSendError = nil
-                Task {
-                    await engine?.setPaused(true)
-                    _ = await speech.playFallback(text: "Hermes has a question for you.")
-                }
+                present(clarify: request)
             }
 
         case GatewayEvent.Kind.clarifyExpire:
@@ -468,6 +467,52 @@ final class ConversationController {
         }
     }
 
+    private func present(approval request: ApprovalRequest) {
+        approval = request
+        promptSendError = nil
+        Task {
+            await engine?.setPaused(true)
+            _ = await speech.playFallback(
+                text: "Hermes is asking for approval to run a command.")
+        }
+    }
+
+    private func present(clarify request: ClarifyRequest) {
+        clarify = request
+        promptSendError = nil
+        Task {
+            await engine?.setPaused(true)
+            _ = await speech.playFallback(text: "Hermes has a question for you.")
+        }
+    }
+
+    /// Adopt the `pending_approval` / `pending_clarify` replay fields of a
+    /// `session.resume` result: a prompt that arrived while this client was
+    /// detached would otherwise never be seen — the agent thread stays parked
+    /// on it until timeout. On a re-resume (`clearStale`), the registry is
+    /// authoritative the other way too: an absent field means the prompt was
+    /// answered elsewhere, expired, or died with the backend, so the stale
+    /// sheet is cleared and listening resumes.
+    private func adoptPendingPrompts(from handle: SessionHandle, clearStale: Bool) {
+        if let payload = handle.raw["pending_approval"],
+            let request = ApprovalRequest(payload: payload, sessionID: handle.runtimeID)
+        {
+            present(approval: request)
+        } else if clearStale, approval != nil {
+            approval = nil
+        }
+
+        if let payload = handle.raw["pending_clarify"],
+            let request = ClarifyRequest(payload: payload, sessionID: handle.runtimeID)
+        {
+            present(clarify: request)
+        } else if clearStale, clarify != nil {
+            clarify = nil
+        }
+
+        if clearStale { resumeIfUnprompted() }
+    }
+
     /// After a reconnect, runtime ids are dead — re-resume by stored id.
     func connectionBecameReady(isReconnect: Bool) async {
         connectionHealthy = true
@@ -481,6 +526,7 @@ final class ConversationController {
             sessionBox.storedID = handle.storedID
             let running = handle.raw["running"]?.truthy ?? false
             await tracker.reset(busy: running)
+            adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
         } catch {
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"

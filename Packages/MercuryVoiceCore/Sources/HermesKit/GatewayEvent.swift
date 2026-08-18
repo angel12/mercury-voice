@@ -48,14 +48,19 @@ public struct ApprovalRequest: Sendable, Equatable, Identifiable {
     public var id: String { sessionID }
 
     public init?(event: GatewayEvent) {
-        guard event.type == GatewayEvent.Kind.approvalRequest,
-            let sessionID = event.sessionID
-        else { return nil }
-        self.sessionID = sessionID
-        self.command = event.payload["command"]?.stringValue
-        self.description = event.payload["description"]?.stringValue
+        guard event.type == GatewayEvent.Kind.approvalRequest else { return nil }
+        self.init(payload: event.payload, sessionID: event.sessionID)
+    }
 
-        if let listed = event.payload["choices"]?.arrayValue?.compactMap(\.stringValue),
+    /// Also decodes the `pending_approval` replay field of `session.resume`
+    /// (same payload shape; the session id comes from the resume handle).
+    public init?(payload: JSONValue, sessionID: String?) {
+        guard let sessionID else { return nil }
+        self.sessionID = sessionID
+        self.command = payload["command"]?.stringValue
+        self.description = payload["description"]?.stringValue
+
+        if let listed = payload["choices"]?.arrayValue?.compactMap(\.stringValue),
             !listed.isEmpty
         {
             self.choices = listed
@@ -63,9 +68,9 @@ public struct ApprovalRequest: Sendable, Equatable, Identifiable {
             // Derive like the server does when choices is absent:
             // allow_permanent/allow_session absent mean *allowed* (!= false).
             var derived = ["once"]
-            if event.payload["smart_denied"]?.truthy != true {
-                if event.payload["allow_session"]?.boolValue != false { derived.append("session") }
-                if event.payload["allow_permanent"]?.boolValue != false { derived.append("always") }
+            if payload["smart_denied"]?.truthy != true {
+                if payload["allow_session"]?.boolValue != false { derived.append("session") }
+                if payload["allow_permanent"]?.boolValue != false { derived.append("always") }
             }
             derived.append("deny")
             self.choices = derived
@@ -86,16 +91,21 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
     public var id: String { requestID }
 
     public init?(event: GatewayEvent) {
-        guard event.type == GatewayEvent.Kind.clarifyRequest,
-            let requestID = event.payload["request_id"]?.stringValue
-        else { return nil }
+        guard event.type == GatewayEvent.Kind.clarifyRequest else { return nil }
+        self.init(payload: event.payload, sessionID: event.sessionID)
+    }
+
+    /// Also decodes the `pending_clarify` replay field of `session.resume`
+    /// (same payload shape, `request_id` included).
+    public init?(payload: JSONValue, sessionID: String?) {
+        guard let requestID = payload["request_id"]?.stringValue else { return nil }
         self.requestID = requestID
-        self.sessionID = event.sessionID
-        self.question = event.payload["question"]?.stringValue ?? ""
+        self.sessionID = sessionID
+        self.question = payload["question"]?.stringValue ?? ""
         self.choices =
-            event.payload["choices"]?.arrayValue?
+            payload["choices"]?.arrayValue?
             .compactMap(\.stringValue)
             .filter { !$0.isEmpty && $0.count <= 200 && !$0.contains("\n") } ?? []
-        self.multiSelect = event.payload["multi_select"]?.truthy ?? false
+        self.multiSelect = payload["multi_select"]?.truthy ?? false
     }
 }
