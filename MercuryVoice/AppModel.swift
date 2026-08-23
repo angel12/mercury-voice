@@ -275,6 +275,24 @@ final class AppModel {
         connectError = note
     }
 
+    /// Recovery UI for a dead credential. Which affordance helps depends on
+    /// how this server authenticates: a gated server has a sign-in form to
+    /// re-present, but a loopback token server has none — its token rotates
+    /// with every backend restart, and the only fix is a fresh dashboard URL.
+    /// Presenting the sign-in sheet there would offer a password the server
+    /// doesn't accept.
+    private func presentAuthRecovery(endpoint: ServerEndpoint) async {
+        if case .sessionToken? = tokenStore.credentials(for: endpoint) {
+            connectError =
+                "\(endpoint.displayName) rejected the session token. It changes each time the "
+                + "backend restarts — open the Hermes dashboard and paste its current URL "
+                + "(or token) to reconnect."
+            return
+        }
+        await presentGatedLogin(
+            endpoint: endpoint, note: HermesError.sessionExpired.errorDescription)
+    }
+
     func disconnect() {
         connectGeneration += 1  // invalidate any in-flight connect()
         browseGeneration += 1  // …and any in-flight browse load
@@ -336,14 +354,13 @@ final class AppModel {
                             isReconnect: isReconnect)
                     }
                     if case .authExpired = phase {
-                        // Dead refresh token: back to the connect screen with
-                        // the sign-in form up. Present BEFORE disconnect —
+                        // Credentials are dead (dead refresh token, or the
+                        // gateway closed the socket with 4401): back to the
+                        // connect screen. Present BEFORE disconnect —
                         // disconnect cancels this pump task, and a cancelled
                         // task can't await the provider lookup.
                         if let endpoint = self.endpoint {
-                            await self.presentGatedLogin(
-                                endpoint: endpoint,
-                                note: HermesError.sessionExpired.errorDescription)
+                            await self.presentAuthRecovery(endpoint: endpoint)
                         }
                         self.disconnect()
                         return

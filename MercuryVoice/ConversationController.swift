@@ -275,7 +275,15 @@ final class ConversationController {
         stateTask = Task { [weak self] in
             for await state in await engine.uiStates() {
                 guard let self else { return }
+                #if os(iOS)
+                    let wasMuted = self.voiceState.muted
+                #endif
                 self.voiceState = state
+                #if os(iOS)
+                    if state.muted != wasMuted {
+                        self.applyMuteToCapture(muted: state.muted)
+                    }
+                #endif
             }
         }
         capture.setLevelHandler { [weak self] level in
@@ -333,6 +341,11 @@ final class ConversationController {
     func appBecameActive() {
         #if os(iOS)
             audioInterrupted = false
+            // Starting audio is allowed again: restore a keepalive that was
+            // dropped by a mute (or refused while backgrounded), or the rest
+            // of the conversation runs without the issue #31 guard. No-ops
+            // when one is already open.
+            if !voiceState.muted { startAudioKeepalive() }
             capture.ensureRunning()
             resumeIfUnprompted()
         #endif
@@ -346,6 +359,27 @@ final class ConversationController {
             keepaliveStreamID = opened.id
             keepaliveDrain = Task.detached {
                 for await _ in opened.stream {}  // discard; consumers decide what's heard
+            }
+        }
+
+        /// Mute has to stop the microphone, not just discard its samples.
+        /// The engine's own mute cancels the recorder and the barge monitor,
+        /// but the keepalive stream above holds the capture engine and the
+        /// `.playAndRecord` session open for the whole conversation — so
+        /// without this the hardware mic and the system privacy indicator
+        /// stay live behind a UI that says "Muted".
+        ///
+        /// Tradeoff: dropping the keepalive gives up the issue #31 guarantee
+        /// for as long as the mute lasts, so unmuting from the Live Activity
+        /// while backgrounded can no longer start the mic immediately — iOS
+        /// refuses to START audio there. That refusal is already modelled:
+        /// the engine parks and `appBecameActive()` re-arms on foreground.
+        /// Holding the mic open through a mute is the worse of the two.
+        private func applyMuteToCapture(muted: Bool) {
+            if muted {
+                stopAudioKeepalive()
+            } else {
+                startAudioKeepalive()
             }
         }
 

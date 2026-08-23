@@ -45,11 +45,18 @@ final class NativeOAuthSignIn: NSObject, ASWebAuthenticationPresentationContextP
         web.presentationContextProvider = self
         web.prefersEphemeralWebBrowserSession = false
         webSession = web
-        web.start()
 
         defer {
             webSession?.cancel()
             webSession = nil
+        }
+        // A refused presentation (no anchor, a sheet already up) fires no
+        // completion handler, so nothing would ever unblock the listener —
+        // fail here instead of waiting out the timeout on a sheet the user
+        // never saw.
+        guard web.start() else {
+            await listener.cancel()
+            throw LoopbackRedirectListener.RedirectError.presentationFailed
         }
         let code: String
         do {

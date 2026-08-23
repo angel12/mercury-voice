@@ -143,6 +143,42 @@ struct NativeOAuthTests {
         }
     }
 
+    /// A browser sheet that never presents means no redirect can ever land;
+    /// the wait must end on its own rather than parking forever.
+    @Test func listenerWaitTimesOut() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "s")
+        _ = try await listener.start()
+
+        await #expect(throws: LoopbackRedirectListener.RedirectError.timedOut) {
+            try await listener.waitForCode(timeout: .milliseconds(50))
+        }
+    }
+
+    @Test func cancellingTheWaitingTaskUnblocksIt() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "s")
+        _ = try await listener.start()
+
+        let waiter = Task { try await listener.waitForCode() }
+        try await Task.sleep(for: .milliseconds(20))
+        waiter.cancel()
+        await #expect(throws: LoopbackRedirectListener.RedirectError.cancelled) {
+            try await waiter.value
+        }
+    }
+
+    /// The timeout must not fire after a real code already arrived.
+    @Test func timeoutDoesNotClobberADeliveredCode() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "s-1")
+        let port = try await listener.start()
+
+        let waiter = Task { try await listener.waitForCode(timeout: .milliseconds(200)) }
+        let url = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=in-time&state=s-1")!
+        _ = try await URLSession.shared.data(from: url)
+        #expect(try await waiter.value == "in-time")
+        // Outlive the timeout to prove the late fire is harmless.
+        try await Task.sleep(for: .milliseconds(250))
+    }
+
     @Test func listenerIgnoresUnrelatedPaths() async throws {
         let listener = LoopbackRedirectListener(expectedState: "s-1")
         let port = try await listener.start()

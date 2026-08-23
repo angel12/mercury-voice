@@ -16,6 +16,14 @@ public actor GatewayClient {
         case closed(reason: String?)
     }
 
+    /// Why the socket closed, for callers that must react differently.
+    /// `unauthorized` is terminal: the server rejected these credentials, so
+    /// redialing with them can only fail the same way.
+    public enum CloseCause: Sendable, Equatable {
+        case unauthorized
+        case other
+    }
+
     private let endpoint: ServerEndpoint
     private let authenticator: HermesAuthenticator
     private let urlSession: URLSession
@@ -27,6 +35,7 @@ public actor GatewayClient {
     private var subscribers: [UUID: AsyncStream<GatewayEvent>.Continuation] = [:]
 
     public private(set) var state: State = .idle
+    public private(set) var closeCause: CloseCause = .other
     private var readyWaiters: [CheckedContinuation<Void, Error>] = []
 
     /// Backend contract version reported in gateway payloads (session.info's
@@ -181,9 +190,10 @@ public actor GatewayClient {
 
     // MARK: Close
 
-    public func close(reason: String? = nil) {
+    public func close(reason: String? = nil, cause: CloseCause = .other) {
         if case .closed = state { return }
         state = .closed(reason: reason)
+        closeCause = cause
 
         receiveLoop?.cancel()
         receiveLoop = nil
@@ -214,19 +224,26 @@ public actor GatewayClient {
                     break
                 }
             } catch {
-                let closeCode = task.closeCode
-                let reason: String
-                if closeCode == .invalid {
-                    reason = error.localizedDescription
-                } else if closeCode.rawValue == 4401 {
-                    reason = "unauthorized (4401) — the server rejected the credentials"
-                } else {
-                    reason = "socket closed (code \(closeCode.rawValue))"
-                }
-                close(reason: reason)
+                let outcome = Self.closeOutcome(closeCode: task.closeCode, error: error)
+                close(reason: outcome.reason, cause: outcome.cause)
                 return
             }
         }
+    }
+
+    /// Socket-close code → user-facing reason + the cause the supervisor
+    /// branches on. Pure so it can be tested without standing up a server.
+    static func closeOutcome(
+        closeCode: URLSessionWebSocketTask.CloseCode, error: Error
+    ) -> (reason: String, cause: CloseCause) {
+        if closeCode == .invalid {
+            // No close frame — a transport error (unreachable, reset, TLS).
+            return (error.localizedDescription, .other)
+        }
+        if closeCode.rawValue == 4401 {
+            return ("unauthorized (4401) — the server rejected the credentials", .unauthorized)
+        }
+        return ("socket closed (code \(closeCode.rawValue))", .other)
     }
 
     private func handleFrame(_ text: String) {
