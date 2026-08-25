@@ -120,8 +120,21 @@ public actor HermesConnection {
             do {
                 try await client.connect()
             } catch {
+                // Read the cause before close() — close() is a no-op once the
+                // socket already closed itself, but the cause it recorded is
+                // what distinguishes a rejected credential from a dropped
+                // network.
+                let rejected = await client.closeCause == .unauthorized
                 await client.close(reason: nil)
                 if Task.isCancelled { return }  // stop() already published .stopped
+                if rejected {
+                    // The handshake was refused with 4401 (a dead token can be
+                    // rejected either mid-flight or on the next dial, depending
+                    // on when the backend restarted). Terminal either way.
+                    publish(.phase(.authExpired))
+                    supervisor = nil
+                    return
+                }
                 if case HermesError.sessionExpired = error {
                     // The refresh token is dead — every redial would fail the
                     // same way. Stop; the user must sign in again.
@@ -161,8 +174,18 @@ public actor HermesConnection {
                 break
             }
 
-            let reason = await closeReason(of: client)
-            publish(.phase(.disconnected(reason: reason)))
+            if await client.closeCause == .unauthorized {
+                // The server rejected these credentials mid-flight (WS close
+                // 4401) — in token mode that is what a backend restart looks
+                // like, since the token rotates with it. Redialing can only
+                // be refused the same way, so stop and let the app ask for
+                // fresh credentials instead of spinning "Reconnecting…"
+                // forever against a dead token.
+                publish(.phase(.authExpired))
+                supervisor = nil
+                return
+            }
+            publish(.phase(.disconnected(reason: await closeReason(of: client))))
             attempt += 1
             await backoff(attempt: attempt)
         }

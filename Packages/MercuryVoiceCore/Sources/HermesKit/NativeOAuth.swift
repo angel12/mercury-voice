@@ -63,12 +63,18 @@ public actor LoopbackRedirectListener {
         case denied(String)
         case stateMismatch
         case listenerFailed(String)
+        case timedOut
+        /// The system browser sheet refused to present, so no redirect can
+        /// ever arrive.
+        case presentationFailed
 
         public var errorDescription: String? {
             switch self {
             case .cancelled: return "Sign-in was cancelled."
             case .denied(let detail): return "Sign-in was denied: \(detail)"
             case .stateMismatch: return "Sign-in response failed validation (state mismatch)."
+            case .timedOut: return "Sign-in timed out. Try again."
+            case .presentationFailed: return "Couldn't open the sign-in browser. Try again."
             case .listenerFailed(let detail): return "Couldn't listen for the sign-in redirect: \(detail)"
             }
         }
@@ -114,11 +120,43 @@ public actor LoopbackRedirectListener {
     }
 
     /// Await the redirect. Single-shot: resolves with the code or throws.
-    public func waitForCode() async throws -> String {
+    ///
+    /// Bounded and cancellation-aware on purpose: the only thing that resumes
+    /// this is a redirect landing on the listener, so a browser sheet that
+    /// never presents (no anchor, another sheet already up) would otherwise
+    /// park the continuation forever and leak the sign-in task with the UI
+    /// stuck on the sheet.
+    public func waitForCode(timeout: Duration = .seconds(180)) async throws -> String {
         if let outcome {
             return try outcome.get()
         }
-        return try await withCheckedThrowingContinuation { codeWaiter = $0 }
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            await self?.timeOut()
+        }
+        defer { timeoutTask.cancel() }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<String, Error>) in
+                // The cancellation handler and the timeout both hop onto the
+                // actor to finish(), so either can land before the
+                // continuation is installed — resume from the buffered
+                // outcome instead of waiting for a resume that already fired.
+                if let outcome {
+                    continuation.resume(with: outcome)
+                } else {
+                    codeWaiter = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    private func timeOut() {
+        finish(.failure(RedirectError.timedOut))
     }
 
     /// Abort (user closed the browser sheet, or the flow owner is bailing).

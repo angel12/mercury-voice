@@ -81,9 +81,13 @@ extension JSONValue {
     }
 
     public var intValue: Int? {
-        if case .number(let value) = self, value.truncatingRemainder(dividingBy: 1) == 0 {
-            return Int(value)
-        }
+        // `Int(exactly:)` does the integrality AND range check in one step.
+        // An unchecked `Int(Double)` traps on out-of-range values, and every
+        // number here is server-controlled (ids, expires_at, contract
+        // versions), so `{"id": 1e19}` from a buggy or hostile gateway would
+        // crash the app rather than fail to decode. The encoder already
+        // bounds-checks the mirror-image conversion below.
+        if case .number(let value) = self { return Int(exactly: value) }
         return nil
     }
 

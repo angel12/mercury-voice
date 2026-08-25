@@ -115,6 +115,27 @@ struct JSONValueTests {
         let text = String(data: data, encoding: .utf8)!
         #expect(text.contains("\"id\":7"))
     }
+
+    /// Server-controlled numbers reach `intValue` on every inbound path, so
+    /// an out-of-range one must decline rather than trap the process.
+    @Test func outOfRangeIntegralNumbersAreNotInts() throws {
+        let json = #"{"huge": 1e300, "big": 1e19, "negative": -1e300, "ok": 9007199254740992}"#
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8))
+        #expect(value["huge"]?.intValue == nil)
+        #expect(value["big"]?.intValue == nil)
+        #expect(value["negative"]?.intValue == nil)
+        // Still a number, just not one that fits Int.
+        #expect(value["huge"]?.doubleValue == 1e300)
+        // In-range integral values keep working.
+        #expect(value["ok"]?.intValue == 9_007_199_254_740_992)
+    }
+
+    @Test func fractionalAndNonFiniteNumbersAreNotInts() {
+        #expect(JSONValue.number(2.5).intValue == nil)
+        #expect(JSONValue.number(.nan).intValue == nil)
+        #expect(JSONValue.number(.infinity).intValue == nil)
+        #expect(JSONValue.number(-0.0).intValue == 0)
+    }
 }
 
 @Suite("Gateway models")

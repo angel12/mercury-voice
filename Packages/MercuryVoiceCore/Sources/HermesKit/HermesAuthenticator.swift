@@ -254,7 +254,15 @@ public actor HermesAuthenticator {
         guard let at = find("hermes_session_at") else { return nil }
         // A provider may omit the refresh token (access-token-only session).
         let rt = find("hermes_session_rt")?.value ?? ""
-        let expiresAt = at.expiresDate.map { Int($0.timeIntervalSince1970) } ?? 0
+        // Clamp rather than convert blindly: the expiry comes from a server
+        // Set-Cookie header, and an out-of-range `Int(Double)` traps — the
+        // same trap as JSONValue.intValue.
+        let expiresAt =
+            at.expiresDate.map { date -> Int in
+                let seconds = date.timeIntervalSince1970
+                guard seconds.isFinite, seconds > 0 else { return 0 }
+                return seconds < 4e18 ? Int(seconds) : .max
+            } ?? 0
         return (at.value, rt, expiresAt)
     }
 
