@@ -11,7 +11,7 @@ Build a native SwiftUI app (macOS + iOS, one multiplatform Xcode project) that i
 - Show **recent projects and sessions** so the user can either attach to an existing session or start a new session bound to a project's directory.
 - Run a hands-free, full-duplex voice loop: listen → transcribe → submit → speak the streamed reply → re-arm the mic, with barge-in and spoken stop-words.
 
-A reference copy of the hermes-agent source is at `./hermes-agent-main/` (re-download from GitHub if missing: `curl -sL https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.tar.gz | tar xz`). All file references below are relative to that directory and were verified against `main` as of 2026-08-13 (desktop contract v6); if line numbers have drifted, search for the symbols named. **When in doubt about protocol behavior, read the referenced source — it is the contract.**
+The hermes-agent reference source is the live checkout at `~/Coding/hermes agent` (mind the space when quoting paths; `git pull` it — or fetch `upstream` — to match the backend you're running; a fresh clone of https://github.com/NousResearch/hermes-agent works anywhere else). File references below are relative to that repo and were last verified against `main` as of 2026-08-13 (desktop contract v6); line numbers will have drifted, so search for the symbols named. **When in doubt about protocol behavior, read the referenced source — it is the contract.**
 
 ---
 
@@ -241,7 +241,7 @@ The state machine must be **pure enough to unit test**: inject clock, audio leve
 
 ## Part 7 — Verification
 
-- Stand up a real backend: `pip install`/`uv sync` the hermes-agent repo (or use an existing install), run `hermes serve --host 127.0.0.1 --port 0` with `HERMES_DASHBOARD_SESSION_TOKEN` set, note the `HERMES_..._READY port=` line. A minimal reference WS client lives at `hermes-agent-main/scripts/iso-certify.py` (`WSClient` + `drive_heavy_turn`) — mirror its handshake in an early integration test.
+- Stand up a real backend: `pip install`/`uv sync` the hermes-agent repo (or use an existing install), run `hermes serve --host 127.0.0.1 --port 0` with `HERMES_DASHBOARD_SESSION_TOKEN` set, note the `HERMES_..._READY port=` line. A minimal reference WS client lives at `scripts/iso-certify.py` in the hermes-agent checkout (`WSClient` + `drive_heavy_turn`) — mirror its handshake in an early integration test.
 - STT/TTS require providers configured in the profile's `~/.hermes/config.yaml` (`stt.*`, `tts.*`; defaults: local faster-whisper STT, edge TTS which is **non-streaming** → exercises the fallback path; a streaming provider like openai/elevenlabs exercises speak-stream).
 - Test matrix: silence-only turn (empty transcript → re-listen), stop word, barge-in during speech, barge-in during generation, approval mid-turn, backend restart mid-conversation (reconnect + resume by stored id), profile switch, new-session-in-project cwd correctness (check `session.info.cwd`/`project`), fallback TTS provider.
 
