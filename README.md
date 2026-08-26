@@ -2,7 +2,7 @@
 
 A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated binds with basic-auth password login and/or native OAuth) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words. On iOS an active conversation also shows a lock-screen Live Activity with the current state and mute / stop / end controls.
 
-Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-18); a v5-or-older backend shows a "backend is older than the app was built for" notice.
+Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-25); a v5-or-older backend shows a "backend is older than the app was built for" notice.
 
 ## Building
 
@@ -16,7 +16,7 @@ xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'pl
 xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
-Unit tests (138 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler):
+Unit tests (165 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler, client-direct voice wires, reconnect replay decoding):
 
 ```bash
 cd Packages/MercuryVoiceCore && swift test
@@ -50,7 +50,10 @@ Packages/MercuryVoiceCore/
 │   ├── RateLockedResampler locks capture to one sample rate across route changes
 │   │                       (AirPods ↔ speaker) so VAD thresholds stay calibrated
 │   ├── SpeakStreamSession  /api/audio/speak-stream WS → int16 PCM → gap-free player
-│   ├── HermesSpeechOutput  stream-first, POST /api/audio/speak fallback, stop/sequence
+│   ├── DirectVoice         client-direct STT/TTS: voice-config cache, provider
+│   │                       wires, sentence cutter, per-clip speech session
+│   ├── HermesSpeechOutput  direct-first, speak-stream relay, whole-clip fallback;
+│   │                       stop/sequence protocol
 │   ├── SpeechText          TTS sanitizer (tables/fences/links/emoji, desktop parity)
 │   └── StopWords           full-utterance match with address-prefix stripping
 MercuryVoice/      # SwiftUI app: Connect → Browse (profiles+projects) → Conversation
@@ -67,7 +70,11 @@ Key protocol facts honored (verified against the hermes-agent source):
 - `session.resume` replays a prompt the session is parked on (`pending_approval` / `pending_clarify`) — a question asked while the app was disconnected reappears on reconnect, and a stale local prompt (answered elsewhere or expired) is cleared.
 - Resumes send `defer_history: true`: the RPC answers immediately and the transcript hydrates in the background (`session.resume_progress` events; a "Loading session history…" notice while it runs). Older backends ignore the flag.
 - `session.usage` ticks (~1/s while a turn runs) drive a live context-window chip in the conversation header, settled by the authoritative `message.complete` usage; the chip hides when the backend reports no real occupancy.
-- Quiet sockets during a busy turn are healthy (server disables WS pings on loopback binds) — no read timeout.
+- Quiet sockets during a busy turn are healthy (server disables WS pings on loopback binds) — no read timeout. Instead, app-foreground probes a seemingly-ready socket with `gateway.ping` and force-redials on failure (half-open sockets after device wake / network switch).
+- **Lossless reconnect**: events carry a per-session `seq` and `gateway.ready` carries a `replay_epoch`; after a reconnect that gets the same runtime session back under the same epoch, `session.events.since` replays the missed frames (so a reply that streamed while the app was away is spoken from where it left off). Any gap signal — cold resume, epoch change, `truncated` ring overrun, old backend — falls back to the tracker reset. A seq watermark dedups replay/live overlap.
+- `session.reclaimed` (broadcast) names a session the server reaped (idle timeout, LRU, or the ~20 s WS-orphan reap that also interrupts a running turn); the app surfaces it instead of letting the next prompt fail mysteriously.
+- **Client-direct voice**: `GET /api/audio/voice-config` hands the client the profile's STT/TTS provider config (keys in memory only, never persisted or logged); when a direction is client-callable (`openai-multipart`/`xai-stt`/`elevenlabs-stt`, `openai-speech`/`elevenlabs-tts`), the app calls the provider directly — mic audio and reply speech skip the gateway hop. TTS is sentence-cut client-side (server-chunker parity) and played per clip. `{"mode":"relay"}`, unknown wires, fetch failures, and older backends all keep the `/api/audio/*` relay endpoints, which remain the floor. A direct STT provider *rejection* surfaces as the error it is rather than silently re-failing through the relay.
+- `projects.tree` / `projects.project_sessions` are called with the selected `profile` for server-side scoping (older backends ignore the param; the client-side preview filter stays as belt-and-suspenders).
 - First submit after a barge-in carries `interrupted: true` (120 s latch, like the desktop).
 
 ## Connecting
@@ -112,6 +119,10 @@ Milestone 2 — text path (keyboard icon in the conversation header):
 - [ ] Quit mid-approval, reopen and resume → the sheet reappears (spoken cue included) and is answerable; answer it from the desktop instead → on reconnect the stale sheet clears and listening resumes
 - [ ] Long multi-tool turn → the header context chip climbs mid-turn and settles at the end-of-turn value (hidden entirely on backends without context reporting)
 - [ ] Resume a session with a long transcript → the conversation screen appears immediately ("Loading session history…" while it hydrates); speaking right away still gets a full-context reply
+- [ ] Drop the network mid-reply for a few seconds and restore it → after "Reconnected." the reply keeps speaking from where it left off (event replay); a backend *restart* mid-reply instead resets cleanly
+- [ ] Let a session idle past the backend's idle TTL while connected → the "backend reclaimed this session" alert appears instead of a failed next prompt
+- [ ] Wake the device from sleep during a conversation → the ping probe redials a dead socket within seconds (no wedged "Thinking…")
+- [ ] With a cloud STT/TTS provider (openai/groq/elevenlabs/xai) configured: voice works with the gateway's audio relay untouched — server logs show no `/api/audio/transcribe` / `speak-stream` traffic (client-direct); with local whisper / edge-tts, the relay endpoints are used exactly as before; setting `voice.client_direct: false` in config.yaml forces relay everywhere
 
 Milestones 3–5 — voice:
 - [ ] Reply is spoken via speak-stream (streaming TTS provider) with live captions

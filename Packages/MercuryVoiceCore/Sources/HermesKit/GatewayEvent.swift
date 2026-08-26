@@ -6,11 +6,27 @@ public struct GatewayEvent: Sendable, Equatable {
     public var type: String
     public var sessionID: String?
     public var payload: JSONValue
+    /// Per-session monotonic stamp (event_replay.py). Present on session
+    /// events from current gateways; nil on global events and old backends.
+    public var seq: Int?
 
-    public init(type: String, sessionID: String?, payload: JSONValue) {
+    public init(type: String, sessionID: String?, payload: JSONValue, seq: Int? = nil) {
         self.type = type
         self.sessionID = sessionID
         self.payload = payload
+        self.seq = seq
+    }
+
+    /// Decode one event-frame `params` object ({type, session_id, seq,
+    /// payload}) — the shape both the live socket and the
+    /// `session.events.since` replay batches carry.
+    public init?(eventParams params: JSONValue) {
+        guard let type = params["type"]?.stringValue else { return nil }
+        self.init(
+            type: type,
+            sessionID: params["session_id"]?.stringValue,
+            payload: params["payload"] ?? .null,
+            seq: params["seq"]?.intValue)
     }
 
     /// Well-known event names (open set — unknown types must be tolerated).
@@ -32,7 +48,30 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let sessionResumeProgress = "session.resume_progress"
         public static let sessionTitle = "session.title"
         public static let notificationShow = "notification.show"
+        public static let sessionReclaimed = "session.reclaimed"
         public static let error = "error"
+    }
+}
+
+/// Result of `session.events.since` — the missed-event replay a reconnecting
+/// client requests with its last observed seq.
+public struct EventReplayBatch: Sendable, Equatable {
+    public var events: [GatewayEvent]
+    public var latestSeq: Int?
+    /// The requested watermark predates the ring buffer — a gap exists, so
+    /// the caller must fall back to a full state refresh instead of replaying.
+    public var truncated: Bool
+    /// Process identity of the seq numbering; compare against the
+    /// `replay_epoch` learned at `gateway.ready` — a mismatch means the
+    /// backend restarted and every watermark is stale.
+    public var epoch: String?
+
+    public init(result: JSONValue) {
+        self.events =
+            result["events"]?.arrayValue?.compactMap(GatewayEvent.init(eventParams:)) ?? []
+        self.latestSeq = result["latest_seq"]?.intValue
+        self.truncated = result["truncated"]?.truthy ?? false
+        self.epoch = result["epoch"]?.stringValue
     }
 }
 

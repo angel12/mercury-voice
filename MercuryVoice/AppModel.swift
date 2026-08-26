@@ -322,12 +322,18 @@ final class AppModel {
         selectedProfile = nil
     }
 
-    /// Immediate re-dial on foreground (backoff skip), and a mic re-arm for
-    /// an engine parked by a background start refusal (issue #31).
+    /// Foreground recovery: probe a seemingly-ready socket with
+    /// `gateway.ping` (a device wake / network switch can leave it half-open
+    /// and indistinguishable from a long quiet turn — a failed probe closes
+    /// it so the supervisor redials), skip any pending backoff, and re-arm a
+    /// mic parked by a background start refusal (issue #31).
     func appBecameActive() {
         conversation?.appBecameActive()
         guard let connection else { return }
-        Task { await connection.pokeReconnect() }
+        Task {
+            await connection.verifyConnection()
+            await connection.pokeReconnect()
+        }
     }
 
     private func startUpdatePump(_ connection: HermesConnection) {
@@ -416,7 +422,10 @@ final class AppModel {
             if generation == browseGeneration { browseLoading = false }
         }
         do {
-            let tree = try await connection.projectsTree()
+            // Server-side profile scoping (current gateways bind the profile's
+            // HERMES_HOME; older ones ignore the param and the client-side
+            // preview filter in BrowseView still applies).
+            let tree = try await connection.projectsTree(profile: selectedProfile)
             guard generation == browseGeneration else { return }
             projectTree = tree
             let profile = selectedProfile ?? "all"
