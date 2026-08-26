@@ -36,6 +36,8 @@ public actor GatewayClient {
 
     public private(set) var state: State = .idle
     public private(set) var closeCause: CloseCause = .other
+    /// `replay_epoch` from this socket's `gateway.ready` (nil on old backends).
+    public private(set) var replayEpoch: String?
     private var readyWaiters: [CheckedContinuation<Void, Error>] = []
 
     /// Backend contract version reported in gateway payloads (session.info's
@@ -254,17 +256,17 @@ public actor GatewayClient {
         // Only frames with method == "event" and params.type are events;
         // everything else is a response.
         if frame["method"]?.stringValue == "event",
-            let type = frame["params"]?["type"]?.stringValue
+            let params = frame["params"], let event = GatewayEvent(eventParams: params)
         {
-            let event = GatewayEvent(
-                type: type,
-                sessionID: frame["params"]?["session_id"]?.stringValue,
-                payload: frame["params"]?["payload"] ?? .null)
-
-            if type == GatewayEvent.Kind.gatewayReady, state == .connecting {
-                state = .ready
-                for cont in readyWaiters { cont.resume() }
-                readyWaiters.removeAll()
+            if event.type == GatewayEvent.Kind.gatewayReady {
+                // Seq numbering identity for the WS replay contract; a later
+                // mismatch on session.events.since means the backend restarted.
+                replayEpoch = event.payload["replay_epoch"]?.stringValue
+                if state == .connecting {
+                    state = .ready
+                    for cont in readyWaiters { cont.resume() }
+                    readyWaiters.removeAll()
+                }
             }
             for sub in subscribers.values { sub.yield(event) }
             return

@@ -129,20 +129,44 @@ extension HermesConnection {
     // MARK: Projects
 
     /// `projects.tree` — the authoritative sidebar grouping (explicit
-    /// projects, auto repo projects, `__no_project__` Home bucket).
-    public func projectsTree(previewLimit: Int = 3) async throws -> ProjectTree {
-        let result = try await request(
-            "projects.tree", params: ["preview_limit": .number(Double(previewLimit))])
+    /// projects, auto repo projects, `__no_project__` Home bucket). Pass the
+    /// selected profile for server-side scoping (`_profile_scoped` binds that
+    /// profile's HERMES_HOME); omitted, or on older backends that ignore the
+    /// param, the launch profile answers as before.
+    public func projectsTree(
+        previewLimit: Int = 3, profile: String? = nil
+    ) async throws -> ProjectTree {
+        var params: [String: JSONValue] = ["preview_limit": .number(Double(previewLimit))]
+        if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
+        let result = try await request("projects.tree", params: .object(params))
         return ProjectTree(json: result)
     }
 
     /// `projects.project_sessions` — the fully hydrated rows for one
     /// project, nested under `project` as repo → lane → sessions.
-    public func projectSessions(projectID: String) async throws -> [SessionSummary] {
-        let result = try await request(
-            "projects.project_sessions", params: ["project_id": .string(projectID)])
+    public func projectSessions(
+        projectID: String, profile: String? = nil
+    ) async throws -> [SessionSummary] {
+        var params: [String: JSONValue] = ["project_id": .string(projectID)]
+        if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
+        let result = try await request("projects.project_sessions", params: .object(params))
         guard let project = result["project"] else { return [] }
         return ProjectInfo.hydratedSessions(in: project)
+    }
+
+    // MARK: Reconnect replay
+
+    /// `session.events.since` — replay events newer than `lastSeen` for a
+    /// still-live session after a reconnect. Throws rpcError on backends
+    /// without the replay contract; callers treat that as `truncated`.
+    public func eventsSince(sessionID: String, lastSeen: Int) async throws -> EventReplayBatch {
+        let result = try await request(
+            "session.events.since",
+            params: [
+                "session_id": .string(sessionID),
+                "last_seen": .number(Double(lastSeen)),
+            ])
+        return EventReplayBatch(result: result)
     }
 
     // MARK: Prompt-family responses

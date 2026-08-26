@@ -128,6 +128,14 @@ public struct HermesRESTClient: Sendable {
         return SpokenClip(dataURL: dataURL, mimeType: json["mime_type"]?.stringValue)
     }
 
+    /// `GET /api/audio/voice-config` — the profile's STT/TTS resolution for
+    /// client-direct voice. Throws on older backends (404) and transport
+    /// failures; callers treat any throw as "relay everything".
+    public func voiceConfig(profile: String?) async throws -> VoiceClientConfig {
+        let json = try await get("/api/audio/voice-config", query: profileQuery(profile))
+        return VoiceClientConfig(json: json)
+    }
+
     /// ws(s) URL for the streaming TTS socket (`/api/audio/speak-stream`).
     /// Build one per dial — gated mode embeds a fresh single-use ticket.
     public func speakStreamURL(profile: String?) async throws -> URL {

@@ -59,6 +59,7 @@ final class ConversationController {
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
     private let speech: HermesSpeechOutput
+    private let voiceStore: VoiceConfigStore
     private let capture = AudioCaptureService.shared
     private let cues = ConversationCuePlayer()
     private var stateTask: Task<Void, Never>?
@@ -130,7 +131,12 @@ final class ConversationController {
         self.connection = connection
         self.profile = profile
         self.profileName = profile
-        self.speech = HermesSpeechOutput(rest: connection.rest, profile: profile)
+        // One client-direct voice-config cache per conversation: STT and TTS
+        // share the fetch, and its keys die with the controller (memory only).
+        let voiceStore = VoiceConfigStore(rest: connection.rest, profile: profile)
+        self.voiceStore = voiceStore
+        self.speech = HermesSpeechOutput(
+            rest: connection.rest, profile: profile, voiceConfig: voiceStore)
 
         let box = sessionBox
         self.tracker = AgentTurnTracker(
@@ -203,6 +209,8 @@ final class ConversationController {
         }
         let running = handle.raw["running"]?.truthy ?? false
         usage = nil  // new session identity; the first turn re-reports
+        lastSeenSeq = nil
+        replayEpoch = await connection.replayEpoch
         await tracker.reset(busy: running)
         // A resumed live session can be parked on a prompt that was emitted
         // while no client was attached; replay it. Nothing to clear on a
@@ -228,7 +236,8 @@ final class ConversationController {
         let engine = ConversationEngine(
             recorder: MicRecorder(capture: capture),
             bargeMonitor: BargeInMonitor(capture: capture),
-            transcriber: RestTranscriber(rest: connection.rest, profile: profile),
+            transcriber: RestTranscriber(
+                rest: connection.rest, profile: profile, voiceConfig: voiceStore),
             speech: speech,
             agent: tracker,
             callbacks: ConversationCallbacks(
@@ -446,6 +455,17 @@ final class ConversationController {
 
     // MARK: Gateway events
 
+    /// Replay-contract state: the last `seq` observed for the runtime
+    /// session, and the `replay_epoch` its numbering belongs to. Both reset
+    /// whenever the runtime session identity changes.
+    private var lastSeenSeq: Int?
+    private var replayEpoch: String?
+    /// While a reconnect-resume is deciding between event replay and a tracker
+    /// reset, live events are parked here so replayed frames can't interleave
+    /// out of order with them; the seq gate dedups any overlap on drain.
+    private var holdingEvents = false
+    private var heldEvents: [GatewayEvent] = []
+
     /// Called by AppModel's pump for every gateway event.
     func handle(event: GatewayEvent) {
         // Session-scoped events only, except title/info which some backends
@@ -455,6 +475,29 @@ final class ConversationController {
             || event.sessionID == sessionBox.runtimeID
             || event.sessionID == sessionBox.storedID
         guard ours else { return }
+
+        if holdingEvents {
+            heldEvents.append(event)
+            return
+        }
+        apply(event)
+    }
+
+    private func drainHeldEvents() {
+        holdingEvents = false
+        let held = heldEvents
+        heldEvents = []
+        for event in held { apply(event) }
+    }
+
+    private func apply(_ event: GatewayEvent) {
+        // Seq gate (runtime-session events only — that's the id the replay
+        // ring is keyed by): drop anything at or below the watermark, so a
+        // replay batch overlapping the live stream can't double-apply deltas.
+        if let seq = event.seq, event.sessionID == sessionBox.runtimeID {
+            if let last = lastSeenSeq, seq <= last { return }
+            lastSeenSeq = seq
+        }
 
         switch event.type {
         case GatewayEvent.Kind.messageStart,
@@ -539,6 +582,22 @@ final class ConversationController {
         case GatewayEvent.Kind.notificationShow:
             notice = event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue
 
+        case GatewayEvent.Kind.sessionReclaimed:
+            // Broadcast (no session_id on the frame): the server reaped a
+            // session out from under its client — idle TTL, LRU cap, or the
+            // WS-orphan reap. Without this, the next prompt just fails
+            // against an id the backend has forgotten.
+            let runtime = event.payload["session_id"]?.stringValue
+            let stored = event.payload["stored_session_id"]?.stringValue
+            let isOurs =
+                (runtime != nil && runtime == sessionBox.runtimeID)
+                || (stored != nil && stored == sessionBox.storedID)
+            if isOurs {
+                let reason = event.payload["reason"]?.stringValue ?? "reclaimed"
+                setupError =
+                    "The backend reclaimed this session (\(reason)). Go back and resume it to continue."
+            }
+
         default:
             break
         }
@@ -590,25 +649,67 @@ final class ConversationController {
         if clearStale { resumeIfUnprompted() }
     }
 
-    /// After a reconnect, runtime ids are dead — re-resume by stored id.
+    /// After a reconnect, re-resume by stored id. When the gateway kept the
+    /// session alive (same runtime id back, same replay epoch), the missed
+    /// events are replayed through `session.events.since` so a reply that
+    /// streamed while we were away is spoken from where it left off; anything
+    /// else (cold resume, backend restart, replay ring overrun, old backend)
+    /// falls back to the tracker reset.
     func connectionBecameReady(isReconnect: Bool) async {
         connectionHealthy = true
         guard isReconnect else { return }
         guard let storedID = sessionBox.storedID else { return }
+        let previousRuntimeID = sessionBox.runtimeID
+        let previousEpoch = replayEpoch
+        let watermark = lastSeenSeq
+        holdingEvents = true
+        defer { drainHeldEvents() }
         do {
             let handle = try await connection.resumeSession(
                 storedID: storedID, profile: profile)
             self.handle = handle
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
-            let running = handle.raw["running"]?.truthy ?? false
-            await tracker.reset(busy: running)
+            replayEpoch = await connection.replayEpoch
+            let replayed = await replayMissedEvents(
+                handle: handle,
+                previousRuntimeID: previousRuntimeID,
+                previousEpoch: previousEpoch,
+                watermark: watermark)
+            if !replayed {
+                lastSeenSeq = nil
+                let running = handle.raw["running"]?.truthy ?? false
+                await tracker.reset(busy: running)
+            }
             adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
             noteHydration(from: handle)
         } catch {
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Lossless-reconnect attempt. True only when every gap-safety check
+    /// passes AND the buffered frames were applied — the caller then skips
+    /// the tracker reset because the replay reconstructs the exact state.
+    private func replayMissedEvents(
+        handle: SessionHandle,
+        previousRuntimeID: String?,
+        previousEpoch: String?,
+        watermark: Int?
+    ) async -> Bool {
+        guard let watermark, let previousEpoch,
+            handle.runtimeID == previousRuntimeID,
+            await connection.replayEpoch == previousEpoch
+        else { return false }
+        guard
+            let batch = try? await connection.eventsSince(
+                sessionID: handle.runtimeID, lastSeen: watermark),
+            !batch.truncated,
+            batch.epoch == nil || batch.epoch == previousEpoch
+        else { return false }
+        for event in batch.events { apply(event) }
+        return true
     }
 
     func connectionLost() {

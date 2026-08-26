@@ -109,6 +109,33 @@ public actor HermesConnection {
         return try await gateway.request(method, params: params, timeout: timeout)
     }
 
+    /// `replay_epoch` from the current socket's `gateway.ready`; nil while
+    /// disconnected or against a backend without the replay contract.
+    public var replayEpoch: String? {
+        get async { await gateway?.replayEpoch }
+    }
+
+    /// Probe a seemingly-ready connection with `gateway.ping`. The app has no
+    /// read timeout (quiet sockets during a busy turn are healthy), so a
+    /// half-open socket — carrier NAT dropped us, the Mac slept — looks
+    /// exactly like a long turn until a write fails. A failed/timed-out ping
+    /// closes the socket so the supervisor redials immediately instead of
+    /// waiting for the next RPC to hang. No-op when not ready (the supervisor
+    /// is already redialing). A backend without the method still answers
+    /// (method-not-found error), which proves liveness — only transport
+    /// failures and timeouts count as dead.
+    public func verifyConnection(timeout: TimeInterval = 5) async {
+        guard case .ready = phase, let gateway else { return }
+        do {
+            _ = try await gateway.request("gateway.ping", timeout: timeout)
+        } catch let error as HermesError {
+            if case .rpcError = error { return }  // server answered — alive
+            await gateway.close(reason: "heartbeat probe failed")
+        } catch {
+            await gateway.close(reason: "heartbeat probe failed")
+        }
+    }
+
     // MARK: Supervisor
 
     private func runSupervisor() async {

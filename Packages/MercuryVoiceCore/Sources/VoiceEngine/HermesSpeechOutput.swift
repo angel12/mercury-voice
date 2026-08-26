@@ -1,26 +1,36 @@
 import Foundation
 import HermesKit
 
-/// The real `SpeechPlaying`: speak-stream WebSocket first, whole-clip REST
-/// fallback second, with the stop/sequence protocol the engine's settle logic
-/// depends on.
+/// The real `SpeechPlaying`. Session ladder (desktop parity): client-direct
+/// synthesis with the profile's own TTS (lowest hops — reply text is already
+/// streaming here, audio goes provider → speaker without touching the
+/// gateway link) → the gateway speak-stream WS relay → whole-clip REST
+/// fallback. Stop/sequence protocol per the engine's settle logic.
 public actor HermesSpeechOutput: SpeechPlaying {
     private let rest: HermesRESTClient
     private let profile: String?
+    private let voiceConfig: VoiceConfigStore?
 
     private var current: SpeakStreamSession?
+    private var currentDirect: DirectSpeechSession?
     private var fallback: FallbackClipPlayer?
     public private(set) var sequence = 0
 
-    public init(rest: HermesRESTClient, profile: String?) {
+    public init(rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil) {
         self.rest = rest
         self.profile = profile
+        self.voiceConfig = voiceConfig
     }
 
     public func startStream() async -> (any SpeechStreaming)? {
         // Contract: exactly one sequence bump per start (the engine's +1
         // accounting detects user Stops racing this setup).
         await stopPlayback()
+        if let tts = await voiceConfig?.tts() {
+            let session = DirectSpeechSession(config: tts)
+            currentDirect = session
+            return session
+        }
         // Gated mode mints a single-use ticket per dial; a mint failure
         // falls back to the whole-clip REST path.
         guard let url = try? await rest.speakStreamURL(profile: profile) else {
@@ -55,6 +65,10 @@ public actor HermesSpeechOutput: SpeechPlaying {
             self.current = nil
             await current.stopNow()
         }
+        if let currentDirect {
+            self.currentDirect = nil
+            await currentDirect.stopNow()
+        }
         if let fallback {
             self.fallback = nil
             fallback.stop()
@@ -64,24 +78,36 @@ public actor HermesSpeechOutput: SpeechPlaying {
     public var isSpeaking: Bool {
         get async {
             if let current, await current.isAudiblyPlaying { return true }
+            if let currentDirect, await currentDirect.isAudiblyPlaying { return true }
             return fallback?.isPlaying ?? false
         }
     }
 }
 
-/// The real `Transcribing`: `POST /api/audio/transcribe` with the
-/// conversation's profile. Empty transcript = silence (success).
+/// The real `Transcribing`: provider-direct when the gateway hands out a
+/// client-callable STT config, `POST /api/audio/transcribe` relay otherwise.
+/// Empty transcript = silence (success). A direct provider REJECTION throws
+/// rather than silently relaying — the configured provider said no, and
+/// re-running the same request through the gateway would just fail again
+/// slower and hide the real error (desktop parity).
 public struct RestTranscriber: Transcribing {
     private let rest: HermesRESTClient
     private let profile: String?
+    private let voiceConfig: VoiceConfigStore?
+    private let direct = DirectVoiceClient()
 
-    public init(rest: HermesRESTClient, profile: String?) {
+    public init(rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil) {
         self.rest = rest
         self.profile = profile
+        self.voiceConfig = voiceConfig
     }
 
     public func transcribe(_ utterance: RecordedUtterance) async throws -> String {
-        try await rest.transcribe(
+        if let config = await voiceConfig?.stt() {
+            return try await direct.transcribe(
+                config: config, audio: utterance.audio, mimeType: utterance.mimeType)
+        }
+        return try await rest.transcribe(
             audio: utterance.audio, mimeType: utterance.mimeType, profile: profile
         ).transcript
     }
