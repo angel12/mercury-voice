@@ -173,7 +173,8 @@ struct EchoGuardTests {
     }
 
     @Test func echoWithOneMisheardWordMatches() {
-        // 4 of 5 words present (0.8): STT mangling a word must not defeat it.
+        // 4 of 5 words present (0.8 ≥ 0.7): STT mangling a word must not
+        // defeat it.
         #expect(
             EchoGuard.isLikelyEcho(transcript: "the whether today is sunny", reply: reply))
     }
@@ -188,9 +189,46 @@ struct EchoGuardTests {
             EchoGuard.isLikelyEcho(transcript: "Sunny — and WARM!", reply: reply))
     }
 
+    @Test func singleWordFromReplyIsNotEcho() {
+        // Issue #8: one word the agent just said ("stop", a repeated term) is
+        // far more likely the user — under the 3-token floor, never echo.
+        #expect(!EchoGuard.isLikelyEcho(transcript: "sunny", reply: reply))
+    }
+
+    @Test func twoWordsFromReplyAreNotEcho() {
+        // Issue #8: even a 100% match at 2 tokens stays under the floor.
+        #expect(!EchoGuard.isLikelyEcho(transcript: "sunny warm", reply: reply))
+    }
+
+    @Test func threeTokensAllMatchedIsEcho() {
+        // At the floor, all three must match (3 * 0.7 = 2.1) — and they do.
+        #expect(EchoGuard.isLikelyEcho(transcript: "sunny and warm", reply: reply))
+    }
+
+    @Test func threeTokensWithTwoMatchedIsNotEcho() {
+        // 2 of 3 matched falls short of 3 * 0.7 = 2.1.
+        #expect(!EchoGuard.isLikelyEcho(transcript: "sunny and cold", reply: reply))
+    }
+
+    @Test func mostlyMatchedLongTranscriptIsEcho() {
+        // 6 of 8 words present (0.75): an echo this mangled slipped past the
+        // old 0.8 threshold and got re-submitted; 0.7 now catches it.
+        #expect(
+            EchoGuard.isLikelyEcho(
+                transcript: "the weather today is sunny and really cold", reply: reply))
+    }
+
+    @Test func longTranscriptWellUnderThresholdIsNotEcho() {
+        // 3 of 8 words present (0.375): a genuine follow-up reusing a few of
+        // the reply's words must go through.
+        #expect(
+            !EchoGuard.isLikelyEcho(
+                transcript: "is the weather going to change tomorrow morning", reply: reply))
+    }
+
     @Test func emptyTranscriptIsNotEcho() {
         #expect(!EchoGuard.isLikelyEcho(transcript: "  ", reply: reply))
-        #expect(!EchoGuard.isLikelyEcho(transcript: "hello", reply: ""))
+        #expect(!EchoGuard.isLikelyEcho(transcript: "hello hello again", reply: ""))
     }
 }
 
