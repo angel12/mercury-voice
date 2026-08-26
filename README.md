@@ -16,7 +16,7 @@ xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'pl
 xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
-Unit tests (165 tests: state machine, barge detector, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler, client-direct voice wires, reconnect replay decoding):
+Unit tests (179 tests: state machine, failure-recovery paths, barge detector, echo guard, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler, client-direct voice wires, reconnect replay decoding):
 
 ```bash
 cd Packages/MercuryVoiceCore && swift test

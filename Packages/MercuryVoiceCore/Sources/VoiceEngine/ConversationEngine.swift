@@ -25,6 +25,12 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
     private var pendingStart = false
     private var turnClosing = false
+    /// Stop pressed while a turn was closing (status == .transcribing, or a
+    /// close already in flight): the user asked for quiet before the
+    /// transcript existed, so the close path must drop its result — no
+    /// submit, no re-arm (issue #5). Consumed by the close path, and cleared
+    /// whenever the mic deliberately re-opens.
+    private var stopRequested = false
     private var awaitingSpokenResponse = false
     private var responseID: String?
     private var spokenSourceLength = 0
@@ -110,6 +116,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public func start() async {
         enabled = true
         muted = false
+        stopRequested = false
         awaitingSpokenResponse = false
         await dropSpeechSession()
         await agent.consumePendingSpeech()
@@ -122,6 +129,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public func end() async {
         enabled = false
         pendingStart = false
+        stopRequested = false
         clearTurnTimeout()
         speechTask?.cancel()
         speechTask = nil
@@ -142,10 +150,23 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public func stopSpeech() async {
         pendingStart = false
         if status == .listening {
+            // Latch as well as cancel: the VAD's auto-stop hops actors, so a
+            // turn close may already be in flight — if handleTurn has passed
+            // its .listening guard, the latch keeps it from re-arming off a
+            // cancelled recording.
+            stopRequested = true
             clearTurnTimeout()
             await recorder.cancel()
-            setStatus(.idle)
+            // handleTurn may have taken over during the await; leave the
+            // status to it (it settles to idle when it consumes the latch).
+            if status == .listening { setStatus(.idle) }
             return
+        }
+        if status == .transcribing {
+            // The turn is between mic close and submit (the 1-3s STT window,
+            // issue #5); there is no playback to stop yet — latch so the
+            // pending transcript is dropped instead of submitted.
+            stopRequested = true
         }
         if status == .thinking {
             // Give up on speaking this turn's reply.
@@ -213,6 +234,10 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         guard enabled, !micBlocked, !(await agent.isBusy) else { return }
         guard !bargeCapturePending else { return }  // the monitor owns the mic
         guard status == .idle else { return }
+        // A deliberate mic re-open (listenNow, unmute, the next turn)
+        // invalidates any stale stop request — it only ever applies to the
+        // turn it interrupted.
+        stopRequested = false
 
         do {
             try await recorder.start(
@@ -249,6 +274,11 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         clearTurnTimeout()
         turnTimeoutGeneration += 1
         let generation = turnTimeoutGeneration
+        // Deliberately strong: [weak self] would break the closure's actor-
+        // context inheritance, moving the task to the global executor — the
+        // timer would then race the actor jobs it must stay FIFO with (a
+        // cancel can land before the sleep parks). The task↔actor cycle this
+        // creates lasts only until the timer fires or is cancelled (#7).
         turnTimeoutTask = Task { [clock] in
             try? await clock.sleep(for: VoiceConstants.turnHardCap, tolerance: nil)
             guard !Task.isCancelled else { return }
@@ -276,6 +306,11 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         stopThinkingChime()
         thinkingChimeGeneration += 1
         let generation = thinkingChimeGeneration
+        // Strong on purpose (see turnTimeoutTask): this loop is the #7
+        // retain cycle — it pins the engine while status stays .thinking, so
+        // an engine released without end() mid-thinking leaks. Every owner
+        // path calls end(); breaking the cycle with [weak self] costs the
+        // actor-FIFO ordering the engine's determinism depends on.
         thinkingChimeTask = Task { [clock] in
             while !Task.isCancelled {
                 try? await clock.sleep(
@@ -315,8 +350,10 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         let result = await recorder.stop()
 
         guard let result, result.heardSpeech || forceTranscribe else {
-            // Never heard speech — quietly re-arm.
-            if enabled, !micBlocked, !(await agent.isBusy), status != .speaking {
+            let stopped = consumeStopRequest()
+            // Never heard speech — quietly re-arm (unless Stop landed while
+            // the turn was closing; the user asked for quiet).
+            if !stopped, enabled, !micBlocked, !(await agent.isBusy), status != .speaking {
                 pendingStart = true
             }
             setStatus(.idle)
@@ -329,8 +366,13 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         do {
             transcript = try await transcriber.transcribe(result)
         } catch {
-            callbacks.onNotice("Transcription failed: \(error.localizedDescription)")
-            if enabled, !micBlocked, !(await agent.isBusy) { pendingStart = true }
+            let stopped = consumeStopRequest()
+            if !stopped {
+                // A Stop mid-close voids the turn — the failure of a
+                // transcript that was going to be dropped is not news.
+                callbacks.onNotice("Transcription failed: \(error.localizedDescription)")
+                if enabled, !micBlocked, !(await agent.isBusy) { pendingStart = true }
+            }
             setStatus(.idle)
             await drive()
             return
@@ -338,9 +380,21 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
+            let stopped = consumeStopRequest()
             // Empty transcript = silence: success, quietly re-arm.
             // (Desktop re-arms on `enabled` alone here.)
-            if enabled { pendingStart = true }
+            if enabled, !stopped { pendingStart = true }
+            setStatus(.idle)
+            await drive()
+            return
+        }
+
+        if consumeStopRequest() {
+            // Stop landed during the STT window (issue #5): the user asked
+            // for quiet before this transcript existed. Drop it — no
+            // stop-word scan, no submit — and don't re-arm; listenNow() or
+            // unmute is the way back, matching Stop's contract in every
+            // other phase.
             setStatus(.idle)
             await drive()
             return
@@ -419,16 +473,30 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         guard status != .speaking else { return }
         self.responseID = responseID
         spokenSourceLength = 0
+        // Read the Stop-detection baseline BEFORE .speaking becomes visible:
+        // a Stop can land between this method and runLiveSpeech's first
+        // instruction (the task hop is not FIFO with other actor jobs), and a
+        // baseline read after that Stop would absorb its sequence bump and
+        // speak a reply the user just stopped (review finding L3).
+        let sequenceBeforeStart = await speech.sequence
+        guard status != .speaking else { return }
         setStatus(.speaking)
         await ensureBargeMonitor()
-        speechTask = Task { await self.runLiveSpeech(responseID: responseID) }
+        speechTask = Task {
+            await self.runLiveSpeech(
+                responseID: responseID, sequenceBeforeStart: sequenceBeforeStart)
+        }
     }
 
-    private func runLiveSpeech(responseID: String) async {
-        let sequenceBeforeStart = await speech.sequence
+    private func runLiveSpeech(responseID: String, sequenceBeforeStart: Int) async {
         guard let session = await speech.startStream() else {
-            if await speech.sequence > sequenceBeforeStart {
-                // A Stop landed during stream setup.
+            // startStream's own stopPlayback bumps the sequence once (+1)
+            // even when it fails; only a bump beyond that is a user Stop
+            // racing the setup. Counting the contract bump as a Stop made
+            // every unavailable stream settle as "user stopped" — the
+            // fallback below was unreachable, so a TTS setup failure
+            // silently muted the reply and parked the mic (issue #11).
+            if await speech.sequence > sequenceBeforeStart + 1 {
                 awaitingSpokenResponse = false
                 await settleAfterSpeech(barged: false, stoppedDuringSetup: true)
             } else {
@@ -631,9 +699,11 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     }
 
     private func submitCapturedUtterance(_ utterance: RecordedUtterance?) async {
-        // Desktop's resumeListening: enabled && !muted, no busy check.
+        // Desktop's resumeListening: enabled && !muted, no busy check. The
+        // stop latch is consumed at every exit — a Stop during the capture's
+        // STT window voids the turn and must not re-arm (issue #5).
         func resumeListening() {
-            if enabled, !micBlocked { pendingStart = true }
+            if enabled, !micBlocked, !consumeStopRequest() { pendingStart = true }
             setStatus(.idle)
         }
 
@@ -680,6 +750,14 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             try? await clock.sleep(for: VoiceConstants.interruptSettlePoll, tolerance: nil)
         }
 
+        if consumeStopRequest() {
+            // Stop landed while the capture was transcribing or waiting for
+            // the interrupted turn to settle — drop it, don't re-arm.
+            setStatus(.idle)
+            await drive()
+            return
+        }
+
         lastTranscript = trimmed
         awaitingSpokenResponse = true
         await dropSpeechSession()
@@ -695,6 +773,12 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
         setStatus(.thinking)
         await drive()
+    }
+
+    private func consumeStopRequest() -> Bool {
+        let requested = stopRequested
+        stopRequested = false
+        return requested
     }
 
     private func consumeInterruptedLatch() -> Bool {
