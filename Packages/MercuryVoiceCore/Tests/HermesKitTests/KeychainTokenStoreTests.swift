@@ -80,8 +80,12 @@ struct KeychainTokenStoreTests {
 
         #expect(recorder.updateQueries.count == 1)
         #expect(recorder.addItems.isEmpty)
-        let data = recorder.updateAttributes.first?[kSecValueData as String] as? Data
-        #expect(data == Data("tok-123".utf8))
+        let attributes = try #require(recorder.updateAttributes.first)
+        #expect(attributes[kSecValueData as String] as? Data == Data("tok-123".utf8))
+        // Re-marks pre-existing items, which shipped as AfterFirstUnlock.
+        #expect(
+            attributes[kSecAttrAccessible as String] as? String
+                == kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
     }
 
     @Test func addFallbackUsesDeviceOnlyAccessibilityAndNoSync() throws {

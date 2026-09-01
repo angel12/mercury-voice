@@ -128,7 +128,13 @@ public struct KeychainTokenStore: Sendable {
         }
         let data = Data(token.utf8)
         let query = baseQuery(account: endpoint.key)
-        let attributes: [String: Any] = [kSecValueData as String: data]
+        // The accessibility attribute goes on the update too, not just the add:
+        // items written by earlier versions are AfterFirstUnlock, and updating
+        // only kSecValueData would leave them that way forever.
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
 
         let status = calls.update(query as CFDictionary, attributes as CFDictionary)
         switch status {
