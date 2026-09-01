@@ -437,7 +437,7 @@ final class AppModel {
             browseError = nil
         } catch let error as HermesError {
             guard generation == browseGeneration else { return }
-            if case .rpcError(HermesError.RPCCode.methodNotFound, _) = error {
+            if case .rpcError(HermesError.RPCCode.methodNotFound, _, _) = error {
                 // Older backend without projects.* — degrade to grouping the
                 // flat list by repo root / cwd.
                 await degradeToFlatSessions(generation: generation)

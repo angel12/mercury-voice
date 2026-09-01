@@ -279,7 +279,8 @@ public actor GatewayClient {
             cont.resume(
                 throwing: HermesError.rpcError(
                     code: error["code"]?.intValue ?? -1,
-                    message: error["message"]?.stringValue ?? "unknown error"))
+                    message: error["message"]?.stringValue ?? "unknown error",
+                    data: error["data"]))
         } else {
             cont.resume(returning: frame["result"] ?? .null)
         }
