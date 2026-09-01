@@ -64,6 +64,7 @@ Key protocol facts honored (verified against the hermes-agent source):
 
 - **Two-ID model** — every RPC takes the ephemeral runtime `session_id`; reconnects re-`session.resume` by the durable stored id and re-anchor to the result's `resumed` field.
 - `prompt.submit` returns immediately; completion is `message.complete` only (busy gate).
+- `prompt.submit` refusals branch on the machine-readable `error.data.reason` (`SESSION_NOT_OWNED` / `MAX_CONCURRENT_SESSIONS` / `SESSION_COORDINATION_UNAVAILABLE`, backends ≥ 2026-08-31) — never on the message prose — and error 5072 (state.db unavailable, message not saved) maps by code; each gets a spoken-friendly notice, with a generic fallback for unknown reasons.
 - The speak-stream gets `{"done": true}` only when the reply is non-pending **and** the turn is no longer busy, so trailing narration isn't cut off; `{"type":"fallback"}` reroutes to whole-clip TTS.
 - Empty transcript = silence → quietly re-listen (never an error toast).
 - `approval.request` is session-keyed (no request_id); `clarify.request`/`clarify.expire` correlate by `request_id`; both pause the voice loop and speak a short notice.
