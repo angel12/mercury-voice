@@ -92,6 +92,10 @@ Key protocol facts honored (verified against the hermes-agent source):
 
 ## Manual verification checklist (live backend)
 
+`[x]` means verified against a live backend, with the run recorded somewhere durable (a PR
+body or an issue comment) — not "believed to work." Everything else is unverified, including
+things that almost certainly do work. Each tick carries the PR it was recorded in.
+
 Milestone 1 — connect + browse:
 - [ ] `/api/status` probe shows version; bad token → clear "token rejected" message
 - [ ] Gateway connects, `gateway.ready` received (app reaches the browse screen)
@@ -132,13 +136,29 @@ Milestones 3–5 — voice:
 - [ ] Barge-in during speech stops playback ≤ ~0.5 s, captures your sentence from the first syllable (pre-roll), submits with the interrupted note
 - [ ] Barge-in during generation also sends `session.interrupt`
 - [ ] Stop button ends speech and does *not* re-arm; mute/unmute behaves
+- [x] Stop pressed while "Transcribing…" shows: nothing is submitted, the mic stays off, Listen brings it back (#20)
+- [x] Barge in over a reply, then Stop while that interruption is transcribing: same contract (#20)
+- [x] Interrupt the agent with a single word it just said ("stop", "no"): the turn goes through instead of being dropped as self-echo (#20)
+- [x] Break the TTS stream path (stop the speak-stream provider): replies fall back to whole-clip audio instead of going silent (#20)
 - [ ] iOS: conversation survives screen lock (background audio) and AirPods route changes
+- [ ] iOS: Live Activity appears on the lock screen / Dynamic Island with working mute / stop / end controls — **currently cannot pass**, see #23
 
 macOS mute hotkey (Settings, ⌘,):
 - [ ] ⌘⇧M toggles mute during a conversation (default, app focused); Conversation menu shows the shortcut and flips Mute/Unmute
 - [ ] Recording a new combo in Settings updates the menu item; Esc cancels; bare letters beep (modifier required, F-keys exempt)
 - [ ] "Use shortcut system-wide" mutes while another app is frontmost (Carbon hotkey; no accessibility prompt) and doesn't double-toggle when the app is frontmost
 - [ ] Disabling the shortcut removes both the key equivalent and the global registration; settings persist across relaunch
+
+Refusal reasons (#22 — needs a backend ≥ 2026-08-31):
+- [ ] `SESSION_NOT_OWNED`: run a turn on a session from `hermes chat`, then speak to the same session here → "Another app is running this session…" and the mic re-arms, not raw pid prose
+- [ ] `5072`: `chmod 000` state.db on a scratch profile, speak a prompt → "…couldn't save your message — its session storage needs repair" (restore permissions after)
+- [ ] Old backend: force any RPC error against a pre-2026-08-31 backend → generic "Hermes error N: …" still appears
+- [ ] Browse still degrades to the flat session list on a backend without `projects.*`
+
+Pre-submission (App Store — see #23):
+- [ ] Sandboxed macOS **Release** build completes a native OAuth sign-in (the loopback listener needs an entitlement the sandbox doesn't currently grant)
+- [ ] Deny the microphone permission on both platforms → a clear message and a working route into Settings, not a dead end
+- [ ] A build uploaded to App Store Connect produces no `ITMS-91053` privacy-manifest email
 
 ## Known deviations from the desktop client (deliberate)
 
