@@ -205,6 +205,15 @@ struct BrowseView: View {
                     .foregroundStyle(.red)
             }
         }
+        // A token rotation mid-session can fail to write the keychain, and
+        // this is the only screen on-screen when that happens (issue #9).
+        if let warning = model.credentialStoreError {
+            Section {
+                Label(warning, systemImage: "key.slash")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+        }
     }
 
     private func sessionRow(_ session: SessionSummary) -> some View {

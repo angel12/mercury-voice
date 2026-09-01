@@ -262,6 +262,7 @@ final class AppModel {
     func cancelPasswordLogin() {
         pendingLogin = nil
         connectError = nil
+        credentialStoreError = nil
     }
 
     /// Look up the gated server's sign-in options and surface whichever the

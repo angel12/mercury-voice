@@ -110,6 +110,7 @@ Milestone 1b — basic auth (gated bind, `dashboard.basic_auth` configured):
 - [ ] Voice conversation works end-to-end (WS + speak-stream mint per-dial tickets)
 - [ ] Backend restart (no configured `secret`) invalidates sessions → app returns to the sign-in form with "session expired", username prefilled
 - [ ] Loopback token servers still connect exactly as before (legacy keychain items migrate silently)
+- [ ] Keychain write failure (e.g. locked keychain) shows an orange "Couldn't save credentials…" notice on the connect and browse screens instead of failing silently (#9)
 
 Milestone 1c — native OAuth (gated bind with an OAuth provider advertising `native_pkce`):
 - [ ] Sign-in form shows "Continue with *provider*" only when the server advertises it (password form still shown iff basic auth is also configured)
