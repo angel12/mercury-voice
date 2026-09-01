@@ -25,6 +25,10 @@ final class AppModel {
     private(set) var serverStatus: ServerStatus?
     private(set) var endpoint: ServerEndpoint?
     var connectError: String?
+    /// A keychain save or delete failed: the session may still work, but the
+    /// credentials will not survive relaunch. Kept separate from
+    /// `connectError` so it never reads as a connection failure.
+    var credentialStoreError: String?
 
     var isConnected: Bool {
         if case .ready = phase { return true }
@@ -93,7 +97,11 @@ final class AppModel {
         savedServers.removeAll { $0.urlString == server.urlString }
         persistServers()
         if let parsed = try? ServerEndpoint.parse(server.urlString) {
-            tokenStore.deleteToken(for: parsed.endpoint)
+            do {
+                try tokenStore.deleteToken(for: parsed.endpoint)
+            } catch {
+                credentialStoreError = error.localizedDescription
+            }
         }
     }
 
@@ -139,6 +147,7 @@ final class AppModel {
         connectGeneration += 1
         let generation = connectGeneration
         connectError = nil
+        credentialStoreError = nil
         pendingLogin = nil
         self.endpoint = endpoint
 
@@ -148,8 +157,17 @@ final class AppModel {
         let store = tokenStore
         let authenticator = HermesAuthenticator(
             endpoint: endpoint, credentials: credentials
-        ) { rotated in
-            store.setCredentials(rotated, for: endpoint)
+        ) { [weak self] rotated in
+            do {
+                try store.setCredentials(rotated, for: endpoint)
+            } catch {
+                // Runs off the main actor: hop back to publish the warning.
+                // A rotation that outlives this connect attempt can leave a
+                // stale warning behind, which is acceptable.
+                Task { @MainActor in
+                    self?.credentialStoreError = error.localizedDescription
+                }
+            }
         }
         let probe = HermesRESTClient(endpoint: endpoint, authenticator: authenticator)
         do {
@@ -184,8 +202,13 @@ final class AppModel {
             return
         }
 
-        // Credentials are good — persist and open the gateway.
-        tokenStore.setCredentials(credentials, for: endpoint)
+        // Credentials are good — persist and open the gateway. A failed save
+        // only costs the next launch's auto-connect, so warn and carry on.
+        do {
+            try tokenStore.setCredentials(credentials, for: endpoint)
+        } catch {
+            credentialStoreError = error.localizedDescription
+        }
         UserDefaults.standard.set(endpoint.key, forKey: "lastServer")
         if !savedServers.contains(where: { $0.urlString == endpoint.key }) {
             savedServers.append(SavedServer(urlString: endpoint.key))

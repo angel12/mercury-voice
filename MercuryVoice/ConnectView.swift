@@ -119,6 +119,12 @@ struct ConnectView: View {
                     .foregroundStyle(.red)
             }
 
+            if let warning = model.credentialStoreError {
+                Label(warning, systemImage: "key.slash")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+
             Button {
                 connecting = true
                 Task {
@@ -206,6 +212,12 @@ struct ConnectView: View {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.red)
+            }
+
+            if let warning = model.credentialStoreError {
+                Label(warning, systemImage: "key.slash")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
             }
 
             if pending.passwordProvider != nil {
