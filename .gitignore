@@ -7,3 +7,7 @@ DerivedData/
 .build/
 build/
 *.swiftpm/xcode/package.xcworkspace/xcuserdata/
+
+# Local working docs (plans, notes, agent scratch) — kept local, not versioned
+docs/superpowers/
+docs/plans/
