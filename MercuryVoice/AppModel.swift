@@ -160,6 +160,10 @@ final class AppModel {
         ) { [weak self] rotated in
             do {
                 try store.setCredentials(rotated, for: endpoint)
+                // Clear any earlier warning: the keychain is writable again.
+                Task { @MainActor in
+                    self?.credentialStoreError = nil
+                }
             } catch {
                 // Runs off the main actor: hop back to publish the warning.
                 // A rotation that outlives this connect attempt can leave a
@@ -206,6 +210,7 @@ final class AppModel {
         // only costs the next launch's auto-connect, so warn and carry on.
         do {
             try tokenStore.setCredentials(credentials, for: endpoint)
+            credentialStoreError = nil
         } catch {
             credentialStoreError = error.localizedDescription
         }

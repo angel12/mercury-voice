@@ -59,9 +59,11 @@ public struct KeychainCalls: Sendable {
 /// server) belong in UserDefaults, not here.
 ///
 /// Writes throw `KeychainError` carrying the underlying `OSStatus` rather
-/// than failing silently, so callers can surface the failure. Stored items
-/// are device-only (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`):
-/// they never sync to iCloud and never leave the device in a backup.
+/// than failing silently, so callers can surface the failure. Items are
+/// marked `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, which keeps them
+/// device-only on iOS; the macOS file-based (login) keychain ignores the
+/// attribute. `kSecAttrSynchronizable` is never set, so items never
+/// iCloud-sync on either platform.
 public struct KeychainTokenStore: Sendable {
     private let service: String
     private let calls: KeychainCalls
@@ -136,7 +138,7 @@ public struct KeychainTokenStore: Sendable {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
 
-        let status = calls.update(query as CFDictionary, attributes as CFDictionary)
+        let status = updateStatus(query: query, attributes: attributes, data: data)
         switch status {
         case errSecSuccess:
             return
@@ -152,6 +154,22 @@ public struct KeychainTokenStore: Sendable {
         default:
             throw KeychainError.writeFailed(status)
         }
+    }
+
+    /// Updates the item's data, re-marking its accessibility when the platform
+    /// allows that key in an update dictionary.
+    ///
+    /// Not every platform is known to accept `kSecAttrAccessible` in
+    /// `SecItemUpdate`'s attributes; if one rejects it (`errSecParam` /
+    /// `errSecNoSuchAttr`) we retry with the data alone rather than failing
+    /// every save. The add path still marks new items device-only.
+    private func updateStatus(
+        query: [String: Any], attributes: [String: Any], data: Data
+    ) -> OSStatus {
+        let status = calls.update(query as CFDictionary, attributes as CFDictionary)
+        guard status == errSecParam || status == errSecNoSuchAttr else { return status }
+        return calls.update(
+            query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
     }
 
     /// Removes any stored item for `endpoint`. A missing item is success.

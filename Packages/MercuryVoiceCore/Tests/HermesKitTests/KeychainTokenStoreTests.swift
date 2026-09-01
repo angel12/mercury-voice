@@ -13,18 +13,30 @@ private final class Recorder: @unchecked Sendable {
     private var _updateAttributes: [[String: Any]] = []
     private var _addItems: [[String: Any]] = []
     private var _deleteQueries: [[String: Any]] = []
-    private var _updateStatus: OSStatus = errSecSuccess
+    private var _updateStatuses: [OSStatus] = [errSecSuccess]
     private var _addStatus: OSStatus = errSecSuccess
     private var _deleteStatus: OSStatus = errSecSuccess
 
+    /// `updateStatuses` is consumed one per `update` call; the last entry
+    /// repeats for any further calls.
     init(
-        updateStatus: OSStatus = errSecSuccess,
+        updateStatuses: [OSStatus] = [errSecSuccess],
         addStatus: OSStatus = errSecSuccess,
         deleteStatus: OSStatus = errSecSuccess
     ) {
-        _updateStatus = updateStatus
+        _updateStatuses = updateStatuses.isEmpty ? [errSecSuccess] : updateStatuses
         _addStatus = addStatus
         _deleteStatus = deleteStatus
+    }
+
+    convenience init(
+        updateStatus: OSStatus,
+        addStatus: OSStatus = errSecSuccess,
+        deleteStatus: OSStatus = errSecSuccess
+    ) {
+        self.init(
+            updateStatuses: [updateStatus], addStatus: addStatus,
+            deleteStatus: deleteStatus)
     }
 
     var updateQueries: [[String: Any]] { lock.withLock { _updateQueries } }
@@ -38,7 +50,8 @@ private final class Recorder: @unchecked Sendable {
                 lock.withLock {
                     _updateQueries.append(Self.dict(query))
                     _updateAttributes.append(Self.dict(attributes))
-                    return _updateStatus
+                    let index = min(_updateQueries.count - 1, _updateStatuses.count - 1)
+                    return _updateStatuses[index]
                 }
             },
             add: { [self] item in
@@ -76,9 +89,11 @@ struct KeychainTokenStoreTests {
 
     @Test func updateSuccessWritesTokenBytesAndSkipsAdd() throws {
         let recorder = Recorder(updateStatus: errSecSuccess)
-        try store(recorder).setToken("tok-123", for: try endpoint())
+        let endpoint = try endpoint()
+        try store(recorder).setToken("tok-123", for: endpoint)
 
         #expect(recorder.updateQueries.count == 1)
+        #expect(recorder.updateQueries.first?[kSecAttrAccount as String] as? String == endpoint.key)
         #expect(recorder.addItems.isEmpty)
         let attributes = try #require(recorder.updateAttributes.first)
         #expect(attributes[kSecValueData as String] as? Data == Data("tok-123".utf8))
@@ -106,6 +121,29 @@ struct KeychainTokenStoreTests {
         #expect(item[kSecAttrSynchronizable as String] == nil)
     }
 
+    @Test func updateRetriesWithoutAccessibilityWhenPlatformRejectsIt() throws {
+        let recorder = Recorder(updateStatuses: [errSecParam, errSecSuccess])
+        try store(recorder).setToken("tok-123", for: try endpoint())
+
+        #expect(recorder.updateQueries.count == 2)
+        #expect(recorder.addItems.isEmpty)
+        let retry = try #require(recorder.updateAttributes.last)
+        #expect(retry[kSecAttrAccessible as String] == nil)
+        #expect(retry[kSecValueData as String] as? Data == Data("tok-123".utf8))
+    }
+
+    @Test func updateRetryFailureThrowsWriteFailed() throws {
+        let recorder = Recorder(updateStatuses: [errSecParam, errSecAuthFailed])
+        let store = store(recorder)
+        let endpoint = try endpoint()
+
+        #expect(throws: KeychainError.writeFailed(errSecAuthFailed)) {
+            try store.setToken("tok-123", for: endpoint)
+        }
+        #expect(recorder.updateQueries.count == 2)
+        #expect(recorder.addItems.isEmpty)
+    }
+
     @Test func updateFailureThrowsWriteFailedAndSkipsAdd() throws {
         let recorder = Recorder(updateStatus: errSecAuthFailed)
         let store = store(recorder)
@@ -131,9 +169,11 @@ struct KeychainTokenStoreTests {
     @Test(arguments: [nil, ""] as [String?])
     func nilOrEmptyTokenDeletes(token: String?) throws {
         let recorder = Recorder()
-        try store(recorder).setToken(token, for: try endpoint())
+        let endpoint = try endpoint()
+        try store(recorder).setToken(token, for: endpoint)
 
         #expect(recorder.deleteQueries.count == 1)
+        #expect(recorder.deleteQueries.first?[kSecAttrAccount as String] as? String == endpoint.key)
         #expect(recorder.updateQueries.isEmpty)
         #expect(recorder.addItems.isEmpty)
     }
@@ -142,8 +182,10 @@ struct KeychainTokenStoreTests {
 
     @Test func deleteTreatsItemNotFoundAsSuccess() throws {
         let recorder = Recorder(deleteStatus: errSecItemNotFound)
-        try store(recorder).deleteToken(for: try endpoint())
+        let endpoint = try endpoint()
+        try store(recorder).deleteToken(for: endpoint)
         #expect(recorder.deleteQueries.count == 1)
+        #expect(recorder.deleteQueries.first?[kSecAttrAccount as String] as? String == endpoint.key)
     }
 
     @Test func deleteFailureThrowsDeleteFailed() throws {
@@ -154,15 +196,18 @@ struct KeychainTokenStoreTests {
         #expect(throws: KeychainError.deleteFailed(errSecAuthFailed)) {
             try store.deleteToken(for: endpoint)
         }
+        #expect(recorder.deleteQueries.first?[kSecAttrAccount as String] as? String == endpoint.key)
     }
 
     // MARK: setCredentials
 
     @Test func nilCredentialsDeletes() throws {
         let recorder = Recorder()
-        try store(recorder).setCredentials(nil, for: try endpoint())
+        let endpoint = try endpoint()
+        try store(recorder).setCredentials(nil, for: endpoint)
 
         #expect(recorder.deleteQueries.count == 1)
+        #expect(recorder.deleteQueries.first?[kSecAttrAccount as String] as? String == endpoint.key)
         #expect(recorder.updateQueries.isEmpty)
         #expect(recorder.addItems.isEmpty)
     }
