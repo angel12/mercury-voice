@@ -64,7 +64,7 @@ struct BrowseView: View {
         HStack {
             VStack(alignment: .leading) {
                 HStack(spacing: 6) {
-                    Text(profile.name).font(.body.weight(.medium))
+                    Text(profile.displayName).font(.body.weight(.medium))
                     if profile.isDefault {
                         Text("default")
                             .font(.caption2)
@@ -131,7 +131,7 @@ struct BrowseView: View {
                 }
             }
         }
-        .navigationTitle(model.selectedProfile ?? "Sessions")
+        .navigationTitle(model.profileDisplayName(model.selectedProfile) ?? "Sessions")
         .refreshable { await model.refreshProjects() }
     }
 

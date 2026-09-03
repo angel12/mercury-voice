@@ -4,6 +4,17 @@ A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com
 
 Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-25); a v5-or-older backend shows a "backend is older than the app was built for" notice.
 
+## Screenshots
+
+<p align="center">
+  <img src="pics/01-connect.png" alt="Connect screen: enter a server address" width="200">
+  <img src="pics/02-workspaces.png" alt="Workspaces listed from the connected server" width="200">
+  <img src="pics/03-listening.png" alt="Voice conversation, listening for speech" width="200">
+  <img src="pics/04-conversation.png" alt="Voice conversation showing the agent's spoken reply as a caption" width="200">
+</p>
+
+Left to right: enter a server address (a password form appears if the server is gated), pick a workspace, talk, and read along with the spoken reply.
+
 ## Building
 
 Open `MercuryVoice.xcodeproj` in Xcode 16+ and run the `MercuryVoice` scheme, or:

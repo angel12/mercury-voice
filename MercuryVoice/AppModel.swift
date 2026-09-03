@@ -41,6 +41,12 @@ final class AppModel {
     // MARK: Browse data
 
     private(set) var profiles: [ProfileInfo] = []
+
+    /// Display name for a profile id, or the id itself when unknown.
+    func profileDisplayName(_ name: String?) -> String? {
+        guard let name else { return nil }
+        return profiles.first { $0.name == name }?.displayName ?? name
+    }
     private(set) var profilesLoading = false
     var selectedProfile: String?
     private(set) var projectTree: ProjectTree?

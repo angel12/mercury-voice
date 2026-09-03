@@ -131,7 +131,7 @@ struct ConversationView: View {
                     .font(.headline)
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    if let profile = controller.profileName {
+                    if let profile = model.profileDisplayName(controller.profileName) {
                         Label(profile, systemImage: "person.crop.circle")
                     }
                     if let project = controller.projectName {
