@@ -25,6 +25,8 @@ public struct ServerStatus: Sendable, Equatable {
 
 public struct ProfileInfo: Sendable, Equatable, Identifiable {
     public var name: String
+    /// Human-facing name from `hermes profile rename`; falls back to `name`.
+    public var displayName: String
     public var path: String?
     public var isDefault: Bool
     public var model: String?
@@ -37,6 +39,8 @@ public struct ProfileInfo: Sendable, Equatable, Identifiable {
     public init?(json: JSONValue) {
         guard let name = json["name"]?.stringValue, !name.isEmpty else { return nil }
         self.name = name
+        let display = json["display_name"]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
+        self.displayName = display.isEmpty ? name : display
         self.path = json["path"]?.stringValue
         self.isDefault = json["is_default"]?.truthy ?? false
         self.model = json["model"]?.stringValue
