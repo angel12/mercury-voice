@@ -165,6 +165,11 @@ public struct ConversationCallbacks: Sendable {
     /// Fired when a mic-start failure parked the engine instead of ending
     /// the conversation; the owner resumes with `setPaused(false)`.
     public var onMicParked: @Sendable () -> Void
+    /// Fired when the system microphone permission is denied at arm time.
+    /// The engine has already disabled itself and set
+    /// `ConversationUIState.microphoneDenied`; the owner shows the way to
+    /// the privacy settings and restarts with `start()` once fixed.
+    public var onMicrophoneDenied: @Sendable () -> Void
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
@@ -173,7 +178,8 @@ public struct ConversationCallbacks: Sendable {
         onTurnCaptured: @escaping @Sendable () -> Void = {},
         onThinkingTick: @escaping @Sendable () -> Void = {},
         micFailureIsFatal: @escaping @Sendable () async -> Bool = { true },
-        onMicParked: @escaping @Sendable () -> Void = {}
+        onMicParked: @escaping @Sendable () -> Void = {},
+        onMicrophoneDenied: @escaping @Sendable () -> Void = {}
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
@@ -182,6 +188,7 @@ public struct ConversationCallbacks: Sendable {
         self.onThinkingTick = onThinkingTick
         self.micFailureIsFatal = micFailureIsFatal
         self.onMicParked = onMicParked
+        self.onMicrophoneDenied = onMicrophoneDenied
     }
 }
 
@@ -191,18 +198,23 @@ public struct ConversationUIState: Sendable, Equatable {
     public var muted: Bool
     public var paused: Bool
     public var lastTranscript: String?
+    /// The microphone permission was refused when the mic tried to arm. The
+    /// loop is disabled until `start()` succeeds again.
+    public var microphoneDenied: Bool
 
     public init(
         status: ConversationStatus = .idle,
         enabled: Bool = false,
         muted: Bool = false,
         paused: Bool = false,
-        lastTranscript: String? = nil
+        lastTranscript: String? = nil,
+        microphoneDenied: Bool = false
     ) {
         self.status = status
         self.enabled = enabled
         self.muted = muted
         self.paused = paused
         self.lastTranscript = lastTranscript
+        self.microphoneDenied = microphoneDenied
     }
 }

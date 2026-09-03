@@ -37,7 +37,7 @@ struct DevChatView: View {
 
                 Divider()
                 HStack {
-                    TextField("Type a prompt (dev text path)", text: $draft)
+                    TextField("Type a message", text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(send)
                     Button("Send", action: send)
@@ -46,7 +46,7 @@ struct DevChatView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Text view (dev)")
+            .navigationTitle("Text")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }

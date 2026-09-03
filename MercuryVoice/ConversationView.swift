@@ -69,23 +69,29 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             header
             Spacer()
-            StatusOrb(
-                status: controller.voiceState.status,
-                muted: controller.voiceState.muted,
-                micLevel: controller.micLevel)
-            Text(statusLabel)
-                .font(.title3.weight(.medium))
-                .padding(.top, 12)
-                .contentTransition(.opacity)
-            if let ticker = controller.toolTicker {
-                Label(ticker, systemImage: "gearshape.2")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 4)
+            if controller.voiceState.microphoneDenied {
+                microphoneDeniedPanel
+            } else {
+                StatusOrb(
+                    status: controller.voiceState.status,
+                    muted: controller.voiceState.muted,
+                    micLevel: controller.micLevel)
+                Text(statusLabel)
+                    .font(.title3.weight(.medium))
+                    .padding(.top, 12)
+                    .contentTransition(.opacity)
+                if let ticker = controller.toolTicker {
+                    Label(ticker, systemImage: "gearshape.2")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
             }
             Spacer()
             captions
-            controls
+            if !controller.voiceState.microphoneDenied {
+                controls
+            }
         }
         .padding()
         .background(backgroundGradient.ignoresSafeArea())
@@ -171,7 +177,7 @@ struct ConversationView: View {
                 Image(systemName: "keyboard")
             }
             .buttonStyle(.borderless)
-            .help("Text view (dev)")
+            .help("Text")
             Button(role: .destructive) {
                 model.endConversation()
             } label: {
@@ -179,6 +185,40 @@ struct ConversationView: View {
             }
             .buttonStyle(.bordered)
         }
+    }
+
+    // MARK: Microphone permission
+
+    /// The recoverable denial state (issue #23 §1.4): the system refused
+    /// microphone access, so instead of the orb we show the way to the
+    /// privacy setting and a retry. The text path (keyboard button in the
+    /// header) keeps working meanwhile.
+    private var microphoneDeniedPanel: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "mic.slash.circle")
+                .font(.system(size: 56))
+                .foregroundStyle(.red)
+            Text("Microphone access is off")
+                .font(.title3.weight(.medium))
+            Text(
+                "Mercury Voice needs the microphone to hear you. Allow it in your device's privacy settings, then try again. You can still type with the keyboard button above."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 360)
+            HStack(spacing: 12) {
+                Button("Open Settings") {
+                    SystemLinks.openMicrophonePrivacySettings()
+                }
+                .buttonStyle(.borderedProminent)
+                Button("Try Again") {
+                    controller.retryMicrophone()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.horizontal)
     }
 
     // MARK: Captions
