@@ -36,8 +36,16 @@ final class NativeOAuthSignIn: NSObject, ASWebAuthenticationPresentationContextP
         // not back through the browser API. The completion handler fires
         // only when the user dismisses the sheet — unblock the listener so
         // the await below throws .cancelled.
+        //
+        // Explicitly `@Sendable`: written inside a @MainActor method the
+        // closure would inherit main-actor isolation, and on macOS
+        // AuthenticationServices invokes it from its XPC reply queue — the
+        // runtime isolation check then traps (SIGTRAP in
+        // dispatch_assert_queue). iOS happens to call back on main, which
+        // is why only the Mac crashed. The listener is an actor, so the
+        // hop inside is safe from any thread.
         let web = ASWebAuthenticationSession(url: authorizeURL, callbackURLScheme: nil) {
-            _, error in
+            @Sendable _, error in
             if error != nil {
                 Task { await listener.cancel() }
             }
