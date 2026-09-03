@@ -437,3 +437,34 @@ func makeUtterance(heardSpeech: Bool = true) -> RecordedUtterance {
         audio: Data([1, 2, 3]), mimeType: "audio/wav", duration: .seconds(1),
         heardSpeech: heardSpeech)
 }
+
+final class FakeMicrophoneAuthorizer: MicrophoneAuthorizing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _authorization: MicrophoneAuthorization
+    private var _requestCount = 0
+
+    init(_ authorization: MicrophoneAuthorization = .granted) {
+        _authorization = authorization
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    /// What the next `request()` resolves to (the "user answered the
+    /// system prompt" outcome, or the already-decided state).
+    var authorization: MicrophoneAuthorization {
+        get { locked { _authorization } }
+        set { locked { _authorization = newValue } }
+    }
+    var requestCount: Int { locked { _requestCount } }
+
+    func request() async -> MicrophoneAuthorization {
+        locked {
+            _requestCount += 1
+            return _authorization
+        }
+    }
+}

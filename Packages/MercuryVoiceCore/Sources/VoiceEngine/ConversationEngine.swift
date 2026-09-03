@@ -12,6 +12,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private let transcriber: any Transcribing
     private let speech: any SpeechPlaying
     private let agent: any AgentInterfacing
+    private let microphone: any MicrophoneAuthorizing
     private let callbacks: ConversationCallbacks
     private let clock: C
 
@@ -22,6 +23,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private var muted = false
     private var paused = false
     private var lastTranscript: String?
+    private var microphoneDenied = false
 
     private var pendingStart = false
     private var turnClosing = false
@@ -60,6 +62,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         transcriber: any Transcribing,
         speech: any SpeechPlaying,
         agent: any AgentInterfacing,
+        microphone: any MicrophoneAuthorizing = AlwaysGrantedMicrophone(),
         callbacks: ConversationCallbacks = ConversationCallbacks(),
         clock: C
     ) {
@@ -68,6 +71,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         self.transcriber = transcriber
         self.speech = speech
         self.agent = agent
+        self.microphone = microphone
         self.callbacks = callbacks
         self.clock = clock
     }
@@ -77,7 +81,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public var uiState: ConversationUIState {
         ConversationUIState(
             status: status, enabled: enabled, muted: muted, paused: paused,
-            lastTranscript: lastTranscript)
+            lastTranscript: lastTranscript, microphoneDenied: microphoneDenied)
     }
 
     public func uiStates() -> AsyncStream<ConversationUIState> {
@@ -116,6 +120,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public func start() async {
         enabled = true
         muted = false
+        microphoneDenied = false
         stopRequested = false
         awaitingSpokenResponse = false
         await dropSpeechSession()
@@ -238,6 +243,19 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         // invalidates any stale stop request — it only ever applies to the
         // turn it interrupted.
         stopRequested = false
+
+        // Ask for the permission ourselves (issue #23 §1.4). Letting the
+        // audio engine trip the prompt hides a denial behind an OSStatus.
+        // Re-checked on every arm: macOS lets the user revoke it any time.
+        let authorization = await microphone.request()
+        guard enabled, !micBlocked, status == .idle else { return }
+        guard authorization == .granted else {
+            microphoneDenied = true
+            enabled = false
+            setStatus(.idle)
+            callbacks.onMicrophoneDenied()
+            return
+        }
 
         do {
             try await recorder.start(

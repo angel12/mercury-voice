@@ -240,6 +240,7 @@ final class ConversationController {
                 rest: connection.rest, profile: profile, voiceConfig: voiceStore),
             speech: speech,
             agent: tracker,
+            microphone: SystemMicrophoneAuthorization(),
             callbacks: ConversationCallbacks(
                 onStopWord: { [weak self] in
                     Task { @MainActor in self?.didEndByStopWord = true }
@@ -807,6 +808,19 @@ final class ConversationController {
 
     func clearNotice() {
         notice = nil
+    }
+
+    /// Show an out-of-band notice from outside the engine (the Live
+    /// Activity controller reports a failed request this way).
+    func showNotice(_ message: String) {
+        notice = message
+    }
+
+    /// Try the microphone again after a permission denial (the user may
+    /// have flipped the switch in system settings). `start()` clears the
+    /// denied state and re-runs the permission check before arming.
+    func retryMicrophone() {
+        Task { await engine?.start() }
     }
 
     func clearSetupError() {

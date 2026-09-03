@@ -128,6 +128,7 @@ struct TurnSilenceSlider: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     }
+                    AboutLinksSection()
                 }
                 .navigationTitle("Settings")
                 .navigationBarTitleDisplayMode(.inline)

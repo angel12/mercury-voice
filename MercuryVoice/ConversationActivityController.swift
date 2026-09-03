@@ -13,6 +13,9 @@
     final class ConversationActivityController {
         private var activity: Activity<ConversationActivityAttributes>?
         private var pump: Task<Void, Never> = Task {}
+        /// Surfaces a failed `Activity.request` to the owner (shown as a
+        /// conversation notice) instead of swallowing it.
+        var onNotice: ((String) -> Void)?
 
         struct Snapshot: Equatable {
             var state: ConversationUIState
@@ -36,9 +39,15 @@
                 for orphan in Activity<ConversationActivityAttributes>.activities {
                     chain { await orphan.end(nil, dismissalPolicy: .immediate) }
                 }
-                activity = try? Activity.request(
-                    attributes: ConversationActivityAttributes(),
-                    content: ActivityContent(state: content, staleDate: nil))
+                do {
+                    activity = try Activity.request(
+                        attributes: ConversationActivityAttributes(),
+                        content: ActivityContent(state: content, staleDate: nil))
+                } catch {
+                    // Loud on purpose: a silent `try?` hid the missing
+                    // NSSupportsLiveActivities key for weeks (issue #23).
+                    onNotice?("Lock screen controls unavailable: \(error.localizedDescription)")
+                }
             }
         }
 
@@ -71,6 +80,9 @@
 
         func body(content: Content) -> some View {
             content.onChange(of: snapshot, initial: true) { _, new in
+                controller.onNotice = { [weak model] message in
+                    model?.conversation?.showNotice(message)
+                }
                 controller.apply(new)
             }
         }

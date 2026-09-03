@@ -56,6 +56,7 @@
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
+                AboutLinksSection()
             }
             .formStyle(.grouped)
             .frame(width: 420)
