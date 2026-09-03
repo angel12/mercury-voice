@@ -11,9 +11,10 @@ Built and verified against desktop contract **v6** (hermes-agent `main` as of 20
   <img src="pics/02-workspaces.png" alt="Workspaces listed from the connected server" width="200">
   <img src="pics/03-listening.png" alt="Voice conversation, listening for speech" width="200">
   <img src="pics/04-conversation.png" alt="Voice conversation showing the agent's spoken reply as a caption" width="200">
+  <img src="pics/05-lock-screen.png" alt="iPhone lock screen with the Mercury Voice Live Activity: session title, Listening status, and mute, stop, and end buttons" width="200">
 </p>
 
-Left to right: enter a server address (a password form appears if the server is gated), pick a workspace, talk, and read along with the spoken reply.
+Left to right: enter a server address (a password form appears if the server is gated), pick a workspace, talk, read along with the spoken reply, and keep talking from the lock screen — the Live Activity shows the session state with mute, stop, and end controls.
 
 ## Building
 
