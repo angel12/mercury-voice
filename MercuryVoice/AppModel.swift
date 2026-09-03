@@ -258,7 +258,13 @@ final class AppModel {
         guard let pending = pendingLogin else { return }
         connectError = nil
         do {
-            let session = try await NativeOAuthSignIn().signIn(
+            // Named binding, not an inline temporary: NativeOAuthSignIn hands
+            // itself to ASWebAuthenticationSession as a *weak* presentation
+            // context provider, and newer compilers warn that an inline
+            // `NativeOAuthSignIn().signIn(...)` receiver is released before
+            // the weak slot is ever read.
+            let oauth = NativeOAuthSignIn()
+            let session = try await oauth.signIn(
                 endpoint: pending.endpoint, provider: provider)
             await connect(endpoint: pending.endpoint, credentials: .password(session))
         } catch LoopbackRedirectListener.RedirectError.cancelled {
