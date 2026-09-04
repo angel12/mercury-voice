@@ -26,11 +26,18 @@ public enum AudioLevel {
     }
 }
 
+/// Capture consumer API used by the recorder and barge monitor. Extracted so
+/// tests can inject a fake without starting `AVAudioEngine`.
+protocol AudioCaptureStreaming: Sendable {
+    func openStream() throws -> (id: UUID, stream: AsyncStream<AudioChunk>)
+    func closeStream(_ id: UUID)
+}
+
 /// One shared microphone: an AVAudioEngine input tap broadcasting mono float
 /// chunks to any number of consumers (the recorder while listening, the barge
 /// monitor while thinking/speaking — never both at once, but the service
 /// doesn't care). The engine runs only while consumers exist.
-public final class AudioCaptureService: @unchecked Sendable {
+public final class AudioCaptureService: AudioCaptureStreaming, @unchecked Sendable {
     public static let shared = AudioCaptureService()
 
     private let lock = NSLock()

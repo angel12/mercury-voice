@@ -41,6 +41,10 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     /// barge captures (issue #12).
     private var spokenReplyText: String?
     private var bargeMonitorActive = false
+    /// iOS mute must stop the barge monitor (and clear this flag) so unmute
+    /// can restart capture; macOS only suspends so the voice-processing
+    /// input stays attached during playback (issue #40).
+    private let detachBargeCaptureWhileMuted: Bool
     private var bargeCapturePending = false
     private var barged = false
     private var speechStartSequence = 0
@@ -64,7 +68,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         agent: any AgentInterfacing,
         microphone: any MicrophoneAuthorizing = AlwaysGrantedMicrophone(),
         callbacks: ConversationCallbacks = ConversationCallbacks(),
-        clock: C
+        clock: C,
+        detachBargeCaptureWhileMuted: Bool? = nil
     ) {
         self.recorder = recorder
         self.barge = bargeMonitor
@@ -74,6 +79,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         self.microphone = microphone
         self.callbacks = callbacks
         self.clock = clock
+        self.detachBargeCaptureWhileMuted =
+            detachBargeCaptureWhileMuted
+            ?? shouldDetachBargeCaptureWhileMuted(isIOS: bargeMuteRunsOnIOS)
     }
 
     // MARK: Observation
@@ -707,21 +715,28 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
     }
 
-    /// Mute/pause: make barge-in deaf without disturbing the speech session
-    /// OR the capture engine — stopping the voice-processing mic unit
-    /// mid-playback kills TTS output on macOS, so the monitor stays attached
-    /// and just discards audio. Any in-flight capture is cancelled.
+    /// Mute/pause: make barge-in deaf. macOS keeps the monitor attached —
+    /// stopping the voice-processing mic unit mid-playback kills TTS.
+    /// iOS releases the capture consumer so the hardware mic / privacy
+    /// indicator can go off; unmute re-arms via `ensureBargeMonitor`, which
+    /// already swallows a refused background mic start. Any in-flight
+    /// capture is cancelled.
     private func suspendBargeMonitor() async {
         if bargeMonitorActive {
-            await barge.setSuspended(true)
+            if detachBargeCaptureWhileMuted {
+                bargeMonitorActive = false
+                await barge.stop()
+            } else {
+                await barge.setSuspended(true)
+            }
         }
         bargeCapturePending = false
         barged = false
     }
 
-    /// Unblock: bring barge-in back. The still-attached monitor just starts
-    /// hearing again (no engine restart); if it was never armed because the
-    /// block predated playback, arm it now. drive() covers the thinking case.
+    /// Unblock: bring barge-in back. A still-attached monitor (macOS) just
+    /// starts hearing again; a detached one (iOS) is restarted. drive()
+    /// covers the thinking case if we aren't speaking.
     private func resumeBargeMonitor() async {
         guard !micBlocked else { return }
         if bargeMonitorActive {

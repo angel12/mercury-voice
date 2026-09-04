@@ -133,9 +133,52 @@ final class FakeRecorder: VoiceRecording, @unchecked Sendable {
     }
 }
 
+/// In-memory capture used with the real `BargeInMonitor` so tests can assert
+/// consumer lifetime without starting `AVAudioEngine`.
+final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
+    private let lock = NSLock()
+    private var streams: [UUID: AsyncStream<AudioChunk>.Continuation] = [:]
+    private var _openCount = 0
+    private var _closeCount = 0
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    var openCount: Int { locked { _openCount } }
+    var closeCount: Int { locked { _closeCount } }
+    var activeCount: Int { locked { streams.count } }
+    /// True once a started stream has been closed (the hardware-mic analogue).
+    var streamClosed: Bool { locked { _openCount > 0 && streams.isEmpty } }
+
+    func openStream() throws -> (id: UUID, stream: AsyncStream<AudioChunk>) {
+        let id = UUID()
+        var continuation: AsyncStream<AudioChunk>.Continuation!
+        let stream = AsyncStream<AudioChunk>(bufferingPolicy: .bufferingNewest(64)) {
+            continuation = $0
+        }
+        locked {
+            streams[id] = continuation
+            _openCount += 1
+        }
+        return (id, stream)
+    }
+
+    func closeStream(_ id: UUID) {
+        let continuation: AsyncStream<AudioChunk>.Continuation? = locked {
+            _closeCount += 1
+            return streams.removeValue(forKey: id)
+        }
+        continuation?.finish()
+    }
+}
+
 final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     private let lock = NSLock()
     private var _startCount = 0
+    private var _stopCount = 0
     private var _suspended = false
     private var _onSpeech: (@Sendable () -> Void)?
     private var _onUtterance: (@Sendable (RecordedUtterance?) -> Void)?
@@ -147,8 +190,11 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     }
 
     var startCount: Int { locked { _startCount } }
+    var stopCount: Int { locked { _stopCount } }
     var isActive: Bool { locked { _onSpeech != nil } }
     var isSuspended: Bool { locked { _suspended } }
+    /// True after `stop()` — analogue of the capture consumer being closed.
+    var streamClosed: Bool { locked { _stopCount > 0 && _onSpeech == nil } }
 
     func start(
         isPlaying: @escaping @Sendable () async -> Bool,
@@ -165,6 +211,7 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
 
     func stop() async {
         locked {
+            _stopCount += 1
             _suspended = false
             _onSpeech = nil
             _onUtterance = nil

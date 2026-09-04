@@ -1,10 +1,27 @@
 import Foundation
 
+/// iOS hardware-mute must release the barge monitor's capture consumer so
+/// `AudioCaptureService` can stop the engine (and the privacy indicator).
+/// macOS keeps the voice-processing input attached during playback — stopping
+/// it mid-TTS kills output.
+func shouldDetachBargeCaptureWhileMuted(isIOS: Bool) -> Bool {
+    isIOS
+}
+
+#if os(iOS)
+    let bargeMuteRunsOnIOS = true
+#else
+    let bargeMuteRunsOnIOS = false
+#endif
+
 /// Full-duplex interrupt monitor: watches the mic during thinking/speaking,
 /// trips on sustained speech, and captures the interrupting utterance with
 /// pre-roll so the first syllable survives.
 public actor BargeInMonitor: BargeMonitoring {
-    private let capture: AudioCaptureService
+    private let capture: any AudioCaptureStreaming
+    /// Testable hook: when true, `setSuspended(true)` closes the capture
+    /// stream instead of only discarding samples (issue #40).
+    let detachCaptureOnSuspend: Bool
 
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
@@ -12,6 +29,13 @@ public actor BargeInMonitor: BargeMonitoring {
 
     public init(capture: AudioCaptureService = .shared) {
         self.capture = capture
+        self.detachCaptureOnSuspend = shouldDetachBargeCaptureWhileMuted(
+            isIOS: bargeMuteRunsOnIOS)
+    }
+
+    init(capture: any AudioCaptureStreaming, detachCaptureOnSuspend: Bool) {
+        self.capture = capture
+        self.detachCaptureOnSuspend = detachCaptureOnSuspend
     }
 
     public func start(
@@ -37,6 +61,11 @@ public actor BargeInMonitor: BargeMonitoring {
 
     public func setSuspended(_ newValue: Bool) {
         suspended = newValue
+        if newValue, detachCaptureOnSuspend {
+            // iOS: release the consumer so the capture engine can stop.
+            // macOS keeps the stream and only discards samples below.
+            detach()
+        }
     }
 
     private func detach() {
