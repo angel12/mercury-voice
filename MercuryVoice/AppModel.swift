@@ -432,9 +432,14 @@ final class AppModel {
         guard connection != nil else { return }
         browseError = nil
 
-        // Keep the initial slow profiles fetch independent of browse loading.
+        // Wait for the first profiles list so the default selection exists
+        // before the unscoped (profile: nil / "all") browse load (issue #37).
         if profiles.isEmpty {
-            startProfilesLoad()
+            if let task = startProfilesLoad() {
+                let generation = connectGeneration
+                await task.value
+                guard generation == connectGeneration else { return }
+            }
         }
         await refreshProjects()
     }
