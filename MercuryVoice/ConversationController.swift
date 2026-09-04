@@ -642,7 +642,10 @@ final class ConversationController {
         {
             present(approval: request)
         } else if clearStale, approval != nil {
+            // Invalidate error ownership too: a late failure for A must not
+            // write into the next sheet (clarify B) via the shared footer.
             approval = nil
+            approvalEpoch += 1
         }
 
         if let payload = handle.raw["pending_clarify"],
@@ -809,7 +812,8 @@ final class ConversationController {
             guard let self, self.approvalEpoch == epoch else { return }
             self.approval = nil
         } applyError: { [weak self] in
-            self?.approvalEpoch == epoch
+            guard let self else { return false }
+            return self.approval != nil && self.approvalEpoch == epoch
         }
     }
 
