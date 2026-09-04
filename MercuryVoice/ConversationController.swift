@@ -604,7 +604,13 @@ final class ConversationController {
         }
     }
 
+    /// Bumped each time an approval sheet is presented. Approvals are
+    /// session-keyed (no request_id), so a late confirmation for A must not
+    /// dismiss B (issue #39).
+    private var approvalEpoch = 0
+
     private func present(approval request: ApprovalRequest) {
+        approvalEpoch += 1
         approval = request
         promptSendError = nil
         Task {
@@ -636,7 +642,10 @@ final class ConversationController {
         {
             present(approval: request)
         } else if clearStale, approval != nil {
+            // Invalidate error ownership too: a late failure for A must not
+            // write into the next sheet (clarify B) via the shared footer.
             approval = nil
+            approvalEpoch += 1
         }
 
         if let payload = handle.raw["pending_clarify"],
@@ -657,6 +666,7 @@ final class ConversationController {
     /// else (cold resume, backend restart, replay ring overrun, old backend)
     /// falls back to the tracker reset.
     func connectionBecameReady(isReconnect: Bool) async {
+        guard !isTornDown else { return }
         connectionHealthy = true
         guard isReconnect else { return }
         guard let storedID = sessionBox.storedID else { return }
@@ -664,28 +674,60 @@ final class ConversationController {
         let previousEpoch = replayEpoch
         let watermark = lastSeenSeq
         holdingEvents = true
-        defer { drainHeldEvents() }
+        defer {
+            if isTornDown {
+                holdingEvents = false
+                heldEvents.removeAll()
+            } else {
+                drainHeldEvents()
+            }
+        }
         do {
             let handle = try await connection.resumeSession(
                 storedID: storedID, profile: profile)
+            guard !isTornDown else {
+                // Teardown owns the old runtime; consume it only if it has
+                // not already been closed. A cold resume returned a new
+                // runtime that teardown never saw, so close it directly.
+                if handle.runtimeID == previousRuntimeID {
+                    await closeSessionIfOpen()
+                } else {
+                    await connection.closeSession(sessionID: handle.runtimeID)
+                }
+                return
+            }
             self.handle = handle
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
-            replayEpoch = await connection.replayEpoch
+            let currentEpoch = await connection.replayEpoch
+            guard !isTornDown else {
+                await closeSessionIfOpen()
+                return
+            }
+            replayEpoch = currentEpoch
             let replayed = await replayMissedEvents(
                 handle: handle,
                 previousRuntimeID: previousRuntimeID,
                 previousEpoch: previousEpoch,
                 watermark: watermark)
+            guard !isTornDown else {
+                await closeSessionIfOpen()
+                return
+            }
             if !replayed {
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
                 await tracker.reset(busy: running)
+                guard !isTornDown else {
+                    await closeSessionIfOpen()
+                    return
+                }
             }
             adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
             noteHydration(from: handle)
         } catch {
+            guard !isTornDown else { return }
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
         }
     }
@@ -701,11 +743,13 @@ final class ConversationController {
     ) async -> Bool {
         guard let watermark, let previousEpoch,
             handle.runtimeID == previousRuntimeID,
-            await connection.replayEpoch == previousEpoch
+            await connection.replayEpoch == previousEpoch,
+            !isTornDown
         else { return false }
         guard
             let batch = try? await connection.eventsSince(
                 sessionID: handle.runtimeID, lastSeen: watermark),
+            !isTornDown,
             !batch.truncated,
             batch.epoch == nil || batch.epoch == previousEpoch
         else { return false }
@@ -761,25 +805,35 @@ final class ConversationController {
 
     func respondApproval(choice: String) {
         guard let request = approval, !promptResponseInFlight else { return }
+        let epoch = approvalEpoch
         sendPromptResponse {
             try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
         } onConfirmed: { [weak self] in
-            self?.approval = nil
+            guard let self, self.approvalEpoch == epoch else { return }
+            self.approval = nil
+        } applyError: { [weak self] in
+            guard let self else { return false }
+            return self.approval != nil && self.approvalEpoch == epoch
         }
     }
 
     func respondClarify(answer: String) {
         guard let request = clarify, !promptResponseInFlight else { return }
+        let requestID = request.requestID
         sendPromptResponse {
-            try await $0.respondClarify(requestID: request.requestID, answer: answer)
+            try await $0.respondClarify(requestID: requestID, answer: answer)
         } onConfirmed: { [weak self] in
-            self?.clarify = nil
+            guard let self, self.clarify?.requestID == requestID else { return }
+            self.clarify = nil
+        } applyError: { [weak self] in
+            self?.clarify?.requestID == requestID
         }
     }
 
     private func sendPromptResponse(
         _ send: @escaping (HermesConnection) async throws -> Void,
-        onConfirmed: @escaping @MainActor () -> Void
+        onConfirmed: @escaping @MainActor () -> Void,
+        applyError: @escaping @MainActor () -> Bool
     ) {
         promptResponseInFlight = true
         promptSendError = nil
@@ -788,9 +842,10 @@ final class ConversationController {
             do {
                 try await send(connection)
                 onConfirmed()
-                promptSendError = nil
+                if applyError() { promptSendError = nil }
                 resumeIfUnprompted()
             } catch {
+                guard applyError() else { return }
                 promptSendError =
                     (error as? HermesError)?.errorDescription ?? error.localizedDescription
             }
