@@ -604,7 +604,13 @@ final class ConversationController {
         }
     }
 
+    /// Bumped each time an approval sheet is presented. Approvals are
+    /// session-keyed (no request_id), so a late confirmation for A must not
+    /// dismiss B (issue #39).
+    private var approvalEpoch = 0
+
     private func present(approval request: ApprovalRequest) {
+        approvalEpoch += 1
         approval = request
         promptSendError = nil
         Task {
@@ -796,25 +802,34 @@ final class ConversationController {
 
     func respondApproval(choice: String) {
         guard let request = approval, !promptResponseInFlight else { return }
+        let epoch = approvalEpoch
         sendPromptResponse {
             try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
         } onConfirmed: { [weak self] in
-            self?.approval = nil
+            guard let self, self.approvalEpoch == epoch else { return }
+            self.approval = nil
+        } applyError: { [weak self] in
+            self?.approvalEpoch == epoch
         }
     }
 
     func respondClarify(answer: String) {
         guard let request = clarify, !promptResponseInFlight else { return }
+        let requestID = request.requestID
         sendPromptResponse {
-            try await $0.respondClarify(requestID: request.requestID, answer: answer)
+            try await $0.respondClarify(requestID: requestID, answer: answer)
         } onConfirmed: { [weak self] in
-            self?.clarify = nil
+            guard let self, self.clarify?.requestID == requestID else { return }
+            self.clarify = nil
+        } applyError: { [weak self] in
+            self?.clarify?.requestID == requestID
         }
     }
 
     private func sendPromptResponse(
         _ send: @escaping (HermesConnection) async throws -> Void,
-        onConfirmed: @escaping @MainActor () -> Void
+        onConfirmed: @escaping @MainActor () -> Void,
+        applyError: @escaping @MainActor () -> Bool
     ) {
         promptResponseInFlight = true
         promptSendError = nil
@@ -823,9 +838,10 @@ final class ConversationController {
             do {
                 try await send(connection)
                 onConfirmed()
-                promptSendError = nil
+                if applyError() { promptSendError = nil }
                 resumeIfUnprompted()
             } catch {
+                guard applyError() else { return }
                 promptSendError =
                     (error as? HermesError)?.errorDescription ?? error.localizedDescription
             }
