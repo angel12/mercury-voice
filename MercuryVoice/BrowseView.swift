@@ -33,6 +33,14 @@ struct BrowseView: View {
         List {
             connectionSection
             Section("Profile") {
+                if let error = model.profilesError {
+                    Label("Could not load profiles: \(error)", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                    Button("Retry") {
+                        Task { await model.refreshBrowseData() }
+                    }
+                    .disabled(model.profilesLoading)
+                }
                 if model.profilesLoading && model.profiles.isEmpty {
                     HStack {
                         ProgressView()
@@ -57,7 +65,7 @@ struct BrowseView: View {
                 Button("Disconnect") { model.disconnect() }
             }
         }
-        .refreshable { await model.refreshProjects() }
+        .refreshable { await model.refreshBrowseData() }
     }
 
     private func profileRow(_ profile: ProfileInfo) -> some View {
