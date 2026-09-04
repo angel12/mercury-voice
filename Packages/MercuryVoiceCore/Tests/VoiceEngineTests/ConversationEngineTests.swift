@@ -35,7 +35,10 @@ struct ConversationEngineTests {
             }
         }
 
-        init(micFailureIsFatal: Bool = true) {
+        init(
+            micFailureIsFatal: Bool = true,
+            detachBargeCaptureWhileMuted: Bool = false
+        ) {
             let clock = TestClock()
             let recorder = FakeRecorder()
             let barge = FakeBargeMonitor()
@@ -68,7 +71,8 @@ struct ConversationEngineTests {
                     onThinkingTick: { thinkingTicks.bump() },
                     micFailureIsFatal: { micFailureIsFatal },
                     onMicParked: { micParks.bump() }),
-                clock: clock)
+                clock: clock,
+                detachBargeCaptureWhileMuted: detachBargeCaptureWhileMuted)
         }
 
         func status(is expected: ConversationStatus) async -> Bool {
@@ -539,6 +543,47 @@ struct ConversationEngineTests {
         await h.engine.toggleMute()
         #expect(await eventually { h.barge.isActive && !h.barge.isSuspended })
         #expect(h.barge.startCount == 2)
+    }
+
+    // MARK: Mute × barge-in on iOS (issue #40)
+
+    @Test func muteWhileThinkingClosesBargeCaptureWhenDetaching() async {
+        let h = Harness(detachBargeCaptureWhileMuted: true)
+        await h.enterThinking()
+        #expect(await eventually { h.barge.isActive })
+
+        await h.engine.toggleMute()
+        #expect(await eventually { !h.barge.isActive })
+        #expect(h.barge.streamClosed)
+        #expect(h.barge.stopCount >= 1)
+
+        // Unmute restarts the monitor (bookkeeping was cleared).
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isActive && !h.barge.isSuspended })
+        #expect(h.barge.startCount == 2)
+    }
+
+    @Test func muteWhileSpeakingClosesBargeCaptureAndUnmuteRestartsWhenDetaching() async {
+        let h = Harness(detachBargeCaptureWhileMuted: true)
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        #expect(await eventually { h.barge.isActive })
+
+        await h.engine.toggleMute()
+        #expect(await eventually { !h.barge.isActive })
+        #expect(h.barge.streamClosed)
+        #expect(await h.engine.status == .speaking)
+        #expect(await h.speech.isSpeaking)
+
+        await h.engine.toggleMute()
+        #expect(await eventually { h.barge.isActive && !h.barge.isSuspended })
+        #expect(h.barge.startCount == 2)
+        #expect(await h.engine.status == .speaking)
+
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
     }
 
     @Test func muteAfterBargeTripCancelsPendingCapture() async {
