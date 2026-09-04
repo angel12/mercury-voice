@@ -13,6 +13,14 @@ import Foundation
 public enum ServerCredentials: Sendable, Equatable, Codable {
     case sessionToken(String)
     case password(PasswordSession)
+
+    /// Prefer the live credentials, which may have rotated during validation.
+    public static func credentialsToPersist(
+        original: ServerCredentials?,
+        authenticatorCurrent: ServerCredentials?
+    ) -> ServerCredentials? {
+        authenticatorCurrent ?? original
+    }
 }
 
 /// Tokens minted by a password (basic-auth) login. The access token is
