@@ -67,19 +67,20 @@ public actor HermesSpeechOutput: SpeechPlaying {
         return session
     }
 
-    public func playFallback(text: String) async -> Bool {
+    public func playFallback(text: String, expectedSequence: Int) async -> Bool {
         // Client-side sanitization mirrors the desktop's playSpeechText; the
         // streaming path sends raw deltas because the server strips markdown
         // per sentence itself.
         let sanitized = SpeechText.sanitizeForSpeech(text)
         guard !sanitized.isEmpty else { return false }
-        // The synthesis request is a suspension point the user can Stop
-        // inside, and there is no player for stopPlayback to reach yet: carry
-        // the sequence across the request and drop a clip that arrives after
-        // a Stop rather than starting playback the user cancelled (#34).
-        let generation = sequence
+        // Caller-supplied generation, not a fresh read: a Stop can land
+        // after the engine snapshots the sequence and before we enter, and
+        // adopting the newer value would play a clip the user cancelled.
+        // Synthesis is also a suspension with no player yet, so the same
+        // value is checked again when the clip arrives (#34).
+        guard sequence == expectedSequence else { return false }
         guard let data = await synthesizeClip(sanitized) else { return false }
-        guard sequence == generation else { return false }
+        guard sequence == expectedSequence else { return false }
 
         let player = makeFallbackPlayer()
         fallback = player

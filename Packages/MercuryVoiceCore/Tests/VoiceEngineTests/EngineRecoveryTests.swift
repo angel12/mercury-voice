@@ -470,3 +470,138 @@ struct FallbackStopTests {
         #expect(gate.requested == ["A reply completed"])
     }
 }
+
+// MARK: - Stop between sequence snapshot and playFallback (issue #34 review)
+
+/// Forwards to a real `HermesSpeechOutput` but parks the sequence read that
+/// immediately follows the engine's pre-clip `stopPlayback` (the second stop
+/// of the turn: startStream's contract bump is the first). That is the
+/// handoff window Astra reproduced: Stop can complete after the engine has
+/// already read its final snapshot but before `playFallback` begins.
+final class SequenceSnapshotGate: SpeechPlaying, @unchecked Sendable {
+    private let inner: HermesSpeechOutput
+    private let lock = NSLock()
+    private var stopCount = 0
+    private var delayArmed = false
+    private var waiting = false
+    private var released = false
+    private var parkedValue: Int?
+    private var waiter: CheckedContinuation<Int, Never>?
+
+    init(_ inner: HermesSpeechOutput) {
+        self.inner = inner
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    var isWaiting: Bool { locked { waiting } }
+
+    func release() {
+        let parked: (CheckedContinuation<Int, Never>, Int)? = locked {
+            released = true
+            waiting = false
+            guard let waiter, let parkedValue else { return nil }
+            self.waiter = nil
+            self.parkedValue = nil
+            return (waiter, parkedValue)
+        }
+        if let parked { parked.0.resume(returning: parked.1) }
+    }
+
+    func startStream() async -> (any SpeechStreaming)? {
+        // Avoid a real speak-stream dial; keep the +1 contract via stopPlayback.
+        await stopPlayback()
+        return nil
+    }
+
+    func playFallback(text: String, expectedSequence: Int) async -> Bool {
+        await inner.playFallback(text: text, expectedSequence: expectedSequence)
+    }
+
+    func stopPlayback() async {
+        await inner.stopPlayback()
+        locked {
+            stopCount += 1
+            if stopCount == 2 { delayArmed = true }
+        }
+    }
+
+    var sequence: Int {
+        get async {
+            let value = await inner.sequence
+            let shouldDelay: Bool = locked {
+                guard delayArmed else { return false }
+                delayArmed = false
+                return true
+            }
+            guard shouldDelay else { return value }
+            return await withCheckedContinuation {
+                (continuation: CheckedContinuation<Int, Never>) in
+                let immediate: Int? = locked {
+                    if released { return parkedValue ?? value }
+                    waiting = true
+                    parkedValue = value
+                    waiter = continuation
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        }
+    }
+
+    var isSpeaking: Bool {
+        get async { await inner.isSpeaking }
+    }
+}
+
+@Suite("Stop between fallback sequence snapshot and playFallback")
+struct FallbackSequenceHandoffTests {
+    @Test func stopAfterFinalSequenceSnapshotMustNotPlay() async {
+        let player = RecordingClipPlayer()
+        let rest = HermesRESTClient(
+            endpoint: ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:1")!), token: nil)
+        let inner = HermesSpeechOutput(
+            rest: rest, profile: nil, voiceConfig: nil,
+            synthesize: { _ in Data([1, 2, 3]) },
+            makeFallbackPlayer: { player })
+        let speech = SequenceSnapshotGate(inner)
+
+        let clock = TestClock()
+        let recorder = FakeRecorder()
+        let barge = FakeBargeMonitor()
+        let transcriber = GatedTranscriber()
+        let agent = FakeAgent()
+        let engine = ConversationEngine(
+            recorder: recorder,
+            bargeMonitor: barge,
+            transcriber: transcriber,
+            speech: speech,
+            agent: agent,
+            clock: clock)
+
+        recorder.nextResult = makeUtterance()
+        transcriber.queue("hello there")
+        await engine.start()
+        #expect(await eventually { await engine.status == .listening })
+        recorder.fireAutoStop()
+        #expect(await eventually { await engine.status == .thinking })
+
+        agent.setPending(PendingSpeech(id: "0", text: "A reply completed", pending: false))
+        agent.setBusy(false)
+        await engine.agentStateChanged()
+        #expect(await eventually { await engine.status == .speaking })
+        #expect(await eventually { speech.isWaiting })
+
+        await engine.stopSpeech()
+        speech.release()
+
+        #expect(await eventually { await engine.status == .idle })
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(player.plays.isEmpty)
+        #expect(recorder.startCount == 1)
+    }
+}

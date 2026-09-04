@@ -628,7 +628,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                     return
                 }
                 speechStartSequence = sequence
-                _ = await speech.playFallback(text: response.text)
+                _ = await speech.playFallback(
+                    text: response.text, expectedSequence: sequence)
                 guard self.responseID == responseID else { return }
                 awaitingSpokenResponse = false
                 await settleAfterSpeech(barged: barged)
