@@ -48,6 +48,7 @@ final class AppModel {
         return profiles.first { $0.name == name }?.displayName ?? name
     }
     private(set) var profilesLoading = false
+    private(set) var profilesError: String?
     var selectedProfile: String?
     private(set) var projectTree: ProjectTree?
     private(set) var recentSessions: [SessionSummary] = []
@@ -347,6 +348,7 @@ final class AppModel {
         profilesTask?.cancel()
         profilesTask = nil
         profilesLoading = false
+        profilesError = nil
         browseLoading = false
         browseError = nil
         let connection = connection
@@ -427,34 +429,56 @@ final class AppModel {
     // MARK: Browse data
 
     func loadBrowseData() async {
-        guard let connection else { return }
+        guard connection != nil else { return }
         browseError = nil
 
-        // Profiles are slow (walks skill trees) — load independently. REST
-        // calls outlive connection.stop(), so a response from a previous
-        // server could land here mid-connect; the generation check drops it
-        // (it would otherwise satisfy the isEmpty gate above and block the
-        // new server's profiles for the whole session).
+        // Keep the initial slow profiles fetch independent of browse loading.
         if profiles.isEmpty {
-            profilesLoading = true
-            profilesTask?.cancel()
-            let generation = connectGeneration
-            profilesTask = Task {
-                defer {
-                    if generation == connectGeneration { profilesLoading = false }
+            startProfilesLoad()
+        }
+        await refreshProjects()
+    }
+
+    /// The profiles page retries the list even when cached rows exist, then
+    /// refreshes the dependent browse data using the resulting selection.
+    func refreshBrowseData() async {
+        guard let task = startProfilesLoad() else { return }
+        let generation = connectGeneration
+        await task.value
+        guard generation == connectGeneration, !task.isCancelled else { return }
+        await refreshProjects()
+    }
+
+    @discardableResult
+    private func startProfilesLoad() -> Task<Void, Never>? {
+        guard let connection else { return nil }
+        profilesTask?.cancel()
+        profilesLoading = true
+        profilesError = nil
+        let generation = connectGeneration
+        let task = Task {
+            defer {
+                if generation == connectGeneration, !Task.isCancelled {
+                    profilesLoading = false
                 }
-                guard let loaded = try? await connection.rest.profiles(),
-                    generation == connectGeneration
-                else { return }
+            }
+            do {
+                let loaded = try await connection.rest.profiles()
+                // REST responses can outlive disconnect or a newer retry.
+                guard generation == connectGeneration, !Task.isCancelled else { return }
                 profiles = loaded
                 if selectedProfile == nil {
                     selectedProfile =
                         loaded.first(where: \.isDefault)?.name ?? loaded.first?.name
                 }
                 Self.cacheProfileNames(loaded.map(\.name))
+            } catch {
+                guard generation == connectGeneration, !Task.isCancelled else { return }
+                profilesError = error.localizedDescription
             }
         }
-        await refreshProjects()
+        profilesTask = task
+        return task
     }
 
     func refreshProjects() async {
