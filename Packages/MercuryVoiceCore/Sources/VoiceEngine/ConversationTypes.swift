@@ -108,13 +108,27 @@ public protocol SpeechPlaying: Sendable {
     /// Whole-clip fallback. Does NOT stop current playback or bump
     /// `sequence` — the engine stops + captures the sequence first, so a
     /// user Stop during fallback playback is detectable.
-    func playFallback(text: String) async -> Bool
+    ///
+    /// `expectedSequence` is that captured generation. Check it at entry
+    /// *and* after synthesis: a Stop can land after the caller read the
+    /// snapshot but before this method begins, and capturing `sequence`
+    /// again here would adopt the Stop as this clip's generation.
+    func playFallback(text: String, expectedSequence: Int) async -> Bool
     /// Stop all playback immediately. Bumps `sequence`.
     func stopPlayback() async
     /// Monotonic count of stopPlayback calls — the stop-detection protocol.
     var sequence: Int { get async }
     /// True while audio is audibly playing (barge-in trigger clamp).
     var isSpeaking: Bool { get async }
+}
+
+extension SpeechPlaying {
+    /// Callers that have not already snapshot the generation (prompt-notice
+    /// speech) capture `sequence` at entry — the engine must pass its own
+    /// snapshot instead, or a Stop between the two hops is absorbed.
+    public func playFallback(text: String) async -> Bool {
+        await playFallback(text: text, expectedSequence: await sequence)
+    }
 }
 
 /// What the engine can say/see about the current spoken reply. Mirrors the

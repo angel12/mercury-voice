@@ -1,8 +1,20 @@
 import AVFoundation
 import Foundation
 
+/// The whole-clip fallback sink: a synthesized clip in, "did it finish" out.
+/// `FallbackClipPlayer` in production; tests substitute a fake so the
+/// fallback path can be driven without an audio device (issue #34).
+protocol FallbackClipPlaying: AnyObject, Sendable {
+    var isPlaying: Bool { get }
+    /// Resolves when playback finishes (true) or is stopped/fails (false).
+    func play(data: Data) async -> Bool
+    func stop()
+}
+
 /// Plays a whole TTS clip returned by `POST /api/audio/speak` as a data URL.
-final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, @unchecked Sendable {
+final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
+    @unchecked Sendable
+{
     private let lock = NSLock()
     private var player: AVAudioPlayer?
     private var finishContinuation: CheckedContinuation<Bool, Never>?

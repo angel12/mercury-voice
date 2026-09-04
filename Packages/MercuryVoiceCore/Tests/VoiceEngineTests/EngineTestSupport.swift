@@ -334,7 +334,7 @@ final class FakeSpeech: SpeechPlaying, @unchecked Sendable {
         return stream
     }
 
-    func playFallback(text: String) async -> Bool {
+    func playFallback(text: String, expectedSequence: Int) async -> Bool {
         locked {
             _fallbackTexts.append(text)
             return _fallbackResult

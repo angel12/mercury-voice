@@ -10,16 +10,41 @@ public actor HermesSpeechOutput: SpeechPlaying {
     private let rest: HermesRESTClient
     private let profile: String?
     private let voiceConfig: VoiceConfigStore?
+    private let synthesizeClip: @Sendable (String) async -> Data?
+    private let makeFallbackPlayer: @Sendable () -> any FallbackClipPlaying
 
     private var current: SpeakStreamSession?
     private var currentDirect: DirectSpeechSession?
-    private var fallback: FallbackClipPlayer?
+    private var fallback: (any FallbackClipPlaying)?
     public private(set) var sequence = 0
 
     public init(rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil) {
+        self.init(
+            rest: rest, profile: profile, voiceConfig: voiceConfig,
+            synthesize: { text in
+                guard let clip = try? await rest.speak(text: text, profile: profile) else {
+                    return nil
+                }
+                return FallbackClipPlayer.decodeDataURL(clip.dataURL)
+            },
+            makeFallbackPlayer: { FallbackClipPlayer() })
+    }
+
+    /// Seam init: the whole-clip synthesis request and the clip player are
+    /// injectable so the fallback path can be driven without a server or an
+    /// audio device (issue #34).
+    init(
+        rest: HermesRESTClient,
+        profile: String?,
+        voiceConfig: VoiceConfigStore?,
+        synthesize: @escaping @Sendable (String) async -> Data?,
+        makeFallbackPlayer: @escaping @Sendable () -> any FallbackClipPlaying
+    ) {
         self.rest = rest
         self.profile = profile
         self.voiceConfig = voiceConfig
+        self.synthesizeClip = synthesize
+        self.makeFallbackPlayer = makeFallbackPlayer
     }
 
     public func startStream() async -> (any SpeechStreaming)? {
@@ -42,17 +67,22 @@ public actor HermesSpeechOutput: SpeechPlaying {
         return session
     }
 
-    public func playFallback(text: String) async -> Bool {
+    public func playFallback(text: String, expectedSequence: Int) async -> Bool {
         // Client-side sanitization mirrors the desktop's playSpeechText; the
         // streaming path sends raw deltas because the server strips markdown
         // per sentence itself.
         let sanitized = SpeechText.sanitizeForSpeech(text)
         guard !sanitized.isEmpty else { return false }
-        guard let clip = try? await rest.speak(text: sanitized, profile: profile),
-            let data = FallbackClipPlayer.decodeDataURL(clip.dataURL)
-        else { return false }
+        // Caller-supplied generation, not a fresh read: a Stop can land
+        // after the engine snapshots the sequence and before we enter, and
+        // adopting the newer value would play a clip the user cancelled.
+        // Synthesis is also a suspension with no player yet, so the same
+        // value is checked again when the clip arrives (#34).
+        guard sequence == expectedSequence else { return false }
+        guard let data = await synthesizeClip(sanitized) else { return false }
+        guard sequence == expectedSequence else { return false }
 
-        let player = FallbackClipPlayer()
+        let player = makeFallbackPlayer()
         fallback = player
         let finished = await player.play(data: data)
         if fallback === player { fallback = nil }
