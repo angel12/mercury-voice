@@ -657,6 +657,7 @@ final class ConversationController {
     /// else (cold resume, backend restart, replay ring overrun, old backend)
     /// falls back to the tracker reset.
     func connectionBecameReady(isReconnect: Bool) async {
+        guard !isTornDown else { return }
         connectionHealthy = true
         guard isReconnect else { return }
         guard let storedID = sessionBox.storedID else { return }
@@ -664,28 +665,60 @@ final class ConversationController {
         let previousEpoch = replayEpoch
         let watermark = lastSeenSeq
         holdingEvents = true
-        defer { drainHeldEvents() }
+        defer {
+            if isTornDown {
+                holdingEvents = false
+                heldEvents.removeAll()
+            } else {
+                drainHeldEvents()
+            }
+        }
         do {
             let handle = try await connection.resumeSession(
                 storedID: storedID, profile: profile)
+            guard !isTornDown else {
+                // Teardown owns the old runtime; consume it only if it has
+                // not already been closed. A cold resume returned a new
+                // runtime that teardown never saw, so close it directly.
+                if handle.runtimeID == previousRuntimeID {
+                    await closeSessionIfOpen()
+                } else {
+                    await connection.closeSession(sessionID: handle.runtimeID)
+                }
+                return
+            }
             self.handle = handle
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
-            replayEpoch = await connection.replayEpoch
+            let currentEpoch = await connection.replayEpoch
+            guard !isTornDown else {
+                await closeSessionIfOpen()
+                return
+            }
+            replayEpoch = currentEpoch
             let replayed = await replayMissedEvents(
                 handle: handle,
                 previousRuntimeID: previousRuntimeID,
                 previousEpoch: previousEpoch,
                 watermark: watermark)
+            guard !isTornDown else {
+                await closeSessionIfOpen()
+                return
+            }
             if !replayed {
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
                 await tracker.reset(busy: running)
+                guard !isTornDown else {
+                    await closeSessionIfOpen()
+                    return
+                }
             }
             adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
             noteHydration(from: handle)
         } catch {
+            guard !isTornDown else { return }
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
         }
     }
@@ -701,11 +734,13 @@ final class ConversationController {
     ) async -> Bool {
         guard let watermark, let previousEpoch,
             handle.runtimeID == previousRuntimeID,
-            await connection.replayEpoch == previousEpoch
+            await connection.replayEpoch == previousEpoch,
+            !isTornDown
         else { return false }
         guard
             let batch = try? await connection.eventsSince(
                 sessionID: handle.runtimeID, lastSeen: watermark),
+            !isTornDown,
             !batch.truncated,
             batch.epoch == nil || batch.epoch == previousEpoch
         else { return false }
