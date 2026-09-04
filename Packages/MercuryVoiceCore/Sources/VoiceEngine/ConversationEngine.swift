@@ -33,6 +33,12 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     /// submit, no re-arm (issue #5). Consumed by the close path, and cleared
     /// whenever the mic deliberately re-opens.
     private var stopRequested = false
+    /// Bumped by `end()`. A turn in flight belongs to the epoch it opened in;
+    /// once that epoch is retired the turn must not submit, mutate state, or
+    /// re-arm (issue #35). `enabled` is not enough on its own — End followed
+    /// by a new Start re-enables the engine while the abandoned turn is still
+    /// parked in its STT window.
+    private var lifetimeEpoch = 0
     private var awaitingSpokenResponse = false
     private var responseID: String?
     private var spokenSourceLength = 0
@@ -141,6 +147,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     /// Full teardown: stop everything, no re-arm.
     public func end() async {
         enabled = false
+        lifetimeEpoch += 1
         pendingStart = false
         stopRequested = false
         clearTurnTimeout()
@@ -373,7 +380,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
         clearTurnTimeout()
         setStatus(.transcribing)
+        let epoch = lifetimeEpoch
         let result = await recorder.stop()
+        guard epoch == lifetimeEpoch else { return }
 
         guard let result, result.heardSpeech || forceTranscribe else {
             let stopped = consumeStopRequest()
@@ -392,6 +401,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         do {
             transcript = try await transcriber.transcribe(result)
         } catch {
+            guard epoch == lifetimeEpoch else { return }
             let stopped = consumeStopRequest()
             if !stopped {
                 // A Stop mid-close voids the turn — the failure of a
@@ -403,6 +413,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             await drive()
             return
         }
+
+        guard epoch == lifetimeEpoch else { return }
 
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
@@ -434,6 +446,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         lastTranscript = trimmed
         awaitingSpokenResponse = true
         await dropSpeechSession()
+        guard epoch == lifetimeEpoch else { return }
         do {
             try await agent.submit(text: trimmed, interrupted: consumeInterruptedLatch())
         } catch {
@@ -786,15 +799,18 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         callbacks.onTurnCaptured()
         setStatus(.transcribing)
 
+        let epoch = lifetimeEpoch
         let transcript: String
         do {
             transcript = try await transcriber.transcribe(utterance)
         } catch {
+            guard epoch == lifetimeEpoch else { return }
             callbacks.onNotice("Transcription failed: \(error.localizedDescription)")
             resumeListening()
             await drive()
             return
         }
+        guard epoch == lifetimeEpoch else { return }
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             resumeListening()
@@ -820,6 +836,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         while await agent.isBusy, clock.now < deadline {
             try? await clock.sleep(for: VoiceConstants.interruptSettlePoll, tolerance: nil)
         }
+        guard epoch == lifetimeEpoch else { return }
 
         if consumeStopRequest() {
             // Stop landed while the capture was transcribing or waiting for
@@ -833,6 +850,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         awaitingSpokenResponse = true
         await dropSpeechSession()
         await agent.consumePendingSpeech()
+        guard epoch == lifetimeEpoch else { return }
         do {
             try await agent.submit(text: trimmed, interrupted: consumeInterruptedLatch())
         } catch {

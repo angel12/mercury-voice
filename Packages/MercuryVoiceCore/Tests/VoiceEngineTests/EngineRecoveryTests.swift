@@ -605,3 +605,77 @@ struct FallbackSequenceHandoffTests {
         #expect(recorder.startCount == 1)
     }
 }
+
+// MARK: - End during turn close (issue #35)
+
+/// `end()` is full teardown: a turn still in flight when it lands belongs to
+/// a conversation that no longer exists, so its transcript must never reach
+/// the agent — including when a new conversation has since started.
+@Suite("End during turn close")
+struct EndDuringTurnCloseTests {
+    @Test func endDuringTranscribingDropsTheTurn() async {
+        let h = RecoveryHarness()
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.armGate()
+        h.transcriber.queue("run the command")
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        h.recorder.fireAutoStop()
+        #expect(await h.status(is: .transcribing))
+
+        // End lands in the STT window; the transcript arrives after.
+        await h.engine.end()
+        h.transcriber.release()
+
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(h.agent.submissions.isEmpty)
+        #expect(await h.engine.status == .idle)
+        #expect(h.recorder.startCount == 1)  // and the mic did not re-arm
+    }
+
+    @Test func endDuringBargeCaptureTranscriptionDropsTheTurn() async {
+        let h = RecoveryHarness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply text", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        #expect(await eventually { h.barge.isActive })
+
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
+        h.agent.setBusy(false)
+        h.transcriber.armGate()
+        h.transcriber.queue("run the command")
+        h.barge.deliver(makeUtterance())
+        #expect(await h.status(is: .transcribing))
+
+        await h.engine.end()
+        h.transcriber.release()
+
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(h.agent.submissions.count == 1)  // only the original turn
+        #expect(await h.engine.status == .idle)
+        #expect(h.recorder.startCount == 1)
+    }
+
+    @Test func startAfterEndDoesNotAdoptTheAbandonedTurn() async {
+        let h = RecoveryHarness()
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.armGate()
+        h.transcriber.queue("run the command")
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        h.recorder.fireAutoStop()
+        #expect(await h.status(is: .transcribing))
+
+        await h.engine.end()
+        // A fresh conversation must not inherit the abandoned turn.
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        h.transcriber.release()
+
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(h.agent.submissions.isEmpty)
+        #expect(await h.engine.status == .listening)
+    }
+}
