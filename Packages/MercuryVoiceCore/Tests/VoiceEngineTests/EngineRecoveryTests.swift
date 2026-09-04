@@ -1,4 +1,5 @@
 import Foundation
+import HermesKit
 import Testing
 
 @testable import VoiceEngine
@@ -306,5 +307,166 @@ struct StopDuringTurnCloseTests {
         try? await Task.sleep(for: .milliseconds(100))
         #expect(h.agent.submissions.count == 1)  // only the original turn
         #expect(h.recorder.startCount == 1)  // no re-arm after the Stop
+    }
+}
+
+// MARK: - Stop during the whole-clip fallback wait (issue #34)
+
+@Suite("Stop during fallback speech")
+struct StopDuringFallbackTests {
+    /// The poll that waits for the reply text to finish must not absorb a
+    /// Stop. The old code re-captured the sequence baseline immediately
+    /// before playback, so the Stop's bump vanished: the clip played and the
+    /// mic re-armed.
+    @Test func stopWhileWaitingForTheReplySkipsTheClipAndDoesNotRearm() async {
+        let h = RecoveryHarness()
+        await h.enterThinking()
+        h.speech.streamAvailable = false
+        // Still streaming, so the fallback path parks in its poll.
+        h.agent.setPending(PendingSpeech(id: "0", text: "A reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        #expect(await eventually { await h.speech.sequence == 1 && h.clock.sleeperCount > 0 })
+
+        // Stop lands while the poll is parked — the sequence bump is the
+        // only record of it.
+        await h.engine.stopSpeech()
+
+        // The reply completes afterwards; the poll wakes and must honor it.
+        h.agent.setPending(PendingSpeech(id: "0", text: "A reply completed", pending: false))
+        h.agent.setBusy(false)
+        h.clock.advance(by: VoiceConstants.fallbackPollInterval)
+
+        #expect(await h.status(is: .idle))
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(h.speech.fallbackTexts.isEmpty)
+        #expect(h.recorder.startCount == 1)
+
+        // listenNow is the documented way back, as after any other Stop.
+        await h.engine.listenNow()
+        #expect(await h.status(is: .listening))
+        #expect(h.recorder.startCount == 2)
+    }
+}
+
+// MARK: - Stop during the whole-clip fallback (issue #34)
+
+/// A gated whole-clip synthesis request: holds `POST /api/audio/speak` open so
+/// a test can land a Stop inside it.
+final class ClipSynthesisGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _requested: [String] = []
+    private var _waiting = false
+    private var released = false
+    private var releasedData: Data?
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    var requested: [String] { locked { _requested } }
+    var isWaiting: Bool { locked { _waiting } }
+
+    func synthesize(_ text: String) async -> Data? {
+        locked { _requested.append(text) }
+        return await withCheckedContinuation {
+            (continuation: CheckedContinuation<Data?, Never>) in
+            let immediate: Bool = locked {
+                if released { return true }
+                _waiting = true
+                waiter = continuation
+                return false
+            }
+            if immediate { continuation.resume(returning: locked { releasedData }) }
+        }
+    }
+
+    /// Answer the parked request (the clip finally arrives).
+    func release(_ data: Data?) {
+        let parked: CheckedContinuation<Data?, Never>? = locked {
+            released = true
+            releasedData = data
+            _waiting = false
+            let parked = waiter
+            waiter = nil
+            return parked
+        }
+        parked?.resume(returning: data)
+    }
+}
+
+/// A clip sink that records plays instead of touching an audio device.
+final class RecordingClipPlayer: FallbackClipPlaying, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _plays: [Data] = []
+    private var _stopCount = 0
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    var plays: [Data] { locked { _plays } }
+    var stopCount: Int { locked { _stopCount } }
+    var isPlaying: Bool { false }
+
+    func play(data: Data) async -> Bool {
+        locked { _plays.append(data) }
+        return true
+    }
+
+    func stop() {
+        locked { _stopCount += 1 }
+    }
+}
+
+@Suite("Stop during the whole-clip fallback")
+struct FallbackStopTests {
+    private func makeSpeech(
+        gate: ClipSynthesisGate, player: RecordingClipPlayer
+    ) -> HermesSpeechOutput {
+        // The REST client is never called: synthesis goes through the gate.
+        let rest = HermesRESTClient(
+            endpoint: ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:1")!), token: nil)
+        return HermesSpeechOutput(
+            rest: rest, profile: nil, voiceConfig: nil,
+            synthesize: { text in await gate.synthesize(text) },
+            makeFallbackPlayer: { player })
+    }
+
+    @Test func stopDuringSynthesisRequestNeverStartsPlayback() async {
+        let gate = ClipSynthesisGate()
+        let player = RecordingClipPlayer()
+        let speech = makeSpeech(gate: gate, player: player)
+
+        let play = Task { await speech.playFallback(text: "A reply completed") }
+        #expect(await eventually { gate.isWaiting })
+
+        // The Stop lands while the clip is still being synthesized — there is
+        // no player to stop yet, so only the sequence records it. The clip
+        // arriving afterwards must not start playing.
+        await speech.stopPlayback()
+        gate.release(Data([1, 2, 3]))
+
+        #expect(await play.value == false)
+        #expect(player.plays.isEmpty)
+    }
+
+    @Test func synthesizedClipPlaysWhenNoStopLands() async {
+        let gate = ClipSynthesisGate()
+        let player = RecordingClipPlayer()
+        let speech = makeSpeech(gate: gate, player: player)
+
+        let play = Task { await speech.playFallback(text: "A reply completed") }
+        #expect(await eventually { gate.isWaiting })
+        gate.release(Data([1, 2, 3]))
+
+        #expect(await play.value == true)
+        #expect(player.plays == [Data([1, 2, 3])])
+        #expect(gate.requested == ["A reply completed"])
     }
 }

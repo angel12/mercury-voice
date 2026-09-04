@@ -516,10 +516,14 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             // silently muted the reply and parked the mic (issue #11).
             if await speech.sequence > sequenceBeforeStart + 1 {
                 awaitingSpokenResponse = false
-                await settleAfterSpeech(barged: false, stoppedDuringSetup: true)
+                await settleAfterSpeech(barged: false, stoppedByUser: true)
             } else {
                 speechSession = nil
-                await awaitFallbackSpeech(responseID: responseID)
+                // The guard above proved the sequence is exactly the contract
+                // bump, so pass that instead of re-reading it: a Stop landing
+                // between here and the wait's first hop must stay visible.
+                await awaitFallbackSpeech(
+                    responseID: responseID, baseline: sequenceBeforeStart + 1)
             }
             return
         }
@@ -536,7 +540,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         if stoppedDuringStart {
             await speech.stopPlayback()
             awaitingSpokenResponse = false
-            await settleAfterSpeech(barged: false, stoppedDuringSetup: true)
+            await settleAfterSpeech(barged: false, stoppedByUser: true)
             return
         }
 
@@ -552,7 +556,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
         guard self.responseID == responseID else { return }
         if outcome == .fallback {
-            await awaitFallbackSpeech(responseID: responseID)
+            // Keep the baseline the stream was started against: a Stop during
+            // streaming stays a bump past it.
+            await awaitFallbackSpeech(responseID: responseID, baseline: speechStartSequence)
         } else {
             awaitingSpokenResponse = false
             await settleAfterSpeech(barged: barged)
@@ -585,9 +591,23 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     }
 
     /// Whole-clip fallback: wait for the reply text to finish, then play it.
-    private func awaitFallbackSpeech(responseID: String) async {
+    ///
+    /// The wait is the second Stop-detection window (issue #34). Nothing here
+    /// is playing yet, so a Stop lands as a bare sequence bump against
+    /// `baseline` — the loop must notice it instead of polling on and
+    /// re-capturing a baseline that hides it. `baseline` is the caller's
+    /// already-validated sequence and is never re-read from the speech
+    /// output, so a Stop from any earlier phase of this turn stays visible.
+    private func awaitFallbackSpeech(responseID: String, baseline: Int) async {
         while true {
             guard self.responseID == responseID else { return }
+            if await speech.sequence > baseline {
+                // A Stop (or a barge trip) landed during the wait. Settle
+                // without speaking: `barged` routes a pending capture to the
+                // mic, everything else stays quiet until listenNow/unmute.
+                await abandonFallbackSpeech()
+                return
+            }
             guard let response = await agent.pendingSpeech() else {
                 await settleAfterSpeech(barged: false)
                 return
@@ -599,7 +619,15 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                 // sequence BEFORE playback so a user Stop mid-clip is seen by
                 // the settle logic and the mic does not re-arm.
                 await speech.stopPlayback()
-                speechStartSequence = await speech.sequence
+                let sequence = await speech.sequence
+                // Our own stopPlayback is the only bump we expect (+1);
+                // anything past it is a Stop that raced the last hop of the
+                // wait, and adopting it as the baseline would absorb it.
+                guard sequence == baseline + 1 else {
+                    await abandonFallbackSpeech()
+                    return
+                }
+                speechStartSequence = sequence
                 _ = await speech.playFallback(text: response.text)
                 guard self.responseID == responseID else { return }
                 awaitingSpokenResponse = false
@@ -610,9 +638,18 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
     }
 
+    /// Give up on the whole-clip reply because playback was stopped before it
+    /// could start. No baseline is left behind for settle to compare against
+    /// (there was no playback), so the stop is passed in directly.
+    private func abandonFallbackSpeech() async {
+        speechStartSequence = 0
+        awaitingSpokenResponse = false
+        await settleAfterSpeech(barged: barged, stoppedByUser: true)
+    }
+
     /// After speech finishes (or is stopped): re-open the mic unless the user
     /// explicitly stopped, or a barge capture owns the next turn.
-    private func settleAfterSpeech(barged: Bool, stoppedDuringSetup: Bool = false) async {
+    private func settleAfterSpeech(barged: Bool, stoppedByUser: Bool = false) async {
         if barged || !awaitingSpokenResponse {
             awaitingSpokenResponse = false
             await agent.consumePendingSpeech()
@@ -628,10 +665,10 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
         await dropSpeechSession()
         let sequence = await speech.sequence
-        let stoppedByUser =
-            stoppedDuringSetup || (speechStartSequence > 0 && sequence > speechStartSequence)
+        let stopped =
+            stoppedByUser || (speechStartSequence > 0 && sequence > speechStartSequence)
         speechStartSequence = 0
-        if enabled, !stoppedByUser { pendingStart = true }
+        if enabled, !stopped { pendingStart = true }
         setStatus(.idle)
         await drive()
     }
