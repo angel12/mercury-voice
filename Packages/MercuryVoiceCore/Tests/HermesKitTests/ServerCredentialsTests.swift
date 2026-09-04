@@ -3,6 +3,33 @@ import Testing
 
 @testable import HermesKit
 
+@Suite("Credentials persistence after validation")
+struct CredentialsPersistenceTests {
+    @Test func rotatedCredentialsReplaceExpiredOriginal() {
+        let original = ServerCredentials.password(PasswordSession(
+            provider: "basic", username: "spencer",
+            accessToken: "expired-access", refreshToken: "old-refresh", expiresAt: 1))
+        let rotated = ServerCredentials.password(PasswordSession(
+            provider: "basic", username: "spencer",
+            accessToken: "rotated-access", refreshToken: "rotated-refresh", expiresAt: 4_000_000_000))
+
+        #expect(ServerCredentials.credentialsToPersist(
+            original: original, authenticatorCurrent: rotated) == rotated)
+    }
+
+    @Test func missingCurrentCredentialsFallBackToOriginal() {
+        let original = ServerCredentials.sessionToken("session-token")
+
+        #expect(ServerCredentials.credentialsToPersist(
+            original: original, authenticatorCurrent: nil) == original)
+    }
+
+    @Test func missingOriginalAndCurrentCredentialsRemainNil() {
+        #expect(ServerCredentials.credentialsToPersist(
+            original: nil, authenticatorCurrent: nil) == nil)
+    }
+}
+
 @Suite("ServerCredentials codec")
 struct ServerCredentialsTests {
     @Test func passwordSessionRoundTrips() throws {

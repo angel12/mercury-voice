@@ -212,10 +212,15 @@ final class AppModel {
             return
         }
 
+        let currentCredentials = await authenticator.credentials
+        guard generation == connectGeneration else { return }
+        let credentialsToPersist = ServerCredentials.credentialsToPersist(
+            original: credentials, authenticatorCurrent: currentCredentials)
+
         // Credentials are good — persist and open the gateway. A failed save
         // only costs the next launch's auto-connect, so warn and carry on.
         do {
-            try tokenStore.setCredentials(credentials, for: endpoint)
+            try tokenStore.setCredentials(credentialsToPersist, for: endpoint)
             credentialStoreError = nil
         } catch {
             credentialStoreError = error.localizedDescription
