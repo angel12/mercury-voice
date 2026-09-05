@@ -12,7 +12,16 @@ final class AppModel {
     /// App Intents (Siri Shortcuts, issue #23) reach it here.
     static let shared = AppModel()
 
-    init() {
+    /// `dependencies` defaults to `.live`, so `AppModel.shared` and every
+    /// production call site resolve to the same keychain, authenticator,
+    /// probe, OAuth sheet and `UserDefaults.standard` as before. Tests pass
+    /// controllable stand-ins to exercise these same methods (issue #81).
+    init(dependencies: AppDependencies = .live) {
+        self.deps = dependencies
+        self.savedServers =
+            (try? JSONDecoder().decode(
+                [SavedServer].self,
+                from: dependencies.defaults.data(forKey: "savedServers") ?? Data())) ?? []
         #if os(iOS)
             ConversationActivityHooks.install(model: self)
         #endif
@@ -59,7 +68,11 @@ final class AppModel {
 
     var conversation: ConversationController?
 
-    private let tokenStore = KeychainTokenStore()
+    /// Internal rather than private so the app test target can assert that
+    /// `AppModel()` still resolves to `.live` (issue #81).
+    let deps: AppDependencies
+    /// Named as before so the credential call sites are unchanged.
+    private var tokenStore: any CredentialStoring { deps.credentialStore }
     private var updatePump: Task<Void, Never>?
 
     /// Monotonic guard for the connect flow: `connect()` suspends across the
@@ -85,14 +98,11 @@ final class AppModel {
         var id: String { urlString }
     }
 
-    private(set) var savedServers: [SavedServer] =
-        (try? JSONDecoder().decode(
-            [SavedServer].self,
-            from: UserDefaults.standard.data(forKey: "savedServers") ?? Data())) ?? []
+    private(set) var savedServers: [SavedServer] = []
 
     private func persistServers() {
         if let data = try? JSONEncoder().encode(savedServers) {
-            UserDefaults.standard.set(data, forKey: "savedServers")
+            deps.defaults.set(data, forKey: "savedServers")
         }
     }
 
@@ -127,7 +137,7 @@ final class AppModel {
 
     func autoConnectOnLaunch() async {
         guard connection == nil,
-            let last = UserDefaults.standard.string(forKey: "lastServer"),
+            let last = deps.defaults.string(forKey: "lastServer"),
             let parsed = try? ServerEndpoint.parse(last),
             let credentials = tokenStore.credentials(for: parsed.endpoint)
         else { return }
@@ -180,7 +190,7 @@ final class AppModel {
                 }
             }
         }
-        let probe = HermesRESTClient(endpoint: endpoint, authenticator: authenticator)
+        let probe = deps.makeProbe(endpoint, authenticator)
         do {
             let status = try await probe.status()
             guard generation == connectGeneration else { return }
@@ -226,7 +236,7 @@ final class AppModel {
         } catch {
             credentialStoreError = error.localizedDescription
         }
-        UserDefaults.standard.set(endpoint.key, forKey: "lastServer")
+        deps.defaults.set(endpoint.key, forKey: "lastServer")
         if !savedServers.contains(where: { $0.urlString == endpoint.key }) {
             savedServers.append(SavedServer(urlString: endpoint.key))
             persistServers()
@@ -245,7 +255,7 @@ final class AppModel {
         else { return }
         connectError = nil
         do {
-            let session = try await HermesAuthenticator.logIn(
+            let session = try await deps.authenticator.logIn(
                 endpoint: pending.endpoint,
                 provider: provider.name,
                 username: username,
@@ -264,13 +274,7 @@ final class AppModel {
         guard let pending = pendingLogin else { return }
         connectError = nil
         do {
-            // Named binding, not an inline temporary: NativeOAuthSignIn hands
-            // itself to ASWebAuthenticationSession as a *weak* presentation
-            // context provider, and newer compilers warn that an inline
-            // `NativeOAuthSignIn().signIn(...)` receiver is released before
-            // the weak slot is ever read.
-            let oauth = NativeOAuthSignIn()
-            let session = try await oauth.signIn(
+            let session = try await deps.oauthSignIn.signIn(
                 endpoint: pending.endpoint, provider: provider)
             await connect(endpoint: pending.endpoint, credentials: .password(session))
         } catch LoopbackRedirectListener.RedirectError.cancelled {
@@ -297,7 +301,7 @@ final class AppModel {
         endpoint: ServerEndpoint, note: String? = nil, generation: Int? = nil
     ) async {
         let providers =
-            (try? await HermesAuthenticator.authProviders(endpoint: endpoint)) ?? []
+            (try? await deps.authenticator.authProviders(endpoint: endpoint)) ?? []
         if let generation, generation != connectGeneration { return }
         let passwordProvider = providers.first(where: \.supportsPassword)
         // OAuth buttons need the RFC 8252 broker: an older gateway can
@@ -596,6 +600,10 @@ final class AppModel {
 
     /// Profile names last seen from the server, persisted so the Shortcuts
     /// profile picker has options while the app isn't connected.
+    ///
+    /// Static, and reached by App Intents outside any `AppModel` instance, so
+    /// it stays on `UserDefaults.standard` rather than the injected defaults —
+    /// it is not part of the connect/sign-in paths issue #81 needs to observe.
     nonisolated static func cachedProfileNames() -> [String] {
         UserDefaults.standard.stringArray(forKey: cachedProfileNamesKey) ?? []
     }
