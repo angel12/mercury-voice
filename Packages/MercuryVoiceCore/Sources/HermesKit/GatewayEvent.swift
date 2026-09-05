@@ -77,10 +77,23 @@ public struct EventReplayBatch: Sendable, Equatable {
 
 // MARK: - Typed payloads
 
-/// `approval.request` — session-keyed: at most one in flight per session and
-/// **no request_id**; answer with `approval.respond {session_id, choice}`.
+/// `approval.request` — answered session-keyed with
+/// `approval.respond {session_id, choice}`, which resolves the *oldest*
+/// queued approval for the session, so `id` stays the session id.
+///
+/// The payload does carry a gateway-assigned `request_id`
+/// (`_ApprovalEntry.__init__` stamps one, and `_approval_request_payload`
+/// copies the entry's dict through to both the event and the
+/// `pending_approval` snapshot field). It is decoded only to recognise the
+/// same approval arriving twice — once in a prompt snapshot and once as a
+/// live frame — and is deliberately not used to address a response; that the
+/// app answers oldest-first while showing the newest frame is a separate
+/// defect, tracked on its own.
 public struct ApprovalRequest: Sendable, Equatable, Identifiable {
     public var sessionID: String
+    /// `request_id` when the backend stamps one; nil on a backend that does
+    /// not, where two approvals cannot be told apart.
+    public var requestID: String?
     public var command: String?
     public var description: String?
     /// Server-derived subset of once/session/always/deny.
@@ -98,6 +111,7 @@ public struct ApprovalRequest: Sendable, Equatable, Identifiable {
     public init?(payload: JSONValue, sessionID: String?) {
         guard let sessionID else { return nil }
         self.sessionID = sessionID
+        self.requestID = payload["request_id"]?.stringValue
         self.command = payload["command"]?.stringValue
         self.description = payload["description"]?.stringValue
 

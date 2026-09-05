@@ -52,13 +52,16 @@ final class ConversationController {
     // MARK: Wiring
 
     private let connection: HermesConnection
+    /// Session RPCs, seamed for the reconnect-ordering tests. Defaults to
+    /// `connection`; nothing else about the connection is abstracted.
+    private let sessionService: any SessionServicing
     private let profile: String?
     private var handle: SessionHandle?
     private var mode: Mode?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
-    private let speech: HermesSpeechOutput
+    private let speech: any SpeechPlaying
     private let voiceStore: VoiceConfigStore
     private let capture = AudioCaptureService.shared
     private let cues = ConversationCuePlayer()
@@ -127,16 +130,24 @@ final class ConversationController {
     private var trackerEventContinuation: AsyncStream<GatewayEvent>.Continuation?
     private var trackerEventPump: Task<Void, Never>?
 
-    init(connection: HermesConnection, profile: String?) {
+    init(
+        connection: HermesConnection,
+        profile: String?,
+        sessionService: (any SessionServicing)? = nil,
+        speech: (any SpeechPlaying)? = nil
+    ) {
         self.connection = connection
+        self.sessionService = sessionService ?? connection
         self.profile = profile
         self.profileName = profile
         // One client-direct voice-config cache per conversation: STT and TTS
         // share the fetch, and its keys die with the controller (memory only).
         let voiceStore = VoiceConfigStore(rest: connection.rest, profile: profile)
         self.voiceStore = voiceStore
-        self.speech = HermesSpeechOutput(
-            rest: connection.rest, profile: profile, voiceConfig: voiceStore)
+        self.speech =
+            speech
+            ?? HermesSpeechOutput(
+                rest: connection.rest, profile: profile, voiceConfig: voiceStore)
 
         let box = sessionBox
         self.tracker = AgentTurnTracker(
@@ -188,14 +199,14 @@ final class ConversationController {
         await startVoiceLoop()
     }
 
-    private func openSession(mode: Mode) async throws {
+    func openSession(mode: Mode) async throws {
         let handle: SessionHandle
         switch mode {
         case .create(let cwd, let title):
-            handle = try await connection.createSession(
+            handle = try await sessionService.createSession(
                 cwd: cwd, profile: profile, title: title)
         case .resume(let storedID):
-            handle = try await connection.resumeSession(storedID: storedID, profile: profile)
+            handle = try await sessionService.resumeSession(storedID: storedID, profile: profile)
         }
         self.handle = handle
         sessionBox.runtimeID = handle.runtimeID
@@ -210,7 +221,7 @@ final class ConversationController {
         let running = handle.raw["running"]?.truthy ?? false
         usage = nil  // new session identity; the first turn re-reports
         lastSeenSeq = nil
-        replayEpoch = await connection.replayEpoch
+        replayEpoch = await sessionService.replayEpoch
         await tracker.reset(busy: running)
         // A resumed live session can be parked on a prompt that was emitted
         // while no client was attached; replay it. Nothing to clear on a
@@ -340,7 +351,7 @@ final class ConversationController {
     private func closeSessionIfOpen() async {
         guard let sid = sessionBox.runtimeID else { return }
         sessionBox.runtimeID = nil
-        await connection.closeSession(sessionID: sid)
+        await sessionService.closeSession(sessionID: sid)
     }
 
     /// AppModel forwards scene-active. Foregrounding is authoritative: an
@@ -491,7 +502,20 @@ final class ConversationController {
         for event in held { apply(event) }
     }
 
-    private func apply(_ event: GatewayEvent) {
+    /// The event families whose state a post-batch prompt read owns.
+    private static let promptFamilyEvents: Set<String> = [
+        GatewayEvent.Kind.approvalRequest,
+        GatewayEvent.Kind.clarifyRequest,
+        GatewayEvent.Kind.clarifyExpire,
+    ]
+
+    /// `skippingPromptFamilies` is set while applying a replay batch: the
+    /// sheets are decided afterwards by a read that is newer than every frame
+    /// in the batch, so re-deciding them here would only flash a prompt (and
+    /// speak its announcement) on its way to being overwritten. The frames
+    /// still pass the seq gate first, so the watermark advances exactly as if
+    /// they had been applied in full.
+    private func apply(_ event: GatewayEvent, skippingPromptFamilies: Bool = false) {
         // Seq gate (runtime-session events only — that's the id the replay
         // ring is keyed by): drop anything at or below the watermark, so a
         // replay batch overlapping the live stream can't double-apply deltas.
@@ -499,6 +523,7 @@ final class ConversationController {
             if let last = lastSeenSeq, seq <= last { return }
             lastSeenSeq = seq
         }
+        if skippingPromptFamilies, Self.promptFamilyEvents.contains(event.type) { return }
 
         switch event.type {
         case GatewayEvent.Kind.messageStart,
@@ -610,6 +635,16 @@ final class ConversationController {
     private var approvalEpoch = 0
 
     private func present(approval request: ApprovalRequest) {
+        // Idempotent by request id. On a reconnect the same approval can
+        // arrive twice — once in the post-batch prompt read and once as the
+        // live frame that was held while that read was in flight — and
+        // presenting it again would bump `approvalEpoch` (discarding an
+        // answer the user may already have sent) and re-speak the
+        // announcement. Only a gateway-stamped id establishes sameness: two
+        // approvals that both lack one are not assumed to be the same
+        // approval, so a backend that does not stamp ids keeps today's
+        // behaviour.
+        if let requestID = request.requestID, approval?.requestID == requestID { return }
         approvalEpoch += 1
         approval = request
         promptSendError = nil
@@ -621,6 +656,9 @@ final class ConversationController {
     }
 
     private func present(clarify request: ClarifyRequest) {
+        // Idempotent by request id, for the same reason as the approval
+        // sheet; clarify requests always carry one.
+        if clarify?.requestID == request.requestID { return }
         clarify = request
         promptSendError = nil
         Task {
@@ -629,16 +667,26 @@ final class ConversationController {
         }
     }
 
-    /// Adopt the `pending_approval` / `pending_clarify` replay fields of a
-    /// `session.resume` result: a prompt that arrived while this client was
+    /// Adopt the `pending_approval` / `pending_clarify` fields of a
+    /// live-session payload: a prompt that arrived while this client was
     /// detached would otherwise never be seen — the agent thread stays parked
-    /// on it until timeout. On a re-resume (`clearStale`), the registry is
+    /// on it until timeout. On a re-read (`clearStale`), the registry is
     /// authoritative the other way too: an absent field means the prompt was
     /// answered elsewhere, expired, or died with the backend, so the stale
     /// sheet is cleared and listening resumes.
-    private func adoptPendingPrompts(from handle: SessionHandle, clearStale: Bool) {
-        if let payload = handle.raw["pending_approval"],
-            let request = ApprovalRequest(payload: payload, sessionID: handle.runtimeID)
+    ///
+    /// Absent is the only "nothing pending" encoding the builder produces
+    /// (`if value: payload[key] = value`), so nil here is a real answer and
+    /// not a missing one — with the caveat recorded on `LiveSessionSnapshot`
+    /// that a backend omitting the fields entirely reads the same way.
+    private func adoptPendingPrompts(
+        sessionID: String,
+        approvalPayload: JSONValue?,
+        clarifyPayload: JSONValue?,
+        clearStale: Bool
+    ) {
+        if let approvalPayload,
+            let request = ApprovalRequest(payload: approvalPayload, sessionID: sessionID)
         {
             present(approval: request)
         } else if clearStale, approval != nil {
@@ -648,8 +696,8 @@ final class ConversationController {
             approvalEpoch += 1
         }
 
-        if let payload = handle.raw["pending_clarify"],
-            let request = ClarifyRequest(payload: payload, sessionID: handle.runtimeID)
+        if let clarifyPayload,
+            let request = ClarifyRequest(payload: clarifyPayload, sessionID: sessionID)
         {
             present(clarify: request)
         } else if clearStale, clarify != nil {
@@ -659,12 +707,62 @@ final class ConversationController {
         if clearStale { resumeIfUnprompted() }
     }
 
+    /// The `session.resume` snapshot as prompt authority — the first read of
+    /// the reconnect, and the only one on any path where the replay is not
+    /// usable.
+    private func adoptPendingPrompts(from handle: SessionHandle, clearStale: Bool) {
+        adoptPendingPrompts(
+            sessionID: handle.runtimeID,
+            approvalPayload: handle.raw["pending_approval"],
+            clarifyPayload: handle.raw["pending_clarify"],
+            clearStale: clearStale)
+    }
+
+    /// The post-batch `session.activate` read as prompt authority. Its
+    /// payload is used for the sheets and nothing else: the session handle,
+    /// the hydration notice and the busy flag all stay owned by the resume.
+    private func adoptPendingPrompts(from snapshot: LiveSessionSnapshot, clearStale: Bool) {
+        adoptPendingPrompts(
+            sessionID: snapshot.runtimeID,
+            approvalPayload: snapshot.pendingApproval,
+            clarifyPayload: snapshot.pendingClarify,
+            clearStale: clearStale)
+    }
+
     /// After a reconnect, re-resume by stored id. When the gateway kept the
     /// session alive (same runtime id back, same replay epoch), the missed
     /// events are replayed through `session.events.since` so a reply that
     /// streamed while we were away is spoken from where it left off; anything
     /// else (cold resume, backend restart, replay ring overrun, old backend)
     /// falls back to the tracker reset.
+    ///
+    /// ## Read order (issue #75)
+    ///
+    /// The prompt sheets are decided by a read taken *after* the replay
+    /// batch, not by the resume snapshot the batch is newer than. The
+    /// original bug was the reverse order: the resume snapshot was
+    /// reconciled after every replayed frame had been applied, so the older
+    /// fact won — a question raised during the outage was cleared as "no
+    /// longer pending", and one answered during it was put back on screen.
+    ///
+    /// Reordering rather than merging is deliberate. The snapshot carries
+    /// resolutions but no seq, the frames carry seq but never a resolution
+    /// (nothing is emitted when an approval or clarify is answered), so the
+    /// two cannot be placed on one axis at all; taking the last read as the
+    /// whole answer needs no ordering rule.
+    ///
+    /// The batch is fetched before that read but applied only after it
+    /// succeeds, so a failure leaves the watermark and every sheet exactly
+    /// where the un-replayed path would have them.
+    ///
+    /// **Known residual, tracked separately.** A prompt whose frame is
+    /// emitted before the read and resolved by another client before the
+    /// read still resurrects: the frame is held, drains after the sheets are
+    /// adopted, and no resolution frame exists to clear it. That is the
+    /// silent-resolution defect, and it reproduces with no reconnect at all —
+    /// a continuously connected client shows the same dead sheet from the
+    /// same server history. It needs `approval.resolved` / `clarify.resolved`
+    /// on the gateway, and no read order can substitute for them.
     func connectionBecameReady(isReconnect: Bool) async {
         guard !isTornDown else { return }
         connectionHealthy = true
@@ -683,7 +781,7 @@ final class ConversationController {
             }
         }
         do {
-            let handle = try await connection.resumeSession(
+            let handle = try await sessionService.resumeSession(
                 storedID: storedID, profile: profile)
             guard !isTornDown else {
                 // Teardown owns the old runtime; consume it only if it has
@@ -692,20 +790,22 @@ final class ConversationController {
                 if handle.runtimeID == previousRuntimeID {
                     await closeSessionIfOpen()
                 } else {
-                    await connection.closeSession(sessionID: handle.runtimeID)
+                    await sessionService.closeSession(sessionID: handle.runtimeID)
                 }
                 return
             }
             self.handle = handle
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
-            let currentEpoch = await connection.replayEpoch
+            let currentEpoch = await sessionService.replayEpoch
             guard !isTornDown else {
                 await closeSessionIfOpen()
                 return
             }
             replayEpoch = currentEpoch
-            let replayed = await replayMissedEvents(
+
+            // Nothing below touches applied state until both reads are in.
+            let batch = await fetchMissedEvents(
                 handle: handle,
                 previousRuntimeID: previousRuntimeID,
                 previousEpoch: previousEpoch,
@@ -714,7 +814,25 @@ final class ConversationController {
                 await closeSessionIfOpen()
                 return
             }
-            if !replayed {
+            let prompts =
+                batch == nil
+                ? nil
+                : await readPromptState(handle: handle, previousEpoch: previousEpoch)
+            guard !isTornDown else {
+                await closeSessionIfOpen()
+                return
+            }
+
+            if let batch, let prompts {
+                for event in batch { apply(event, skippingPromptFamilies: true) }
+                adoptPendingPrompts(from: prompts, clearStale: true)
+            } else {
+                // No usable replay: the batch (if one was fetched) is
+                // discarded unapplied, so the watermark never advanced past
+                // it and no prompt frame in it was seen. Dropping the
+                // watermark is what makes the drain safe — a restarted
+                // backend numbers from 1 again, and a retained watermark
+                // would swallow every frame after it.
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
                 await tracker.reset(busy: running)
@@ -722,8 +840,8 @@ final class ConversationController {
                     await closeSessionIfOpen()
                     return
                 }
+                adoptPendingPrompts(from: handle, clearStale: true)
             }
-            adoptPendingPrompts(from: handle, clearStale: true)
             notice = "Reconnected."
             noteHydration(from: handle)
         } catch {
@@ -732,29 +850,57 @@ final class ConversationController {
         }
     }
 
-    /// Lossless-reconnect attempt. True only when every gap-safety check
-    /// passes AND the buffered frames were applied — the caller then skips
-    /// the tracker reset because the replay reconstructs the exact state.
-    private func replayMissedEvents(
+    /// Fetch the frames missed during the outage, or nil when a lossless
+    /// replay is not available (no watermark, a recycled runtime id, a
+    /// changed replay epoch, a backend without the method, or a batch that
+    /// overran the ring). Applies nothing: the caller decides that after the
+    /// prompt read, so a fetch that turns out to be unusable costs one
+    /// discarded round trip and no state.
+    private func fetchMissedEvents(
         handle: SessionHandle,
         previousRuntimeID: String?,
         previousEpoch: String?,
         watermark: Int?
-    ) async -> Bool {
+    ) async -> [GatewayEvent]? {
         guard let watermark, let previousEpoch,
             handle.runtimeID == previousRuntimeID,
-            await connection.replayEpoch == previousEpoch,
+            await sessionService.replayEpoch == previousEpoch,
             !isTornDown
-        else { return false }
+        else { return nil }
         guard
-            let batch = try? await connection.eventsSince(
+            let batch = try? await sessionService.eventsSince(
                 sessionID: handle.runtimeID, lastSeen: watermark),
             !isTornDown,
             !batch.truncated,
             batch.epoch == nil || batch.epoch == previousEpoch
-        else { return false }
-        for event in batch.events { apply(event) }
-        return true
+        else { return nil }
+        return batch.events
+    }
+
+    /// Re-read the prompt registry after the batch, and validate that it
+    /// describes the same session the batch was fetched for.
+    ///
+    /// `session.activate` resolves a live runtime id only, so a session that
+    /// went away answers 4001 and lands here as nil. The identity check
+    /// closes the case a live answer cannot: a runtime id reaped and reminted
+    /// inside one process would answer for a different session, and applying
+    /// the earlier runtime's batch to it would be a gap, not a replay. The
+    /// epoch is re-read afterwards for the same reason — nothing may be
+    /// applied across a restart the fetch-time checks could not see.
+    ///
+    /// nil for any of it (including a backend without the method) means the
+    /// batch is discarded and the caller takes the un-replayed path.
+    private func readPromptState(
+        handle: SessionHandle, previousEpoch: String?
+    ) async -> LiveSessionSnapshot? {
+        guard
+            let snapshot = try? await sessionService.activateSession(
+                sessionID: handle.runtimeID),
+            !isTornDown,
+            snapshot.describesSameSession(as: handle)
+        else { return nil }
+        guard await sessionService.replayEpoch == previousEpoch, !isTornDown else { return nil }
+        return snapshot
     }
 
     func connectionLost() {
