@@ -39,7 +39,12 @@ typealias ClipFactory =
 final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
     @unchecked Sendable
 {
-    private let lock = NSLock()
+    /// Recursive because the start now runs under this lock: a clip that
+    /// reported completion synchronously from `startPlaying()` would re-enter
+    /// `finish` on the same thread and deadlock a non-recursive lock. On the
+    /// reentrant path `player` and `finishContinuation` are already published,
+    /// so `finish` resolves once and the outer `play` merely unlocks (#65).
+    private let lock = NSRecursiveLock()
     private var player: PlayableClip?
     private var finishContinuation: CheckedContinuation<Bool, Never>?
     private let makeClip: ClipFactory
