@@ -77,6 +77,59 @@ struct LiveSessionSnapshotTests {
         }
     }
 
+    /// Presence is the backend saying something *is* pending, so a value the
+    /// sheet decoders cannot use is an unvalidated shape and must be refused.
+    /// Accepting one would clear a live clarify sheet (`ClarifyRequest` is nil
+    /// without a string `request_id`, which the caller reads as "answered
+    /// elsewhere") or present an approval sheet with nothing in it
+    /// (`ApprovalRequest` never fails on content).
+    @Test func refusesAPresentButUnusablePromptPayload() throws {
+        let bodies = [
+            // pending_approval present, not an object.
+            #"{"pending_approval": "rm -rf build"}"#,
+            #"{"pending_approval": ["rm -rf build"]}"#,
+            #"{"pending_approval": 1}"#,
+            #"{"pending_approval": true}"#,
+            // `if value:` in the builder emits neither of these, so both are
+            // shapes it did not produce rather than "nothing pending".
+            #"{"pending_approval": null}"#,
+            #"{"pending_approval": {}}"#,
+            // pending_clarify present, not an object.
+            #"{"pending_clarify": "Which branch?"}"#,
+            #"{"pending_clarify": ["Which branch?"]}"#,
+            #"{"pending_clarify": null}"#,
+            #"{"pending_clarify": {}}"#,
+            // An object, but with no id to correlate the answer by.
+            #"{"pending_clarify": {"question": "Which branch?"}}"#,
+            #"{"pending_clarify": {"request_id": "", "question": "Which branch?"}}"#,
+            #"{"pending_clarify": {"request_id": 7, "question": "Which branch?"}}"#,
+            // A usable prompt does not excuse an unusable one beside it.
+            """
+            {"pending_approval": {"command": "make install"},
+             "pending_clarify": {"question": "Which branch?"}}
+            """,
+        ]
+        for body in bodies {
+            let merged = "{\(envelope), \(body.dropFirst())"
+            #expect(LiveSessionSnapshot(result: try json(merged)) == nil, "accepted \(body)")
+        }
+    }
+
+    /// The compatibility half of the same check: the gateway stamps every
+    /// approval with a `request_id`, but `ApprovalRequest` treats it as
+    /// optional for backends that do not, so validation must not start
+    /// requiring one.
+    @Test func acceptsAnApprovalWithoutARequestID() throws {
+        let snapshot = LiveSessionSnapshot(
+            result: try json(
+                """
+                {\(envelope), "pending_approval": {"command": "make install"}}
+                """))
+
+        #expect(snapshot?.pendingApproval?["command"]?.stringValue == "make install")
+        #expect(snapshot?.pendingApproval?["request_id"] == nil)
+    }
+
     // MARK: Identity across two reads of the same session
 
     private func handle(

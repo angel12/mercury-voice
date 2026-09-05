@@ -47,6 +47,17 @@ public struct LiveSessionSnapshot: Sendable, Equatable {
     /// it is set for any blocking prompt type (`secret.request`,
     /// `sudo.request`, `terminal.read.request`, …) while the clarify field is
     /// filtered to `clarify.request` alone.
+    ///
+    /// A *present* pending key is validated too, because presence is the
+    /// backend asserting that something **is** pending: a value the sheet
+    /// decoders cannot use is an unvalidated shape, not an empty registry.
+    /// Passing one through would do the very damage this type exists to
+    /// prevent — `ClarifyRequest` returns nil without a string `request_id`,
+    /// which the caller reads as "answered elsewhere" and clears a live
+    /// sheet, and `ApprovalRequest` never fails on content, so it would put
+    /// an approval sheet on screen with nothing in it. Refusing instead makes
+    /// `activateSession` throw, and the reconnect takes the un-replayed
+    /// fallback, which is the conservative direction.
     public init?(result: JSONValue) {
         guard let runtimeID = result["session_id"]?.stringValue, !runtimeID.isEmpty,
             let sessionKey = result["session_key"]?.stringValue, !sessionKey.isEmpty,
@@ -54,11 +65,38 @@ public struct LiveSessionSnapshot: Sendable, Equatable {
             result["status"]?.stringValue != nil,
             result["running"]?.boolValue != nil
         else { return nil }
+
+        // No `request_id` is demanded of an approval: the gateway stamps one
+        // (`approval_gateway_wait.py`), but `ApprovalRequest` carries it as
+        // optional for backends that do not, and this must not become the
+        // check that breaks them.
+        let approvalField = result["pending_approval"]
+        if let approvalField, !Self.carriesAPrompt(approvalField) { return nil }
+
+        // Clarify is correlated *by* `request_id` — without one there is no
+        // prompt to adopt, only a sheet to wrongly clear.
+        let clarifyField = result["pending_clarify"]
+        if let clarifyField {
+            guard Self.carriesAPrompt(clarifyField),
+                let requestID = clarifyField["request_id"]?.stringValue, !requestID.isEmpty
+            else { return nil }
+        }
+
         self.runtimeID = runtimeID
         self.sessionKey = sessionKey
         self.startedAt = startedAt
-        self.pendingApproval = result["pending_approval"]
-        self.pendingClarify = result["pending_clarify"]
+        self.pendingApproval = approvalField
+        self.pendingClarify = clarifyField
+    }
+
+    /// A non-empty JSON object, which is the only thing the builder can write
+    /// for a present pending key: it emits the key under `if value:`, so both
+    /// `null` and `{}` are falsy and never produced. Both are refused here for
+    /// that reason, leaving **absent** as the sole "nothing pending"
+    /// encoding — a backend that sends `null` for it loses lossless replay,
+    /// which is the same cost as any other unvalidated shape.
+    private static func carriesAPrompt(_ value: JSONValue) -> Bool {
+        value.objectValue?.isEmpty == false
     }
 
     /// True when this snapshot came from the same runtime session, in the

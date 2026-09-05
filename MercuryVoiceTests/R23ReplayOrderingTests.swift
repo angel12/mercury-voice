@@ -389,6 +389,58 @@ struct R23ReplayOrderingTests {
         #expect(!controller.devMessages.contains { $0.text == "batched" })
     }
 
+    /// The envelope can be perfect and the prompt field still unusable. A
+    /// *present* pending key is the backend asserting something is pending,
+    /// so a value the sheet decoders cannot read is an unvalidated shape —
+    /// and the two failure modes are the exact damage R23 is about: a
+    /// clarify with no `request_id` decodes to nil and clears the live
+    /// sheet, and a non-object approval presents a sheet with nothing in it.
+    @Test("a clarify with no request id is refused, not read as answered")
+    func presentButUnusableClarifyRoutesToTheFallback() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(
+            service: service,
+            pendingClarify: Fixtures.clarifyPayload(requestID: "q0", question: "Old?"))
+        #expect(controller.clarify?.requestID == "q0")
+
+        enqueueReconnectResume(
+            service,
+            pendingClarify: Fixtures.clarifyPayload(requestID: "q0", question: "Old?"))
+        service.enqueueBatch(
+            Fixtures.replayBatch([
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched")
+            ]))
+        enqueuePromptRead(
+            service, status: "waiting",
+            pendingClarify: .object(["question": .string("Which branch?")]))
+
+        await controller.connectionBecameReady(isReconnect: true)
+
+        // The still-pending question survives, on the resume snapshot's
+        // authority, and the batch is discarded with the read.
+        #expect(controller.clarify?.requestID == "q0")
+        #expect(!controller.devMessages.contains { $0.text == "batched" })
+    }
+
+    @Test("a non-object approval is refused, not presented as an empty sheet")
+    func presentButUnusableApprovalRoutesToTheFallback() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        enqueueReconnectResume(
+            service, pendingApproval: Fixtures.approvalPayload(command: "make install"))
+        service.enqueueBatch(
+            Fixtures.replayBatch([
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched")
+            ]))
+        enqueuePromptRead(service, pendingApproval: .string("make install"))
+
+        await controller.connectionBecameReady(isReconnect: true)
+
+        #expect(controller.approval?.command == "make install")
+        #expect(!controller.devMessages.contains { $0.text == "batched" })
+    }
+
     // MARK: Absent pending keys are a valid answer, not a missing one
 
     @Test("a waiting snapshot with no pending keys clears the sheets")
