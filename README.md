@@ -28,7 +28,7 @@ xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'pl
 xcodebuild -project MercuryVoice.xcodeproj -scheme MercuryVoice -destination 'generic/platform=iOS Simulator' build
 ```
 
-Unit tests (179 tests: state machine, failure-recovery paths, barge detector, echo guard, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler, client-direct voice wires, reconnect replay decoding):
+Unit tests (state machine, failure-recovery paths, barge detector, echo guard, sanitizer, stop words, protocol models, endpoint/credential parsing, OAuth/PKCE, project decoding, resampler, client-direct voice wires, reconnect replay decoding; the command reports the current test count):
 
 ```bash
 cd Packages/MercuryVoiceCore && swift test
@@ -154,7 +154,7 @@ Milestones 3–5 — voice:
 - [x] Interrupt the agent with a single word it just said ("stop", "no"): the turn goes through instead of being dropped as self-echo (#20)
 - [x] Break the TTS stream path (stop the speak-stream provider): replies fall back to whole-clip audio instead of going silent (#20)
 - [ ] iOS: conversation survives screen lock (background audio) and AirPods route changes
-- [ ] iOS: Live Activity appears on the lock screen / Dynamic Island with working mute / stop / end controls — **currently cannot pass**, see #23
+- [ ] iOS: Live Activity appears on the lock screen / Dynamic Island with working mute / stop / end controls (bundle support is present; rerun on the release candidate)
 
 macOS mute hotkey (Settings, ⌘,):
 - [ ] ⌘⇧M toggles mute during a conversation (default, app focused); Conversation menu shows the shortcut and flips Mute/Unmute
@@ -169,7 +169,7 @@ Refusal reasons (#22 — needs a backend ≥ 2026-08-31):
 - [ ] Browse still degrades to the flat session list on a backend without `projects.*`
 
 Pre-submission (App Store — see #23):
-- [ ] Sandboxed macOS **Release** build completes a native OAuth sign-in (the loopback listener needs an entitlement the sandbox doesn't currently grant)
+- [ ] Sandboxed macOS **Release** build completes a native OAuth sign-in (the loopback listener's network-server entitlement is present; verify the signed release candidate)
 - [ ] Deny the microphone permission on both platforms → a clear message and a working route into Settings, not a dead end
 - [ ] A build uploaded to App Store Connect produces no `ITMS-91053` privacy-manifest email
 

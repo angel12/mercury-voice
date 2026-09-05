@@ -238,6 +238,32 @@ struct EngineRecoveryTests {
 
 @Suite("Stop during turn close")
 struct StopDuringTurnCloseTests {
+    @Test(arguments: [false, true])
+    func stoppedBargeTranscriptionHasNoStopWordOrErrorSideEffects(fails: Bool) async {
+        let h = RecoveryHarness()
+        await h.enterThinking()
+        h.barge.trip()
+        #expect(await eventually { h.agent.interruptCount == 1 })
+        h.agent.setBusy(false)
+        h.transcriber.armGate()
+        if fails {
+            h.transcriber.queueFailure(TestError.boom)
+        } else {
+            h.transcriber.queue("stop")
+        }
+        h.barge.deliver(makeUtterance())
+        #expect(await h.status(is: .transcribing))
+        await h.engine.stopSpeech()
+        h.transcriber.release()
+
+        #expect(await h.status(is: .idle))
+        #expect(await h.engine.uiState.enabled)
+        #expect(h.notices.list.isEmpty)
+        #expect(h.agent.submissions.count == 1)
+        #expect(h.recorder.startCount == 1)
+        await h.engine.end()
+    }
+
     @Test func stopDuringTranscribingDropsTheTurn() async {
         let h = RecoveryHarness()
         h.recorder.nextResult = makeUtterance()

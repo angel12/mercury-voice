@@ -1,5 +1,14 @@
 import Foundation
 
+/// Both directions need HTTP URLs; relative or non-network URLs must relay.
+private func directVoiceBaseURL(_ raw: String) -> URL? {
+    guard let url = URL(string: raw),
+        let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+        let host = url.host, !host.isEmpty
+    else { return nil }
+    return url
+}
+
 /// The active profile's STT/TTS resolution for CLIENT-DIRECT voice, from
 /// `GET /api/audio/voice-config` (upstream `tools/voice_client_config.py`).
 ///
@@ -28,8 +37,8 @@ public struct VoiceClientConfig: Sendable, Equatable {
 public struct DirectSTTConfig: Sendable, Equatable {
     public enum Wire: String, Sendable {
         /// `POST {base}/audio/transcriptions`, multipart, Bearer — OpenAI and
-        /// compatibles (groq/mistral/deepinfra); response is plain text
-        /// because the request sets `response_format=text`.
+        /// compatibles (groq/mistral/deepinfra); requests plain text, but
+        /// also accepts JSON `{text}` from providers ignoring that format.
         case openAIMultipart = "openai-multipart"
         /// `POST {base}/stt`, multipart + `format=true`, Bearer → `{text}`.
         case xai = "xai-stt"
@@ -50,7 +59,7 @@ public struct DirectSTTConfig: Sendable, Equatable {
         guard json["mode"]?.stringValue == "direct",
             let wire = json["wire"]?.stringValue.flatMap(Wire.init(rawValue:)),
             let base = json["base_url"]?.stringValue,
-            let baseURL = URL(string: base),
+            let baseURL = directVoiceBaseURL(base),
             let apiKey = json["api_key"]?.stringValue, !apiKey.isEmpty
         else { return nil }
         self.wire = wire
@@ -84,7 +93,7 @@ public struct DirectTTSConfig: Sendable, Equatable {
         guard json["mode"]?.stringValue == "direct",
             let wire = json["wire"]?.stringValue.flatMap(Wire.init(rawValue:)),
             let base = json["base_url"]?.stringValue,
-            let baseURL = URL(string: base),
+            let baseURL = directVoiceBaseURL(base),
             let apiKey = json["api_key"]?.stringValue, !apiKey.isEmpty
         else { return nil }
         self.wire = wire

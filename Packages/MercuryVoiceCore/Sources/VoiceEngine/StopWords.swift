@@ -49,8 +49,7 @@ public enum StopWords {
                 out.append(char)
             }
         }
-        return out.split(separator: " ").joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
+        return out.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
     /// Strip the first matching address prefix ("hey hermes stop" → "stop").

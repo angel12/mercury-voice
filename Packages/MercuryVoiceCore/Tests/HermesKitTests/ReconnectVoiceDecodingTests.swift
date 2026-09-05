@@ -42,12 +42,38 @@ struct VoiceClientConfigDecodingTests {
         #expect(config.tts == nil)
     }
 
-    @Test func missingKeyOrBadURLReadsAsRelay() throws {
+    @Test func missingKeyReadsAsRelay() throws {
         let noKey = DirectSTTConfig(
             json: try json(
                 #"{"mode": "direct", "wire": "xai-stt", "base_url": "https://x.ai", "api_key": ""}"#
             ))
         #expect(noKey == nil)
+    }
+
+    @Test(arguments: ["not-a-url", "", "https:///", "file:///tmp/audio", "ftp://example.com"])
+    func invalidProviderURLReadsAsRelay(base: String) {
+        let fields: [String: JSONValue] = [
+            "mode": "direct", "base_url": .string(base), "api_key": "test-key",
+        ]
+        var stt = fields
+        stt["wire"] = "openai-multipart"
+        var tts = fields
+        tts["wire"] = "openai-speech"
+        #expect(DirectSTTConfig(json: .object(stt)) == nil)
+        #expect(DirectTTSConfig(json: .object(tts)) == nil)
+    }
+
+    @Test(arguments: ["http://127.0.0.1:8080/v1", "https://example.com/v1"])
+    func absoluteHTTPProviderURLsRemainDirect(base: String) {
+        let fields: [String: JSONValue] = [
+            "mode": "direct", "base_url": .string(base), "api_key": "test-key",
+        ]
+        var stt = fields
+        stt["wire"] = "openai-multipart"
+        var tts = fields
+        tts["wire"] = "openai-speech"
+        #expect(DirectSTTConfig(json: .object(stt)) != nil)
+        #expect(DirectTTSConfig(json: .object(tts)) != nil)
     }
 }
 
