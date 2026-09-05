@@ -73,7 +73,20 @@ final class AppModel {
     let deps: AppDependencies
     /// Named as before so the credential call sites are unchanged.
     private var tokenStore: any CredentialStoring { deps.credentialStore }
-    private var updatePump: Task<Void, Never>?
+    /// Internal rather than private so app tests can await the pump task and
+    /// assert on what it did, instead of racing it (issue #55).
+    private(set) var updatePump: Task<Void, Never>?
+
+    /// The most recent `disconnect()` teardown, retained rather than
+    /// fire-and-forget so a test can await it before asserting that a
+    /// connection was *not* stopped — an immediate assertion could otherwise
+    /// pass simply because the teardown had not run yet (issue #55).
+    ///
+    /// This is the latest teardown, **not** a general drain of every
+    /// outstanding one: an earlier teardown may still be running. Tests that
+    /// rely on it have to argue why the earlier one cannot affect what they
+    /// assert.
+    private(set) var pendingTeardown: Task<Void, Never>?
 
     /// Monotonic guard for the connect flow: `connect()` suspends across the
     /// status/validation probes, so an overlapping connect (second saved-server
@@ -245,7 +258,7 @@ final class AppModel {
         let connection = HermesConnection(endpoint: endpoint, authenticator: authenticator)
         self.connection = connection
         startUpdatePump(connection)
-        await connection.start()
+        await deps.startGateway(connection)
     }
 
     /// Sign in to a gated server with the pending password provider, then
@@ -254,16 +267,22 @@ final class AppModel {
         guard let pending = pendingLogin, let provider = pending.passwordProvider
         else { return }
         connectError = nil
+        let generation = connectGeneration
         do {
             let session = try await deps.authenticator.logIn(
                 endpoint: pending.endpoint,
                 provider: provider.name,
                 username: username,
                 password: password)
+            // A superseded login drops its minted session rather than
+            // persisting credentials for a flow the user abandoned.
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             await connect(endpoint: pending.endpoint, credentials: .password(session))
         } catch let error as HermesError {
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             connectError = error.errorDescription
         } catch {
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             connectError = error.localizedDescription
         }
     }
@@ -273,20 +292,36 @@ final class AppModel {
     func signIn(oauthProvider provider: AuthProviderInfo) async {
         guard let pending = pendingLogin else { return }
         connectError = nil
+        let generation = connectGeneration
         do {
             let session = try await deps.oauthSignIn.signIn(
                 endpoint: pending.endpoint, provider: provider)
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             await connect(endpoint: pending.endpoint, credentials: .password(session))
         } catch LoopbackRedirectListener.RedirectError.cancelled {
             // User closed the browser sheet — stay on the sign-in form.
         } catch let error as HermesError {
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             connectError = error.errorDescription
         } catch {
+            guard loginIsCurrent(generation: generation, pending: pending) else { return }
             connectError = error.localizedDescription
         }
     }
 
+    /// A sign-in or recovery that suspended may only publish once neither the
+    /// connect flow nor the sign-in form has moved on underneath it (R02).
+    /// Generation alone is not enough — Back does not change it by itself —
+    /// and identity alone is not enough, because a second gated connect can
+    /// republish an equal-looking form.
+    private func loginIsCurrent(generation: Int, pending: PendingLogin) -> Bool {
+        generation == connectGeneration && pendingLogin == pending
+    }
+
     func cancelPasswordLogin() {
+        // Back abandons the attempt: invalidate any sign-in still in flight so
+        // it cannot connect or write an error onto the screen behind it.
+        connectGeneration += 1
         pendingLogin = nil
         connectError = nil
         credentialStoreError = nil
@@ -294,15 +329,20 @@ final class AppModel {
 
     /// Look up the gated server's sign-in options and surface whichever the
     /// server advertises: the password form, native-OAuth browser sign-in
-    /// (issue #51), or both. `generation` ties the mutation to the connect
-    /// attempt that asked for it; pass nil when there is no competing
-    /// connect flow (auth-expiry pump).
+    /// (issue #51), or both.
+    ///
+    /// `generation` ties the mutation to the connect attempt that asked for
+    /// it, and is required. It was once optional, and the auth-expiry pump
+    /// passed nil on the documented grounds that it had no competing connect
+    /// flow — but the user can connect elsewhere during the provider lookup,
+    /// which is R02's third race. Leaving the parameter optional would let a
+    /// future caller reintroduce that bypass, so there is no default (#55).
     private func presentGatedLogin(
-        endpoint: ServerEndpoint, note: String? = nil, generation: Int? = nil
+        endpoint: ServerEndpoint, note: String? = nil, generation: Int
     ) async {
         let providers =
             (try? await deps.authenticator.authProviders(endpoint: endpoint)) ?? []
-        if let generation, generation != connectGeneration { return }
+        if generation != connectGeneration { return }
         let passwordProvider = providers.first(where: \.supportsPassword)
         // OAuth buttons need the RFC 8252 broker: an older gateway can
         // register OAuth providers it only serves via browser cookies,
@@ -332,7 +372,7 @@ final class AppModel {
     /// with every backend restart, and the only fix is a fresh dashboard URL.
     /// Presenting the sign-in sheet there would offer a password the server
     /// doesn't accept.
-    private func presentAuthRecovery(endpoint: ServerEndpoint) async {
+    private func presentAuthRecovery(endpoint: ServerEndpoint, generation: Int) async {
         if case .sessionToken? = tokenStore.credentials(for: endpoint) {
             connectError =
                 "\(endpoint.displayName) rejected the session token. It changes each time the "
@@ -341,7 +381,9 @@ final class AppModel {
             return
         }
         await presentGatedLogin(
-            endpoint: endpoint, note: HermesError.sessionExpired.errorDescription)
+            endpoint: endpoint,
+            note: HermesError.sessionExpired.errorDescription,
+            generation: generation)
     }
 
     func disconnect() {
@@ -362,9 +404,9 @@ final class AppModel {
         if connection != nil || conversation != nil {
             // Teardown closes the backend session over the gateway, so it
             // must complete before the connection stops.
-            Task {
+            pendingTeardown = Task {
                 await conversation?.teardown()
-                await connection?.stop()
+                if let connection { await deps.stopGateway(connection) }
             }
         }
         phase = .stopped
@@ -389,8 +431,9 @@ final class AppModel {
     }
 
     private func startUpdatePump(_ connection: HermesConnection) {
+        let updates = deps.gatewayUpdates
         updatePump = Task { [weak self] in
-            for await update in await connection.updates() {
+            for await update in await updates(connection) {
                 guard let self, !Task.isCancelled else { return }
                 switch update {
                 case .phase(let phase):
@@ -418,7 +461,13 @@ final class AppModel {
                         // disconnect cancels this pump task, and a cancelled
                         // task can't await the provider lookup.
                         if let endpoint = self.endpoint {
-                            await self.presentAuthRecovery(endpoint: endpoint)
+                            let generation = self.connectGeneration
+                            await self.presentAuthRecovery(
+                                endpoint: endpoint, generation: generation)
+                            // Recovery suspended on the provider lookup. If a
+                            // newer connect landed meanwhile this pump is
+                            // stale, and must not tear that connection down.
+                            guard generation == self.connectGeneration else { return }
                         }
                         self.disconnect()
                         return
@@ -480,7 +529,7 @@ final class AppModel {
                     selectedProfile =
                         loaded.first(where: \.isDefault)?.name ?? loaded.first?.name
                 }
-                Self.cacheProfileNames(loaded.map(\.name))
+                cacheProfileNames(loaded.map(\.name))
             } catch {
                 guard generation == connectGeneration, !Task.isCancelled else { return }
                 profilesError = error.localizedDescription
@@ -608,8 +657,13 @@ final class AppModel {
         UserDefaults.standard.stringArray(forKey: cachedProfileNamesKey) ?? []
     }
 
-    private static func cacheProfileNames(_ names: [String]) {
-        UserDefaults.standard.set(names, forKey: cachedProfileNamesKey)
+    /// Instance method, and it writes to the *injected* defaults, so a test
+    /// that drives a successful connection cannot reach the user's real
+    /// Shortcuts cache. In production `deps.defaults` is
+    /// `UserDefaults.standard`, which is what `cachedProfileNames()` above
+    /// reads, so the pair still agree (issue #55, condition from #81 review).
+    private func cacheProfileNames(_ names: [String]) {
+        deps.defaults.set(names, forKey: Self.cachedProfileNamesKey)
     }
 
     enum ShortcutStartError: LocalizedError {

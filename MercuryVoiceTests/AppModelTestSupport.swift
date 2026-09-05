@@ -1,5 +1,6 @@
 import Foundation
 import HermesKit
+import Testing
 
 @testable import MercuryVoice
 
@@ -33,24 +34,32 @@ final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
 }
 
 /// Authenticator whose two round-trips a test can hold open and release.
+///
+/// Everything the seam reads is `let`: the seam runs off the main actor, so
+/// post-construction mutation would be an unsynchronised read even though a
+/// test would in practice set it before handing the object over (#81 review).
 final class ScriptedAuthenticator: AuthenticatingService, @unchecked Sendable {
     private let lock = NSLock()
     private var _logInEndpoints: [String] = []
     private var _providerEndpoints: [String] = []
 
-    var providers: [AuthProviderInfo]
-    var logInResult: Result<PasswordSession, any Error>
+    let providers: [AuthProviderInfo]
+    let logInResult: Result<PasswordSession, any Error>
     /// When set, `logIn` suspends here until the test releases it.
-    var logInGate: CallGate?
+    let logInGate: CallGate?
     /// When set, `authProviders` suspends here until the test releases it.
-    var providersGate: CallGate?
+    let providersGate: CallGate?
 
     init(
         providers: [AuthProviderInfo] = [.passwordProvider],
-        logInResult: Result<PasswordSession, any Error> = .success(.stub)
+        logInResult: Result<PasswordSession, any Error> = .success(.stub),
+        logInGate: CallGate? = nil,
+        providersGate: CallGate? = nil
     ) {
         self.providers = providers
         self.logInResult = logInResult
+        self.logInGate = logInGate
+        self.providersGate = providersGate
     }
 
     /// Endpoints `logIn` was called for, in order.
@@ -82,6 +91,12 @@ struct ScriptedProbe: ServerProbing {
 
     func status() async throws -> ServerStatus { try statusResult.get() }
     func validateToken() async throws { try validateResult.get() }
+
+    /// An open (non-gated) server that validates, so `connect()` runs through
+    /// to building a gateway.
+    static var accepting: ScriptedProbe {
+        ScriptedProbe(statusResult: .success(.open), validateResult: .success(()))
+    }
 }
 
 /// Records which endpoints `connect()` probed, in order. This is how a test
@@ -105,11 +120,122 @@ final class ProbeRecorder: @unchecked Sendable {
     }
 }
 
+/// Drives the gateway lifecycle without dialling anything (issue #55).
+///
+/// `HermesConnection`'s initialiser is inert — it stores the endpoint and
+/// builds a REST client — so tests let `AppModel` construct the real actor and
+/// simply never start it. That keeps the seam to three closures instead of a
+/// protocol over the whole gateway.
+final class GatewayRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened: [HermesConnection] = []
+    private var stopped: [ObjectIdentifier] = []
+    private var channels:
+        [ObjectIdentifier: (
+            stream: AsyncStream<HermesConnection.Update>,
+            continuation: AsyncStream<HermesConnection.Update>.Continuation
+        )] = [:]
+
+    /// Connections `AppModel` opened, in order. Recorded in `start`, which
+    /// `connect()` awaits directly, so this is settled by the time `connect`
+    /// returns — unlike `updates`, which runs inside the pump's own task.
+    ///
+    /// This array retains every connection *deliberately*: `wasStopped` keys on
+    /// `ObjectIdentifier`, which is only sound while the objects stay alive, or
+    /// an address could be recycled and a stale identifier would match a new
+    /// connection.
+    var connections: [HermesConnection] { lock.withLock { opened } }
+    var stoppedCount: Int { lock.withLock { stopped.count } }
+
+    func wasStopped(_ connection: HermesConnection) -> Bool {
+        lock.withLock { stopped.contains(ObjectIdentifier(connection)) }
+    }
+
+    /// Never dials.
+    func start(_ connection: HermesConnection) {
+        lock.withLock {
+            if !opened.contains(where: { $0 === connection }) { opened.append(connection) }
+            _ = channelLocked(connection)
+        }
+    }
+
+    func stop(_ connection: HermesConnection) {
+        lock.withLock { stopped.append(ObjectIdentifier(connection)) }
+    }
+
+    func updates(_ connection: HermesConnection) -> AsyncStream<HermesConnection.Update> {
+        lock.withLock { channelLocked(connection).stream }
+    }
+
+    /// Deliver an update to the nth connection `AppModel` opened. `AsyncStream`
+    /// buffers, so this is safe to call before the pump starts iterating.
+    ///
+    /// Fidelity gap worth knowing: the real `HermesConnection.updates()` yields
+    /// the current phase on subscription; this does not, so a pump under test
+    /// never sees an initial `.stopped`.
+    ///
+    /// `.phase(.ready)` is refused. `HermesConnection.rest` is a real
+    /// `HermesRESTClient` built in the actor's initialiser, `nonisolated`, and
+    /// *not* behind this seam — a `.ready(false)` would send `loadBrowseData`
+    /// at a live network. This harness does not cover ready/browse behaviour;
+    /// that needs a REST seam (#81 review).
+    func send(
+        _ update: HermesConnection.Update,
+        toConnection index: Int,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        if case .phase(let phase) = update, case .ready = phase {
+            Issue.record(
+                "GatewayRecorder cannot deliver .ready: HermesConnection.rest is not seamed, so loadBrowseData would hit the network.",
+                sourceLocation: sourceLocation)
+            return
+        }
+        sendUnchecked(update, toConnection: index)
+    }
+
+    /// Finish every stream. Call from a test's `defer` so a pump whose model
+    /// went away does not stay suspended for the life of the process.
+    func finishAll() {
+        let all = lock.withLock { Array(channels.values.map(\.continuation)) }
+        for continuation in all { continuation.finish() }
+    }
+
+    private func sendUnchecked(_ update: HermesConnection.Update, toConnection index: Int) {
+        let continuation = lock.withLock {
+            index < opened.count ? channelLocked(opened[index]).continuation : nil
+        }
+        continuation?.yield(update)
+    }
+
+    /// Caller holds `lock`.
+    private func channelLocked(
+        _ connection: HermesConnection
+    ) -> (
+        stream: AsyncStream<HermesConnection.Update>,
+        continuation: AsyncStream<HermesConnection.Update>.Continuation
+    ) {
+        let key = ObjectIdentifier(connection)
+        if let existing = channels[key] { return existing }
+        let made = AsyncStream<HermesConnection.Update>.makeStream()
+        let channel = (stream: made.stream, continuation: made.continuation)
+        channels[key] = channel
+        return channel
+    }
+}
+
 @MainActor
 final class ScriptedOAuthSignIn: OAuthSigningIn {
-    var result: Result<PasswordSession, any Error> = .success(.stub)
-    var gate: CallGate?
+    let result: Result<PasswordSession, any Error>
+    let gate: CallGate?
     private(set) var endpoints: [String] = []
+
+    init(
+        result: Result<PasswordSession, any Error> = .success(.stub),
+        gate: CallGate? = nil
+    ) {
+        self.result = result
+        self.gate = gate
+    }
 
     func signIn(endpoint: ServerEndpoint, provider: AuthProviderInfo) async throws
         -> PasswordSession
@@ -180,6 +306,7 @@ extension AppDependencies {
         authenticator: ScriptedAuthenticator = ScriptedAuthenticator(),
         probes: ProbeRecorder = ProbeRecorder(),
         oauthSignIn: ScriptedOAuthSignIn = ScriptedOAuthSignIn(),
+        gateway: GatewayRecorder = GatewayRecorder(),
         defaults: UserDefaults
     ) -> AppDependencies {
         AppDependencies(
@@ -187,6 +314,9 @@ extension AppDependencies {
             authenticator: authenticator,
             makeProbe: { endpoint, _ in probes.make(endpoint) },
             oauthSignIn: oauthSignIn,
-            defaults: defaults)
+            defaults: defaults,
+            startGateway: { gateway.start($0) },
+            stopGateway: { gateway.stop($0) },
+            gatewayUpdates: { gateway.updates($0) })
     }
 }
