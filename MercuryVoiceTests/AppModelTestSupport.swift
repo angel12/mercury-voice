@@ -307,6 +307,7 @@ extension AppDependencies {
         probes: ProbeRecorder = ProbeRecorder(),
         oauthSignIn: ScriptedOAuthSignIn = ScriptedOAuthSignIn(),
         gateway: GatewayRecorder = GatewayRecorder(),
+        conversations: ConversationRecorder = ConversationRecorder(),
         defaults: UserDefaults
     ) -> AppDependencies {
         AppDependencies(
@@ -317,6 +318,7 @@ extension AppDependencies {
             defaults: defaults,
             startGateway: { gateway.start($0) },
             stopGateway: { gateway.stop($0) },
-            gatewayUpdates: { gateway.updates($0) })
+            gatewayUpdates: { gateway.updates($0) },
+            makeConversation: { conversations.make(connection: $0, profile: $1) })
     }
 }

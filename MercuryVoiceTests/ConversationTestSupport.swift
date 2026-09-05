@@ -23,10 +23,14 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private var _epoch: String?
     private var _epochOnActivate: String??
     private var _resumedIDs: [String] = []
+    private var _createdCWDs: [String?] = []
     private var _eventsSinceCalls: [(sessionID: String, lastSeen: Int)] = []
     private var _activatedIDs: [String] = []
     private var _closedIDs: [String] = []
 
+    /// When set, `createSession` suspends here until the test releases it —
+    /// the window a second launch has to overlap the first (issue #77).
+    var createGate: CallGate?
     /// When set, `resumeSession` suspends here until the test releases it.
     var resumeGate: CallGate?
     /// When set, `eventsSince` suspends here until the test releases it.
@@ -71,6 +75,8 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     // MARK: Observation
 
     var resumedIDs: [String] { lock.withLock { _resumedIDs } }
+    /// `cwd` of every `session.create`, in call order.
+    var createdCWDs: [String?] { lock.withLock { _createdCWDs } }
     var eventsSinceCalls: [(sessionID: String, lastSeen: Int)] {
         lock.withLock { _eventsSinceCalls }
     }
@@ -86,6 +92,8 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func createSession(cwd: String?, profile: String?, title: String?) async throws
         -> SessionHandle
     {
+        lock.withLock { _createdCWDs.append(cwd) }
+        if let createGate { await createGate.arrive() }
         let next: JSONValue? = lock.withLock {
             createAnswers.isEmpty ? nil : createAnswers.removeFirst()
         }
@@ -173,6 +181,101 @@ final class RecordingSpeech: SpeechPlaying, @unchecked Sendable {
     }
     var isSpeaking: Bool {
         get async { false }
+    }
+}
+
+// MARK: Audio stack stand-ins (issue #77)
+
+/// A microphone that never hears anything. `startCalls` is how a test sees
+/// whether a controller's voice loop actually armed the mic — the audio half
+/// of the R25 leak, where a superseded launch opens its engine anyway.
+final class SilentRecorder: VoiceRecording, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _startCalls = 0
+    private var _cancelCalls = 0
+
+    var startCalls: Int { lock.withLock { _startCalls } }
+    var cancelCalls: Int { lock.withLock { _cancelCalls } }
+
+    func start(vad: VADParameters, onAutoStop: @escaping @Sendable () -> Void) async throws {
+        lock.withLock { _startCalls += 1 }
+    }
+
+    func stop() async -> RecordedUtterance? { nil }
+
+    func cancel() async { lock.withLock { _cancelCalls += 1 } }
+}
+
+/// A barge monitor that never trips.
+final class SilentBargeMonitor: BargeMonitoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _startCalls = 0
+
+    var startCalls: Int { lock.withLock { _startCalls } }
+
+    func start(
+        isPlaying: @escaping @Sendable () async -> Bool,
+        onSpeech: @escaping @Sendable () -> Void,
+        onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
+    ) async throws {
+        lock.withLock { _startCalls += 1 }
+    }
+
+    func stop() async {}
+
+    func setSuspended(_ suspended: Bool) async {}
+}
+
+struct SilentTranscriber: Transcribing {
+    func transcribe(_ utterance: RecordedUtterance) async throws -> String { "" }
+}
+
+/// Builds the controllers `AppModel` launches, keeping each launch's scripted
+/// session service and audio stack so a test can ask, per launch, which
+/// backend session it opened and whether it ever armed the microphone.
+///
+/// This is the `AppDependencies.makeConversation` seam; it does not stub
+/// `ConversationController` itself, so `AppModel` drives the real `begin()`,
+/// `openSession()`, `startVoiceLoop()` and `teardown()`.
+@MainActor
+final class ConversationRecorder {
+    struct Launch {
+        let controller: ConversationController
+        let service: ScriptedSessionService
+        let recorder: SilentRecorder
+        let bargeMonitor: SilentBargeMonitor
+        let speech: RecordingSpeech
+        let profile: String?
+    }
+
+    private(set) var launches: [Launch] = []
+    /// Called with the launch index and its fresh session service, before the
+    /// controller is built — this is where a test enqueues the answer that
+    /// launch's `session.create` / `session.resume` returns, and installs a
+    /// gate to hold it open.
+    var script: (Int, ScriptedSessionService) -> Void = { _, _ in }
+
+    func make(connection: HermesConnection, profile: String?) -> ConversationController {
+        let service = ScriptedSessionService()
+        script(launches.count, service)
+        let recorder = SilentRecorder()
+        let bargeMonitor = SilentBargeMonitor()
+        let speech = RecordingSpeech()
+        let controller = ConversationController(
+            connection: connection,
+            profile: profile,
+            sessionService: service,
+            speech: speech,
+            audio: ConversationController.AudioStack(
+                recorder: recorder,
+                bargeMonitor: bargeMonitor,
+                transcriber: SilentTranscriber(),
+                microphone: AlwaysGrantedMicrophone()))
+        launches.append(
+            Launch(
+                controller: controller, service: service, recorder: recorder,
+                bargeMonitor: bargeMonitor, speech: speech, profile: profile))
+        return controller
     }
 }
 
