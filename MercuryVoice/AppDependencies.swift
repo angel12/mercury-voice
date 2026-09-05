@@ -86,12 +86,26 @@ struct AppDependencies {
     var oauthSignIn: any OAuthSigningIn
     var defaults: UserDefaults
 
+    // Gateway lifecycle, as three closures over the concrete `HermesConnection`
+    // rather than a protocol (issue #55). `AppModel` needs exactly these three
+    // moments observable — when a gateway is started, when its updates are
+    // consumed, and when it is stopped — and `HermesConnection`'s initialiser
+    // is inert, so a test can let `AppModel` build the real actor and simply
+    // never start it. Abstracting the whole gateway would mean a 14-member
+    // protocol rippling into `ConversationController` for no added coverage.
+    var startGateway: @Sendable (HermesConnection) async -> Void
+    var stopGateway: @Sendable (HermesConnection) async -> Void
+    var gatewayUpdates: @Sendable (HermesConnection) async -> AsyncStream<HermesConnection.Update>
+
     static var live: AppDependencies {
         AppDependencies(
             credentialStore: KeychainTokenStore(),
             authenticator: LiveAuthenticatingService(),
             makeProbe: { HermesRESTClient(endpoint: $0, authenticator: $1) },
             oauthSignIn: LiveOAuthSignIn(),
-            defaults: .standard)
+            defaults: .standard,
+            startGateway: { await $0.start() },
+            stopGateway: { await $0.stop() },
+            gatewayUpdates: { await $0.updates() })
     }
 }

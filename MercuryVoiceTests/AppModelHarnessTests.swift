@@ -13,6 +13,10 @@ import Testing
 /// held open and released deterministically. The behaviour fixes those
 /// capabilities unblock (R02 and the other controller races) land on their
 /// own branches.
+///
+/// iOS note: every `AppModel(...)` built here re-points the static
+/// `ConversationActivityHooks` closures at that instance, so the Shortcuts /
+/// Live Activity hooks are not meaningful in-test (#81 review, nit 2).
 @MainActor
 @Suite("AppModel test harness")
 struct AppModelHarnessTests {
@@ -34,6 +38,10 @@ struct AppModelHarnessTests {
 
     /// The default initializer — the one `AppModel.shared` uses — must still
     /// resolve to `.live`, not to anything test-shaped.
+    ///
+    /// This builds a real `AppModel`, so it *reads* the user's real
+    /// `UserDefaults.standard` `savedServers`. Read-only, and it asserts
+    /// nothing about the contents (#81 review, nit 3).
     @Test func defaultInitializerUsesLiveDependencies() {
         let model = AppModel()
         #expect(model.deps.defaults === UserDefaults.standard)
@@ -84,8 +92,7 @@ struct AppModelHarnessTests {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let gate = CallGate()
-        let auth = ScriptedAuthenticator()
-        auth.logInGate = gate
+        let auth = ScriptedAuthenticator(logInGate: gate)
         let probes = ProbeRecorder()
         let model = AppModel(
             dependencies: .scripted(authenticator: auth, probes: probes, defaults: defaults))
