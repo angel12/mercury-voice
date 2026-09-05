@@ -110,6 +110,18 @@ public final class AudioCaptureService: AudioCaptureStreaming, @unchecked Sendab
         lock.unlock()
     }
 
+    /// Whether a level handler is currently installed. Read-only
+    /// observability: the meter is process-global and last-writer-wins, so
+    /// the app's conversation-ownership tests assert on it directly rather
+    /// than on their own bookkeeping (issue #77). Nothing branches on it, and
+    /// it stays internal — the app tests reach it through
+    /// `@testable import VoiceEngine`, so this is not new public API.
+    var hasLevelHandler: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return levelHandler != nil
+    }
+
     /// Open a consumer stream, starting the engine if needed.
     public func openStream() throws -> (id: UUID, stream: AsyncStream<AudioChunk>) {
         let id = UUID()

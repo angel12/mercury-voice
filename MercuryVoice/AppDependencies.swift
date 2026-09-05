@@ -97,6 +97,13 @@ struct AppDependencies {
     var stopGateway: @Sendable (HermesConnection) async -> Void
     var gatewayUpdates: @Sendable (HermesConnection) async -> AsyncStream<HermesConnection.Update>
 
+    /// Builds the controller for one conversation launch (issue #77). The
+    /// live value is the construction `startConversation`/`continueSession`
+    /// did inline; the seam exists so the ownership tests can script
+    /// `session.*` and swap the audio stack while `AppModel` runs its real
+    /// launch path.
+    var makeConversation: (HermesConnection, String?) -> ConversationController
+
     static var live: AppDependencies {
         AppDependencies(
             credentialStore: KeychainTokenStore(),
@@ -106,6 +113,7 @@ struct AppDependencies {
             defaults: .standard,
             startGateway: { await $0.start() },
             stopGateway: { await $0.stop() },
-            gatewayUpdates: { await $0.updates() })
+            gatewayUpdates: { await $0.updates() },
+            makeConversation: { ConversationController(connection: $0, profile: $1) })
     }
 }
