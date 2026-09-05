@@ -11,13 +11,55 @@ protocol FallbackClipPlaying: AnyObject, Sendable {
     func stop()
 }
 
+/// What the clip lifecycle actually does with a decoded clip. Extracted so the
+/// stop/start handoff can be driven deterministically without an audio device
+/// (issue #65); in production this is always `AVAudioPlayer`.
+protocol PlayableClip: AnyObject {
+    var isPlaying: Bool { get }
+    /// Begin playback; `false` means it could not start.
+    func startPlaying() -> Bool
+    func stopPlaying()
+}
+
+extension AVAudioPlayer: PlayableClip {
+    func startPlaying() -> Bool { play() }
+    func stopPlaying() { stop() }
+}
+
+/// Decodes `data` into a clip ready to start, reporting completion to
+/// `delegate`. Everything device-facing lives behind this.
+typealias ClipFactory =
+    @Sendable (_ data: Data, _ delegate: AVAudioPlayerDelegate) throws -> PlayableClip
+
 /// Plays a whole TTS clip returned by `POST /api/audio/speak` as a data URL.
+///
+/// Single-use, and terminal after `stop()`: both callers mint one of these per
+/// clip and can be interrupted on the actor hop that reaches `play`, so a Stop
+/// that lands before the clip is even built has to stay decided (issue #65).
 final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
     @unchecked Sendable
 {
-    private let lock = NSLock()
-    private var player: AVAudioPlayer?
+    /// Recursive because the start now runs under this lock: a clip that
+    /// reported completion synchronously from `startPlaying()` would re-enter
+    /// `finish` on the same thread and deadlock a non-recursive lock. On the
+    /// reentrant path `player` and `finishContinuation` are already published,
+    /// so `finish` resolves once and the outer `play` merely unlocks (#65).
+    private let lock = NSRecursiveLock()
+    private var player: PlayableClip?
     private var finishContinuation: CheckedContinuation<Bool, Never>?
+    private let makeClip: ClipFactory
+    /// Set by `stop()` and never cleared. Guards the window in which this
+    /// player exists but `play` has not run yet.
+    private var stopped = false
+
+    override convenience init() {
+        self.init(makeClip: FallbackClipPlayer.makeAudioPlayerClip)
+    }
+
+    init(makeClip: @escaping ClipFactory) {
+        self.makeClip = makeClip
+        super.init()
+    }
 
     var isPlaying: Bool {
         lock.lock()
@@ -29,22 +71,25 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
     func play(data: Data) async -> Bool {
         await withCheckedContinuation { continuation in
             lock.lock()
+            // A Stop that arrived before the clip was built stays decided:
+            // the caller has already been told this clip is cancelled, and
+            // finally reaching `play` must not undo that.
+            guard !stopped else {
+                lock.unlock()
+                continuation.resume(returning: false)
+                return
+            }
             do {
-                let player = try AVAudioPlayer(data: data)
-                #if os(macOS)
-                    // Honor the selected output; only pass UIDs that resolve
-                    // to a live device — a stale UID would fail playback.
-                    if let uid = AudioDevicePreference.outputUID,
-                        MacAudioDevices.resolve(uid: uid) != nil
-                    {
-                        player.currentDevice = uid
-                    }
-                #endif
-                player.delegate = self
+                let player = try makeClip(data, self)
                 self.player = player
                 self.finishContinuation = continuation
+                // Started under the same lock that publishes it, so a Stop
+                // cannot land in between: it either arrives first and is
+                // refused above, or waits here and stops a clip that really
+                // did start.
+                let started = player.startPlaying()
                 lock.unlock()
-                if !player.play() {
+                if !started {
                     finish(success: false)
                 }
             } catch {
@@ -54,12 +99,34 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
         }
     }
 
+    /// Stop playback and make this player terminal: any later `play` resolves
+    /// `false` without starting anything.
     func stop() {
         lock.lock()
+        stopped = true
         let player = player
         lock.unlock()
-        player?.stop()
+        player?.stopPlaying()
         finish(success: false)
+    }
+
+    /// Production clip: an `AVAudioPlayer` decoded from the whole clip and
+    /// routed to the selected output, not yet started.
+    private static func makeAudioPlayerClip(
+        data: Data, delegate: AVAudioPlayerDelegate
+    ) throws -> PlayableClip {
+        let player = try AVAudioPlayer(data: data)
+        #if os(macOS)
+            // Honor the selected output; only pass UIDs that resolve
+            // to a live device — a stale UID would fail playback.
+            if let uid = AudioDevicePreference.outputUID,
+                MacAudioDevices.resolve(uid: uid) != nil
+            {
+                player.currentDevice = uid
+            }
+        #endif
+        player.delegate = delegate
+        return player
     }
 
     private func finish(success: Bool) {
