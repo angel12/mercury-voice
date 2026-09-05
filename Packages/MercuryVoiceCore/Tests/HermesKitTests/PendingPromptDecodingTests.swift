@@ -29,6 +29,24 @@ struct PendingPromptDecodingTests {
         #expect(request?.choices == ["once", "deny"])
     }
 
+    /// The gateway stamps `request_id` on every approval entry
+    /// (`_ApprovalEntry.__init__`) and `_approval_request_payload` copies the
+    /// entry's dict through, so both the event and the `pending_approval`
+    /// snapshot field carry it. It is decoded to recognise the same approval
+    /// arriving twice; `id` stays the session id because `approval.respond`
+    /// is answered session-keyed.
+    @Test func approvalCarriesTheRequestIDWhenTheBackendStampsOne() throws {
+        let stamped = ApprovalRequest(
+            payload: try json(#"{"command": "ls", "request_id": "a1"}"#), sessionID: "sid-1")
+        #expect(stamped?.requestID == "a1")
+        #expect(stamped?.id == "sid-1")
+
+        // A backend that does not stamp one leaves it nil, and two such
+        // approvals must not be assumed to be the same approval.
+        let unstamped = ApprovalRequest(payload: try json(#"{"command": "ls"}"#), sessionID: "s")
+        #expect(unstamped?.requestID == nil)
+    }
+
     @Test func approvalDerivesChoicesLikeTheServer() throws {
         // allow_* absent means allowed; the full ladder is offered.
         let full = ApprovalRequest(payload: try json(#"{"command": "ls"}"#), sessionID: "s")

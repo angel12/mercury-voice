@@ -78,6 +78,38 @@ extension HermesConnection {
         return handle
     }
 
+    /// `session.activate` — re-read the live session's payload, including
+    /// its pending-prompt registry state, without closing or re-resuming
+    /// anything.
+    ///
+    /// Used on reconnect to take prompt state *after* the replay batch has
+    /// been fetched, so the sheets are decided by the newest read rather than
+    /// by a snapshot the batch is newer than (issue #75). `omit_messages`
+    /// skips the transcript DB read, and the handler resolves a **live
+    /// runtime id only** — a session the gateway no longer holds answers
+    /// 4001 rather than falling back to the stored id, which is what makes a
+    /// success meaningful as an identity check.
+    ///
+    /// Its side effects (transport rebind to the socket this call is already
+    /// on, a viewers timestamp, `last_active` touch, cancelling a pending
+    /// ws-orphan reap) are re-applications of what the preceding
+    /// `session.resume` just did.
+    ///
+    /// Throws on a backend without the method, and on any malformed payload.
+    public func activateSession(sessionID: String) async throws -> LiveSessionSnapshot {
+        let result = try await request(
+            "session.activate",
+            params: [
+                "session_id": .string(sessionID),
+                "omit_messages": .bool(true),
+            ])
+        guard let snapshot = LiveSessionSnapshot(result: result) else {
+            throw HermesError.malformedResponse(
+                "session.activate did not return a live-session payload")
+        }
+        return snapshot
+    }
+
     /// `prompt.submit` returns `{"status":"streaming"}` immediately — the
     /// reply arrives only via events; never await this for completion. Set
     /// `interrupted` on the first submit after a barge-in so the backend
