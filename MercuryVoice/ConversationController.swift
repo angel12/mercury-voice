@@ -532,7 +532,13 @@ final class ConversationController {
 
         /// Every system call is over — the reliable stand-in for the
         /// unreliable interruption `.ended`. Same recovery as foregrounding.
-        private func systemCallsEnded() {
+        ///
+        /// Internal rather than private only because `CXCall` cannot be
+        /// constructed in a test, so the superseded-controller coverage has to
+        /// invoke this entry point directly. The interruption path next door
+        /// needs no such hook — a real `AVAudioSession` notification reaches
+        /// it (issue #77).
+        func systemCallsEnded() {
             guard !isTornDown else { return }
             audioInterrupted = false
             capture.ensureRunning()

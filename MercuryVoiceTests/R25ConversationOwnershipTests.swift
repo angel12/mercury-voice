@@ -1,7 +1,7 @@
 import Foundation
 import HermesKit
 import Testing
-import VoiceEngine
+@testable import VoiceEngine
 
 #if os(iOS)
     import AVFoundation
@@ -389,16 +389,13 @@ struct R25ConversationOwnershipTests {
         /// observer of its own here — it is still inside `session.create` — so
         /// anything that moved would have come from the old controller.
         ///
-        /// Scope, stated exactly: this covers delivery *after* teardown, which
-        /// is deterministic. It does **not** cover the narrower window the
-        /// `isTornDown` guards exist for — a block already enqueued on
-        /// `OperationQueue.main` when `removeObserver` runs. That window is not
-        /// reproducible in-process: `NotificationCenter`'s queued delivery
-        /// blocks the posting thread until the main-queue block completes, so
-        /// pinning the main thread across the enqueue deadlocks the poster
-        /// (measured: the post times out at 5s and the block only runs once
-        /// main is released). The guards are defended by construction, not by
-        /// this test.
+        /// Scope, stated exactly: teardown has already removed the observers
+        /// by the time this posts, so the `isTornDown` guards are never on the
+        /// path here and this establishes nothing about them. It is
+        /// preservation coverage for observer removal. The guards are covered
+        /// by the two tests below, in the window where they actually matter:
+        /// superseded, but not yet torn down, with the observers still
+        /// registered.
         @Test func aSupersededControllersInterruptionIsInert() async {
             let (defaults, suiteName) = makeTestDefaults()
             defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -433,6 +430,77 @@ struct R25ConversationOwnershipTests {
             await second.value
             #expect(ConversationController.levelMeterOwner === replacement)
             #expect(AudioCaptureService.shared.hasLevelHandler)
+        }
+
+        /// `isTornDown` is set synchronously by `supersede()`, but `teardown()`
+        /// — which removes the observers — is asynchronous. Between the two the
+        /// controller is dropped and its observer is still registered, so a
+        /// real interruption is delivered to a controller that no longer owns
+        /// anything. That window is the reason the guard exists, and it is
+        /// reachable directly: `supersede()` is the exact entry point
+        /// `AppModel.releaseConversation()` uses.
+        ///
+        /// Covers the `audioInterruption` guard alone. Removing it makes this
+        /// fail; removing the `systemCallsEnded` guard does not.
+        @Test func anInterruptionAfterSupersessionIsNotRecorded() async {
+            let (defaults, suiteName) = makeTestDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let gateway = GatewayRecorder()
+            defer { gateway.finishAll() }
+
+            let conversations = recorder(gates: [:])
+            let model = await connectedModel(
+                conversations: conversations, gateway: gateway, defaults: defaults)
+
+            await model.startConversation(cwd: "/one")
+            let superseded = conversations.launches[0].controller
+            #expect(!superseded.audioInterrupted)
+
+            // Dropped, but not torn down: the observer installed by
+            // startVoiceLoop is still registered on NotificationCenter.
+            superseded.supersede()
+
+            postInterruption(.began)
+            await drainMainQueue()
+
+            #expect(!superseded.audioInterrupted)
+        }
+
+        /// The other half, in the same window. `CXCall` cannot be constructed,
+        /// so this invokes the entry point the `CallEndWatcher` delegate calls
+        /// rather than driving `CXCallObserver`.
+        ///
+        /// The controller is interrupted while it is still live first, so the
+        /// call after supersession has something to change: without the guard
+        /// `systemCallsEnded()` clears the flag, and reaches `ensureRunning()`
+        /// on the shared capture service and `setPaused(false)` on the dead
+        /// engine. Covers the `systemCallsEnded` guard alone.
+        @Test func systemCallsEndedAfterSupersessionDoesNotRecover() async {
+            let (defaults, suiteName) = makeTestDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let gateway = GatewayRecorder()
+            defer { gateway.finishAll() }
+
+            let conversations = recorder(gates: [:])
+            let model = await connectedModel(
+                conversations: conversations, gateway: gateway, defaults: defaults)
+
+            await model.startConversation(cwd: "/one")
+            let superseded = conversations.launches[0].controller
+
+            // Interrupted while live, through the real notification — this is
+            // also what proves the installed observer reaches the handler.
+            postInterruption(.began)
+            await drainMainQueue()
+            #expect(superseded.audioInterrupted)
+
+            superseded.supersede()
+            let recorderStartsBefore = conversations.launches[0].recorder.startCalls
+
+            superseded.systemCallsEnded()
+
+            #expect(superseded.audioInterrupted)
+            #expect(conversations.launches[0].recorder.startCalls == recorderStartsBefore)
         }
 
     #endif
