@@ -279,7 +279,10 @@ struct AudioCaptureLifecycleTests {
         #expect(factory.buildCount == 0)
 
         // Bounded rather than a bare drain: a stream left attached has to fail
-        // this test, not hang it.
+        // this test, not hang it. The join after the cancel is what keeps a
+        // failing run from leaving the consumer task alive behind it --
+        // cancelling an AsyncStream iteration ends it, so this returns whether
+        // or not the stream was finished.
         let stream = try #require(joiner.current)
         let finished = Box<Bool>(false)
         let pump = Task {
@@ -288,6 +291,7 @@ struct AudioCaptureLifecycleTests {
         }
         #expect(await eventually { finished.current })
         pump.cancel()
+        await pump.value
 
         let (id, _) = try service.openStream()
         #expect(factory.buildCount == 1)
