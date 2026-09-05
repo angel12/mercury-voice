@@ -100,7 +100,7 @@ final class ConversationController {
         private var callObserver: CXCallObserver?
         private var callObserverDelegate: CallEndWatcher?
         /// True between an interruption's begin and end notifications.
-        private var audioInterrupted = false
+        private(set) var audioInterrupted = false
         /// True when the engine parked after a refused mic start; cleared by
         /// the foreground/interruption-ended resume.
         private var parkedForBackground = false
@@ -273,6 +273,46 @@ final class ConversationController {
         }
     }
 
+    // MARK: Shared capture level meter
+
+    /// The controller that currently owns the shared mic-level meter.
+    ///
+    /// `AudioCaptureService.shared.setLevelHandler` is process-global and
+    /// last-writer-wins, and a superseded controller's `teardown()` is
+    /// asynchronous — so an unconditional clear there can in principle land
+    /// after the replacement has already installed its handler and leave the
+    /// live conversation's meter dead. The launch path happens to enqueue the
+    /// outgoing teardown before the replacement can install, but that is
+    /// scheduler behaviour, not a contract, so ownership is checked rather
+    /// than assumed (issue #77).
+    ///
+    /// One isolation boundary: this static and both operations below are
+    /// main-actor state on a `@MainActor` type, and every install and clear in
+    /// the app goes through them, so no ordering between two teardowns can
+    /// take the meter from its owner.
+    ///
+    /// Weak: the owner is always the controller `AppModel.conversation` holds,
+    /// and that is only released after a teardown which clears this, so it does
+    /// not dangle in practice — weak just guarantees the static can never keep
+    /// a dead controller alive.
+    private(set) static weak var levelMeterOwner: ConversationController?
+
+    private func takeLevelMeter() {
+        Self.levelMeterOwner = self
+        capture.setLevelHandler { [weak self] level in
+            Task { @MainActor in self?.micLevel = level }
+        }
+    }
+
+    /// Clear the shared meter only while this controller still owns it. A
+    /// superseded controller reaching here after the replacement installed
+    /// must leave the replacement's handler alone.
+    private func releaseLevelMeterIfOwned() {
+        guard Self.levelMeterOwner === self else { return }
+        Self.levelMeterOwner = nil
+        capture.setLevelHandler(nil)
+    }
+
     /// The production audio stack: the shared capture service's recorder and
     /// barge monitor, REST transcription, and the system permission.
     private func liveAudioStack() -> AudioStack {
@@ -348,9 +388,7 @@ final class ConversationController {
                 #endif
             }
         }
-        capture.setLevelHandler { [weak self] level in
-            Task { @MainActor in self?.micLevel = level }
-        }
+        takeLevelMeter()
         #if os(iOS)
             startAudioKeepalive()
             observeAudioInterruptions()
@@ -371,7 +409,7 @@ final class ConversationController {
         trackerEventPump?.cancel()
         stateTask?.cancel()
         captionTask?.cancel()
-        capture.setLevelHandler(nil)
+        releaseLevelMeterIfOwned()
         #if os(iOS)
             stopAudioKeepalive()
             if let interruptionObserver {
@@ -456,24 +494,34 @@ final class ConversationController {
 
         /// Pause the loop for the interruption's duration; the capture
         /// service separately rebuilds its engine on the ended signal.
+        ///
+        /// Both callbacks target `self`, not `AppModel.shared.conversation`.
+        /// Every controller installs its own pair in `startVoiceLoop`, so the
+        /// live conversation still hears the system exactly once — but a
+        /// superseded controller can no longer reach into whatever
+        /// conversation is current now. Removing the observers in `teardown()`
+        /// is not enough on its own: these are delivered on `OperationQueue`
+        /// `.main`, so a callback enqueued before the removal still runs after
+        /// it. The `isTornDown` checks in the two handlers are what make that
+        /// late delivery inert (issue #77).
         private func observeAudioInterruptions() {
             interruptionObserver = NotificationCenter.default.addObserver(
                 forName: AVAudioSession.interruptionNotification,
                 object: nil, queue: .main
-            ) { notification in
+            ) { [weak self] notification in
                 guard
                     let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
                         as? UInt,
                     let type = AVAudioSession.InterruptionType(rawValue: raw)
                 else { return }
                 MainActor.assumeIsolated {
-                    AppModel.shared.conversation?.audioInterruption(began: type == .began)
+                    self?.audioInterruption(began: type == .began)
                 }
             }
 
-            let watcher = CallEndWatcher {
+            let watcher = CallEndWatcher { [weak self] in
                 MainActor.assumeIsolated {
-                    AppModel.shared.conversation?.systemCallsEnded()
+                    self?.systemCallsEnded()
                 }
             }
             let observer = CXCallObserver()
@@ -485,12 +533,14 @@ final class ConversationController {
         /// Every system call is over — the reliable stand-in for the
         /// unreliable interruption `.ended`. Same recovery as foregrounding.
         private func systemCallsEnded() {
+            guard !isTornDown else { return }
             audioInterrupted = false
             capture.ensureRunning()
             resumeIfUnprompted()
         }
 
         private func audioInterruption(began: Bool) {
+            guard !isTornDown else { return }
             audioInterrupted = began
             if began {
                 Task { await engine?.setPaused(true) }

@@ -1,6 +1,11 @@
 import Foundation
 import HermesKit
 import Testing
+import VoiceEngine
+
+#if os(iOS)
+    import AVFoundation
+#endif
 
 @testable import MercuryVoice
 
@@ -16,8 +21,12 @@ import Testing
 /// microphone and held a backend session open.
 ///
 /// Every wait here is a `CallGate` or a task value — no sleeping, no polling.
+/// Serialized: `startVoiceLoop` installs a handler on the process-global
+/// `AudioCaptureService.shared`, and the meter-ownership assertions below read
+/// it back, so these tests must not interleave with each other. No other suite
+/// reaches that state — the controller tests elsewhere stop at `openSession`.
 @MainActor
-@Suite("Conversation ownership (R25)")
+@Suite("Conversation ownership (R25)", .serialized)
 struct R25ConversationOwnershipTests {
 
     // MARK: Harness
@@ -285,4 +294,146 @@ struct R25ConversationOwnershipTests {
         #expect(launch.service.closedIDs == ["rt-0"])
         #expect(launch.recorder.cancelCalls >= 1)
     }
+
+    // MARK: Shared capture state under reversed cleanup ordering
+
+    /// A superseded controller's teardown is asynchronous, so it can land
+    /// after the replacement has already installed its own mic-level handler.
+    /// This drives that order deliberately — the replacement is fully settled
+    /// first, and only then does the old controller's *real* `teardown()` run
+    /// — and asserts the shared handler on `AudioCaptureService` survives.
+    ///
+    /// The assertion is on the capture service itself, not on the ownership
+    /// bookkeeping alone: an unconditional `setLevelHandler(nil)` leaves
+    /// `hasLevelHandler == false`, which is exactly what this catches.
+    @Test func delayedCleanupCannotTakeTheLevelMeterFromTheReplacement() async {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+
+        let conversations = recorder(gates: [:])
+        let model = await connectedModel(
+            conversations: conversations, gateway: gateway, defaults: defaults)
+
+        await model.startConversation(cwd: "/one")
+        let superseded = conversations.launches[0].controller
+        #expect(ConversationController.levelMeterOwner === superseded)
+
+        await model.startConversation(cwd: "/two")
+        await model.pendingTeardown?.value
+        let replacement = conversations.launches[1].controller
+
+        // The replacement owns the meter and the shared handler is installed.
+        #expect(ConversationController.levelMeterOwner === replacement)
+        #expect(AudioCaptureService.shared.hasLevelHandler)
+
+        // Reversed order, forced: run the superseded controller's real
+        // teardown again, now that the replacement has installed its handler.
+        await superseded.teardown()
+
+        #expect(ConversationController.levelMeterOwner === replacement)
+        #expect(AudioCaptureService.shared.hasLevelHandler)
+
+        // …and the owner still gives it up when it is the one tearing down.
+        await replacement.teardown()
+        #expect(ConversationController.levelMeterOwner == nil)
+        #expect(!AudioCaptureService.shared.hasLevelHandler)
+    }
+
+    #if os(iOS)
+
+        /// Drain `OperationQueue.main` past anything already enqueued — the
+        /// queue the interruption observer is registered on. FIFO, so once
+        /// this operation runs, a block enqueued before it has already run.
+        private func drainMainQueue() async {
+            await withCheckedContinuation { continuation in
+                OperationQueue.main.addOperation { continuation.resume() }
+            }
+        }
+
+        private func postInterruption(_ type: AVAudioSession.InterruptionType) {
+            NotificationCenter.default.post(
+                name: AVAudioSession.interruptionNotification,
+                object: nil,
+                userInfo: [AVAudioSessionInterruptionTypeKey: type.rawValue])
+        }
+
+        /// The live conversation's own observer drives *itself*. This is the
+        /// half that fails against the pre-follow-up code, where the callback
+        /// went to `AppModel.shared.conversation` — a different instance from
+        /// the model under test, so the interruption reached nothing at all.
+        @Test func aLiveControllersInterruptionObserverDrivesThatController() async {
+            let (defaults, suiteName) = makeTestDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let gateway = GatewayRecorder()
+            defer { gateway.finishAll() }
+
+            let conversations = recorder(gates: [:])
+            let model = await connectedModel(
+                conversations: conversations, gateway: gateway, defaults: defaults)
+
+            await model.startConversation(cwd: "/one")
+            let live = conversations.launches[0].controller
+            #expect(!live.audioInterrupted)
+
+            postInterruption(.began)
+            await drainMainQueue()
+
+            #expect(live.audioInterrupted)
+        }
+
+        /// An interruption delivered after the replacement has taken over must
+        /// change nothing on the superseded controller, and must not reach the
+        /// conversation that is current now through it. The replacement has no
+        /// observer of its own here — it is still inside `session.create` — so
+        /// anything that moved would have come from the old controller.
+        ///
+        /// Scope, stated exactly: this covers delivery *after* teardown, which
+        /// is deterministic. It does **not** cover the narrower window the
+        /// `isTornDown` guards exist for — a block already enqueued on
+        /// `OperationQueue.main` when `removeObserver` runs. That window is not
+        /// reproducible in-process: `NotificationCenter`'s queued delivery
+        /// blocks the posting thread until the main-queue block completes, so
+        /// pinning the main thread across the enqueue deadlocks the poster
+        /// (measured: the post times out at 5s and the block only runs once
+        /// main is released). The guards are defended by construction, not by
+        /// this test.
+        @Test func aSupersededControllersInterruptionIsInert() async {
+            let (defaults, suiteName) = makeTestDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let gateway = GatewayRecorder()
+            defer { gateway.finishAll() }
+
+            let held = CallGate()
+            let conversations = recorder(gates: [1: held])
+            let model = await connectedModel(
+                conversations: conversations, gateway: gateway, defaults: defaults)
+
+            await model.startConversation(cwd: "/one")
+            let superseded = conversations.launches[0].controller
+            #expect(!superseded.audioInterrupted)
+
+            // Replacement takes ownership and is held inside session.create, so
+            // it has not installed an observer of its own yet.
+            let second = Task { await model.startConversation(cwd: "/two") }
+            await held.waitUntilEntered()
+            await model.pendingTeardown?.value
+            let replacement = conversations.launches[1].controller
+            #expect(model.conversation === replacement)
+
+            postInterruption(.began)
+            await drainMainQueue()
+
+            #expect(!superseded.audioInterrupted)
+            #expect(!replacement.audioInterrupted)
+            #expect(model.conversation === replacement)
+
+            await held.release()
+            await second.value
+            #expect(ConversationController.levelMeterOwner === replacement)
+            #expect(AudioCaptureService.shared.hasLevelHandler)
+        }
+
+    #endif
 }
