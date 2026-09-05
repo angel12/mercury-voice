@@ -132,7 +132,28 @@ struct DirectSpeechOutcomeTests {
     /// simply move after a *successful* play: audio the user already heard
     /// must not be re-spoken from the beginning.
     @Test func aClipCutShortAfterItStartedKeepsWhatPlayed() async {
-        #expect(await run(oneSentence, player: ScriptedPlayer([.interrupted])) == .done)
+        let player = ScriptedPlayer([.interrupted])
+        #expect(await run(twoSentences, player: player) == .done)
+        // And the cut is respected: the pump stops rather than speaking on
+        // past the sentence the user had already heard interrupted (M8).
+        #expect(player.plays == 1)
+    }
+
+    /// Issue #69, item 1, end to end through the shipping `FallbackClipPlayer`
+    /// with only its clip replaced: a start that refuses on the first clip
+    /// means nothing was audible, so the turn must reach the gateway fallback.
+    /// `AVAudioPlayer` cannot be made to refuse a start, so #65's clip seam is
+    /// what makes this reachable at all.
+    @Test func aFirstClipWhoseStartRefusesReachesTheFallback() async {
+        let session = DirectSpeechSession(
+            config: ttsConfig,
+            client: ScriptedSynthesizer(),
+            makePlayer: { FallbackClipPlayer(makeClip: { _, _ in TestClip(startSucceeds: false) }) })
+
+        await session.append(oneSentence)
+        await session.finish()
+
+        #expect(await session.waitDone() == .fallback)
     }
 
     /// Nothing audible on the second clip either, but the first one played,

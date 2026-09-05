@@ -14,7 +14,8 @@ enum ClipPlayback: Sendable {
     case completed
     /// Became audible and was cut short: a stop, or a decode error mid-clip.
     case interrupted
-    /// Never became audible: the data would not decode, or `play()` refused.
+    /// Never became audible: the data would not decode, `play()` refused, or
+    /// a Stop had already made this player terminal.
     case neverStarted
 }
 
@@ -28,17 +29,62 @@ protocol FallbackClipPlaying: AnyObject, Sendable {
     func stop()
 }
 
+/// What the clip lifecycle actually does with a decoded clip. Extracted so the
+/// stop/start handoff can be driven deterministically without an audio device
+/// (issue #65); in production this is always `AVAudioPlayer`.
+protocol PlayableClip: AnyObject {
+    var isPlaying: Bool { get }
+    /// Begin playback; `false` means it could not start.
+    func startPlaying() -> Bool
+    func stopPlaying()
+}
+
+extension AVAudioPlayer: PlayableClip {
+    func startPlaying() -> Bool { play() }
+    func stopPlaying() { stop() }
+}
+
+/// Decodes `data` into a clip ready to start, reporting completion to
+/// `delegate`. Everything device-facing lives behind this.
+typealias ClipFactory =
+    @Sendable (_ data: Data, _ delegate: AVAudioPlayerDelegate) throws -> PlayableClip
+
 /// Plays a whole TTS clip returned by `POST /api/audio/speak` as a data URL.
+///
+/// Single-use, and terminal after `stop()`: both callers mint one of these per
+/// clip and can be interrupted on the actor hop that reaches `play`, so a Stop
+/// that lands before the clip is even built has to stay decided (issue #65).
 final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
     @unchecked Sendable
 {
-    private let lock = NSLock()
-    private var player: AVAudioPlayer?
+    /// Recursive because the start now runs under this lock: a clip that
+    /// reported completion synchronously from `startPlaying()` would re-enter
+    /// `finish` on the same thread and deadlock a non-recursive lock. On the
+    /// reentrant path `player` and `finishContinuation` are already published,
+    /// so `finish` resolves once and the outer `play` merely unlocks (#65).
+    /// `began` deliberately is *not* published yet on that path — nothing was
+    /// audible, so a synchronous failure has to read it as false (#69).
+    private let lock = NSRecursiveLock()
+    private var player: PlayableClip?
     private var finishContinuation: CheckedContinuation<ClipPlayback, Never>?
-    /// Latched where the distinction is actually known: `AVAudioPlayer.play()`
+    private let makeClip: ClipFactory
+    /// Set by `stop()` and never cleared. Guards the window in which this
+    /// player exists but `play` has not run yet.
+    private var stopped = false
+    /// Latched where the distinction is actually known: `startPlaying()`
     /// returning true is the moment the clip became audible. Everything after
-    /// that is an interruption, not a failure to start.
+    /// that is an interruption, not a failure to start. Only ever read under
+    /// the lock, and only ever set while the start still holds it.
     private var began = false
+
+    override convenience init() {
+        self.init(makeClip: FallbackClipPlayer.makeAudioPlayerClip)
+    }
+
+    init(makeClip: @escaping ClipFactory) {
+        self.makeClip = makeClip
+        super.init()
+    }
 
     var isPlaying: Bool {
         lock.lock()
@@ -50,31 +96,45 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
     func play(data: Data) async -> ClipPlayback {
         await withCheckedContinuation { continuation in
             lock.lock()
-            began = false
+            // A Stop that arrived before the clip was built stays decided:
+            // the caller has already been told this clip is cancelled, and
+            // finally reaching `play` must not undo that. Nothing was ever
+            // audible, so this is `neverStarted` rather than an interruption.
+            guard !stopped else {
+                lock.unlock()
+                continuation.resume(returning: .neverStarted)
+                return
+            }
             do {
-                let player = try AVAudioPlayer(data: data)
-                #if os(macOS)
-                    // Honor the selected output; only pass UIDs that resolve
-                    // to a live device — a stale UID would fail playback.
-                    if let uid = AudioDevicePreference.outputUID,
-                        MacAudioDevices.resolve(uid: uid) != nil
-                    {
-                        player.currentDevice = uid
-                    }
-                #endif
-                player.delegate = self
+                let player = try makeClip(data, self)
                 self.player = player
                 self.finishContinuation = continuation
-                // Latched before `play()` rather than after: the delegate
-                // can fire the moment playback ends, and a clip short enough
-                // to finish inside that window would otherwise be reported as
-                // never having started.
-                began = true
+                // Started under the same lock that publishes it, so a Stop
+                // cannot land in between: it either arrives first and is
+                // refused above, or waits here and stops a clip that really
+                // did start.
+                let started = player.startPlaying()
+                // Latched only on a successful start, and only after the call
+                // returns. Serializing the start under the lock is what makes
+                // this safe and what makes it necessary (#65 + #69):
+                //
+                //  - An asynchronous completion runs `finish` on another
+                //    thread, which blocks on this same lock until the latch is
+                //    published, so it can never read a stale `false`. That is
+                //    the race that forced the latch *before* the start while
+                //    `play` still unlocked first.
+                //  - A clip that completes synchronously from `startPlaying()`
+                //    re-enters `finish` on this thread with `began` still
+                //    false, so a synchronous failure resolves `neverStarted`
+                //    rather than claiming the user heard something. Latching
+                //    first would reintroduce the #69 defect on that path.
+                //
+                // Setting it afterwards on an already-resolved continuation is
+                // harmless: the player is single-use and terminal.
+                if started { began = true }
                 lock.unlock()
-                if !player.play() {
-                    lock.lock()
-                    began = false
-                    lock.unlock()
+                if !started {
+                    // A no-op when a synchronous completion already resolved.
                     finish(success: false)
                 }
             } catch {
@@ -84,12 +144,34 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
         }
     }
 
+    /// Stop playback and make this player terminal: any later `play` resolves
+    /// `neverStarted` without starting anything.
     func stop() {
         lock.lock()
+        stopped = true
         let player = player
         lock.unlock()
-        player?.stop()
+        player?.stopPlaying()
         finish(success: false)
+    }
+
+    /// Production clip: an `AVAudioPlayer` decoded from the whole clip and
+    /// routed to the selected output, not yet started.
+    private static func makeAudioPlayerClip(
+        data: Data, delegate: AVAudioPlayerDelegate
+    ) throws -> PlayableClip {
+        let player = try AVAudioPlayer(data: data)
+        #if os(macOS)
+            // Honor the selected output; only pass UIDs that resolve
+            // to a live device — a stale UID would fail playback.
+            if let uid = AudioDevicePreference.outputUID,
+                MacAudioDevices.resolve(uid: uid) != nil
+            {
+                player.currentDevice = uid
+            }
+        #endif
+        player.delegate = delegate
+        return player
     }
 
     private func finish(success: Bool) {
