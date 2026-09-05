@@ -7,8 +7,7 @@ import SwiftUI
 /// a sign-in prompt.
 struct ConnectView: View {
     @Environment(AppModel.self) private var model
-    @State private var serverInput = ""
-    @State private var tokenInput = ""
+    @State private var form = ConnectFormState()
     @State private var usernameInput = ""
     @State private var passwordInput = ""
     @State private var connecting = false
@@ -84,12 +83,22 @@ struct ConnectView: View {
         }
     }
 
+    /// `ConnectFormState` owns the token/endpoint rules (issue #54); the
+    /// fields drive it rather than mutating the two strings independently.
+    private var serverBinding: Binding<String> {
+        Binding(get: { form.serverInput }, set: { form.setServerInput($0) })
+    }
+
+    private var tokenBinding: Binding<String> {
+        Binding(get: { form.token }, set: { form.setToken($0) })
+    }
+
     private var serverForm: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Server").font(.headline)
             TextField(
                 "127.0.0.1:8080 or paste the dashboard URL",
-                text: $serverInput
+                text: serverBinding
             )
             .textFieldStyle(.roundedBorder)
             .autocorrectionDisabled()
@@ -97,17 +106,9 @@ struct ConnectView: View {
                 .textInputAutocapitalization(.never)
                 .keyboardType(.URL)
             #endif
-            .onChange(of: serverInput) { _, newValue in
-                // Lift an embedded ?token= into the token field.
-                if let parsed = try? ServerEndpoint.parse(newValue),
-                    let token = parsed.embeddedToken
-                {
-                    tokenInput = token
-                }
-            }
 
             Text("Session token").font(.headline)
-            SecureField("auto-filled from a pasted dashboard URL", text: $tokenInput)
+            SecureField("auto-filled from a pasted dashboard URL", text: tokenBinding)
                 .textFieldStyle(.roundedBorder)
             Text("Gated servers with a username & password skip this — just Connect.")
                 .font(.caption)
@@ -128,7 +129,7 @@ struct ConnectView: View {
             Button {
                 connecting = true
                 Task {
-                    await model.connect(input: serverInput, token: tokenInput)
+                    await model.connect(input: form.serverInput, token: form.token)
                     connecting = false
                 }
             } label: {
@@ -139,7 +140,7 @@ struct ConnectView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(serverInput.isEmpty || connecting)
+            .disabled(form.serverInput.isEmpty || connecting)
         }
         .frame(maxWidth: 420)
     }
