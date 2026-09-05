@@ -148,6 +148,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     public func end() async {
         enabled = false
         lifetimeEpoch += 1
+        awaitingSpokenResponse = false
         pendingStart = false
         stopRequested = false
         clearTurnTimeout()
@@ -349,7 +350,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                 try? await clock.sleep(
                     for: VoiceConstants.thinkingChimeInterval, tolerance: nil)
                 guard !Task.isCancelled else { return }
-                guard await self.thinkingChimeTicked(generation: generation) else { return }
+                guard self.thinkingChimeTicked(generation: generation) else { return }
             }
         }
     }
@@ -450,6 +451,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         do {
             try await agent.submit(text: trimmed, interrupted: consumeInterruptedLatch())
         } catch {
+            guard epoch == lifetimeEpoch else { return }
             callbacks.onNotice("Send failed: \(error.localizedDescription)")
             awaitingSpokenResponse = false
             if enabled, !micBlocked { pendingStart = true }
@@ -457,6 +459,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             await drive()
             return
         }
+        guard epoch == lifetimeEpoch else { return }
         setStatus(.thinking)
         await drive()
     }
@@ -469,6 +472,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     // MARK: Drive loop (the desktop's effect)
 
     private func drive() async {
+        guard enabled else { return }
         if awaitingSpokenResponse, status != .speaking {
             if status == .thinking {
                 let busy = await agent.isBusy
@@ -805,12 +809,24 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             transcript = try await transcriber.transcribe(utterance)
         } catch {
             guard epoch == lifetimeEpoch else { return }
+            if consumeStopRequest() {
+                setStatus(.idle)
+                await drive()
+                return
+            }
             callbacks.onNotice("Transcription failed: \(error.localizedDescription)")
             resumeListening()
             await drive()
             return
         }
         guard epoch == lifetimeEpoch else { return }
+        // A stopped recording is void before interpreting its words or
+        // reporting errors, just like the normal turn-close path.
+        if consumeStopRequest() {
+            setStatus(.idle)
+            await drive()
+            return
+        }
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             resumeListening()
@@ -854,12 +870,14 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         do {
             try await agent.submit(text: trimmed, interrupted: consumeInterruptedLatch())
         } catch {
+            guard epoch == lifetimeEpoch else { return }
             callbacks.onNotice("Send failed: \(error.localizedDescription)")
             awaitingSpokenResponse = false
             resumeListening()
             await drive()
             return
         }
+        guard epoch == lifetimeEpoch else { return }
         setStatus(.thinking)
         await drive()
     }

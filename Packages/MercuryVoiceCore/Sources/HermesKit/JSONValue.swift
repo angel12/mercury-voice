@@ -43,10 +43,8 @@ extension JSONValue: Codable {
         case .number(let value):
             // Emit integral numbers without a fractional part so ids like
             // {"id": 1} round-trip in the shape the server sent them.
-            if value.truncatingRemainder(dividingBy: 1) == 0,
-                value >= Double(Int64.min), value <= Double(Int64.max)
-            {
-                try container.encode(Int64(value))
+            if let integer = Int64(exactly: value) {
+                try container.encode(integer)
             } else {
                 try container.encode(value)
             }
@@ -85,8 +83,8 @@ extension JSONValue {
         // An unchecked `Int(Double)` traps on out-of-range values, and every
         // number here is server-controlled (ids, expires_at, contract
         // versions), so `{"id": 1e19}` from a buggy or hostile gateway would
-        // crash the app rather than fail to decode. The encoder already
-        // bounds-checks the mirror-image conversion below.
+        // crash the app rather than fail to decode. The encoder uses the
+        // same exact-conversion check for Int64.
         if case .number(let value) = self { return Int(exactly: value) }
         return nil
     }

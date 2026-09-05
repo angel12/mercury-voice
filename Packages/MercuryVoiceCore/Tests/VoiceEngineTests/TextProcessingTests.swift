@@ -5,6 +5,14 @@ import Testing
 
 @Suite("Stop words")
 struct StopWordTests {
+    @Test(arguments: [
+        "stop\nlistening", "hey\thermes stop", "\nplease\r\nstop\t", "stop\u{00A0}please",
+    ])
+    func stopPhrasesNormalizeAllWhitespace(phrase: String) {
+        #expect(StopWords.isStopCommand(phrase))
+        #expect(!StopWords.isStopCommand("stop\nthe docker container"))
+    }
+
     @Test func matchesBareStopPhrases() {
         #expect(StopWords.isStopCommand("stop"))
         #expect(StopWords.isStopCommand("Stop."))

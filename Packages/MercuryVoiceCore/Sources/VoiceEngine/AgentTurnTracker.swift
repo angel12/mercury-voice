@@ -108,7 +108,9 @@ public actor AgentTurnTracker: AgentInterfacing {
 
         case GatewayEvent.Kind.error:
             // Defensive unwedge: a dead turn must not leave the loop stuck
-            // in thinking forever.
+            // in thinking forever. Seal partial text too, so speech can
+            // finish and the next turn cannot extend a consumed bubble.
+            sealOpenBubble(finalText: nil)
             busy = false
 
         default:

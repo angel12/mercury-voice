@@ -102,4 +102,17 @@ struct AgentTurnTrackerTests {
         await tracker.handle(event: event("error", #"{"message": "boom"}"#))
         #expect(await !tracker.isBusy)
     }
+
+    @Test func errorSealsPartialReplyAndSeparatesTheNextTurn() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Partial reply"}"#))
+        await tracker.handle(event: event("error", #"{"message": "boom"}"#))
+        #expect(await tracker.pendingSpeech()?.pending == false)
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(event: event("message.delta", #"{"text": "Next reply"}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Next reply")
+        #expect(await tracker.visibleAssistantText == "Partial reply\n\nNext reply")
+    }
 }

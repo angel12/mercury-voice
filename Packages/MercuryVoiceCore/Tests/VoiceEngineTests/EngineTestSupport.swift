@@ -42,13 +42,17 @@ final class TestClock: Clock, @unchecked Sendable {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<Void, any Error>) in
-                let immediate: Bool = locked {
-                    if deadline.offset <= currentNow.offset { return true }
+                let immediate: Result<Void, any Error>? = locked {
+                    // Cancellation can run before this continuation exists.
+                    // Check under the same lock used by onCancel so it cannot
+                    // slip between this check and sleeper registration.
+                    if Task.isCancelled { return .failure(CancellationError()) }
+                    if deadline.offset <= currentNow.offset { return .success(()) }
                     sleepers.append(
                         Sleeper(id: id, deadline: deadline, continuation: continuation))
-                    return false
+                    return nil
                 }
-                if immediate { continuation.resume() }
+                if let immediate { continuation.resume(with: immediate) }
             }
         } onCancel: {
             let cancelled: Sleeper? = locked {
@@ -85,10 +89,10 @@ final class FakeRecorder: VoiceRecording, @unchecked Sendable {
     private var _nextResult: RecordedUtterance?
     private var _startError: (any Error)?
 
-    private func locked<T>(_ body: () -> T) -> T {
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
         defer { lock.unlock() }
-        return body()
+        return try body()
     }
 
     var startCount: Int { locked { _startCount } }
@@ -124,12 +128,6 @@ final class FakeRecorder: VoiceRecording, @unchecked Sendable {
     func fireAutoStop() {
         let handler = locked { _onAutoStop }
         handler?()
-    }
-
-    private func locked<T>(_ body: () throws -> T) rethrows -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body()
     }
 }
 

@@ -119,6 +119,21 @@ struct DirectVoiceRequestTests {
             DirectVoiceClient.parseSTTResponse(wire: .elevenLabs, data: Data("junk".utf8)) == "")
     }
 
+    @Test(arguments: ["stop", "", " hello world "])
+    func openAICompatibleJSONTranscriptUsesText(text: String) throws {
+        let data = try JSONEncoder().encode(["text": text])
+        #expect(
+            DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: data)
+                == text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    @Test(arguments: ["plain words", "{unfinished", "{\"unrelated\":true}"])
+    func openAITextWithoutTranscriptFieldIsPreserved(text: String) {
+        #expect(
+            DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: Data(text.utf8))
+                == text)
+    }
+
     @Test func openAISpeechRequest() throws {
         let config = try #require(
             DirectTTSConfig(

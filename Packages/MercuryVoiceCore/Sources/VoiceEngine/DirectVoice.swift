@@ -133,7 +133,7 @@ public struct DirectVoiceClient: Sendable {
         case .openAIMultipart:
             path = "/audio/transcriptions"
             if let model = config.model { fields.append(("model", model)) }
-            // Plain-text response — no JSON parse can miss the transcript.
+            // Request plain text; some compatible providers still return JSON.
             fields.append(("response_format", "text"))
             if let language = config.language { fields.append(("language", language)) }
         case .xai:
@@ -167,14 +167,16 @@ public struct DirectVoiceClient: Sendable {
     }
 
     static func parseSTTResponse(wire: DirectSTTConfig.Wire, data: Data) -> String {
+        let json = try? JSONDecoder().decode(JSONValue.self, from: data)
+        if let text = json?["text"]?.stringValue {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         switch wire {
         case .openAIMultipart:
             return (String(data: data, encoding: .utf8) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         case .xai, .elevenLabs:
-            let json = try? JSONDecoder().decode(JSONValue.self, from: data)
-            return (json?["text"]?.stringValue ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ""
         }
     }
 
