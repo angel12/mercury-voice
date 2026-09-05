@@ -52,19 +52,20 @@ private final class GatedEngineFactory: @unchecked Sendable {
 
     /// Run `body` inside the next build, once.
     func onNextBuild(_ body: @escaping @Sendable () -> Void) { locked { _duringBuild = body } }
-    /// Fail the next build, once, as a dead route would.
+    /// Fail the next build, once, as a dead route would. Checked *after* the
+    /// hook, so a hook can fail the very build it is running inside.
     func failNextBuild(_ error: Error) { locked { _failure = error } }
 
     var make: CaptureEngineFactory {
         { [self] _ in
-            if let failure = locked({ defer { _failure = nil }; return _failure }) { throw failure }
-            let engine = FakeCaptureEngine()
-            locked { _built.append(engine) }
             let hook = locked { () -> (@Sendable () -> Void)? in
                 defer { _duringBuild = nil }
                 return _duringBuild
             }
             hook?()
+            if let failure = locked({ defer { _failure = nil }; return _failure }) { throw failure }
+            let engine = FakeCaptureEngine()
+            locked { _built.append(engine) }
             return engine
         }
     }
@@ -139,6 +140,158 @@ struct AudioCaptureLifecycleTests {
         #expect(factory.built[0].isRunning == true)
         service.closeStream(try #require(second.current))
         #expect(factory.built[0].isRunning == false)
+    }
+
+    // MARK: R11 — a build's failure is news about its own generation only
+
+    @Test func anObsoleteBuildFailureReconcilesInsteadOfGivingUp() throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+        let (id, _) = try service.openStream()
+
+        // The route moves again while the rebuild's engine is starting, and
+        // then that start fails. The failure describes a route that has
+        // already been abandoned, so the rebuild that superseded it still has
+        // to happen.
+        factory.onNextBuild {
+            service.reconfigure()
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+        }
+        service.reconfigure()
+
+        try #require(factory.buildCount == 2)
+        #expect(factory.built[1].isRunning == true)
+
+        service.closeStream(id)
+        #expect(factory.built[1].isRunning == false)
+    }
+
+    @Test func anObsoleteBuildFailureDoesNotEndNewerConsumers() throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+        let (first, _) = try service.openStream()
+        let second = Box<UUID?>(nil)
+
+        // A consumer that attaches *after* the invalidation belongs to the new
+        // generation; the doomed build's failure is not about it.
+        factory.onNextBuild {
+            service.reconfigure()
+            second.set(try? service.openStream().id)
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+        }
+        service.reconfigure()
+
+        try #require(factory.buildCount == 2)
+        let published = factory.built[1]
+        #expect(published.isRunning == true)
+
+        // Both are still attached: only closing the last one stops the engine.
+        service.closeStream(first)
+        #expect(published.isRunning == true)
+        service.closeStream(try #require(second.current))
+        #expect(published.isRunning == false)
+    }
+
+    @Test func theBuildClaimSurvivesAnObsoleteFailureSoTheRetryStaysSingleOwner() throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+        let (first, _) = try service.openStream()
+        let second = Box<UUID?>(nil)
+
+        factory.onNextBuild {
+            service.reconfigure()
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+            // A consumer arriving inside the *retry* has to adopt it, which
+            // only holds while the loop still owns the build claim across the
+            // obsolete failure.
+            factory.onNextBuild {
+                second.set(try? service.openStream().id)
+            }
+        }
+        service.reconfigure()
+
+        // The first engine and the retry's -- no third started alongside it.
+        try #require(factory.buildCount == 2)
+        #expect(factory.built[1].isRunning == true)
+
+        service.closeStream(first)
+        #expect(factory.built[1].isRunning == true)
+        service.closeStream(try #require(second.current))
+        #expect(factory.built[1].isRunning == false)
+    }
+
+    @Test func closingEveryConsumerDuringAnObsoleteFailingBuildStopsWithoutRebuilding() throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+        let (id, _) = try service.openStream()
+
+        factory.onNextBuild {
+            service.reconfigure()
+            service.closeStream(id)
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+        }
+        service.reconfigure()
+
+        // Reconciling an obsolete failure must not mean retrying forever.
+        #expect(factory.buildCount == 1)
+        #expect(factory.built[0].isRunning == false)
+
+        // ...and the build claim was still released.
+        let (again, _) = try service.openStream()
+        #expect(factory.buildCount == 2)
+        service.closeStream(again)
+    }
+
+    @Test func anObsoleteFailureInsideACallersOwnBuildDoesNotSurfaceToThatCaller() throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+
+        // openStream's own build is superseded while it runs and then fails.
+        // The retry succeeds, so the caller gets a working stream rather than
+        // an error about a route that had already been abandoned.
+        factory.onNextBuild {
+            service.reconfigure()
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+        }
+        let (id, _) = try service.openStream()
+
+        try #require(factory.buildCount == 1)
+        #expect(factory.built[0].isRunning == true)
+
+        // The stream really is the published engine's: closing it stops that
+        // engine, which only holds if the caller is its attached consumer.
+        service.closeStream(id)
+        #expect(factory.built[0].isRunning == false)
+    }
+
+    @Test func aCurrentGenerationFailureFinishesEvenAConsumerThatJoinedTheBuild() async throws {
+        let factory = GatedEngineFactory()
+        let service = AudioCaptureService(makeEngine: factory.make)
+        let joiner = Box<AsyncStream<AudioChunk>?>(nil)
+
+        // Nothing invalidates this build, so its failure really is the current
+        // generation's news and ends every turn attached to it.
+        factory.onNextBuild {
+            joiner.set(try? service.openStream().stream)
+            factory.failNextBuild(MercuryAudioError.noInputDevice)
+        }
+        #expect(throws: MercuryAudioError.self) { try service.openStream() }
+        #expect(factory.buildCount == 0)
+
+        // Bounded rather than a bare drain: a stream left attached has to fail
+        // this test, not hang it.
+        let stream = try #require(joiner.current)
+        let finished = Box<Bool>(false)
+        let pump = Task {
+            for await _ in stream {}
+            finished.set(true)
+        }
+        #expect(await eventually { finished.current })
+        pump.cancel()
+
+        let (id, _) = try service.openStream()
+        #expect(factory.buildCount == 1)
+        service.closeStream(id)
     }
 
     // MARK: Preserved lifecycle behaviour

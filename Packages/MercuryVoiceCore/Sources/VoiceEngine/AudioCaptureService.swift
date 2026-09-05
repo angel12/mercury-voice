@@ -130,6 +130,17 @@ public final class AudioCaptureService: AudioCaptureStreaming, @unchecked Sendab
     }
 
     #if os(iOS)
+        /// Known limitation (issue #64): the `engine != nil` guard is false for
+        /// the whole of a build, so a real input switch that lands inside one
+        /// is not seen here and does not supersede it. `reconfigure()`,
+        /// `ensureRunning()` and the interruption observer all reach
+        /// `restartEngineIfRunning()` and advance the generation whether or not
+        /// an engine is published; this path does not. The build then publishes
+        /// on the old route while `engineInputUID` records the *new* one, read
+        /// after the engine started, so the next notification sees no change.
+        /// Base behaves identically. Loosening the guard would reintroduce the
+        /// voice-processing route churn described above, so it needs its own
+        /// reproduction and design rather than a change here.
         private func restartIfInputRouteChanged() {
             let currentUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
             lock.lock()
@@ -241,9 +252,10 @@ public final class AudioCaptureService: AudioCaptureStreaming, @unchecked Sendab
     ///
     /// The caller claims the build by setting `building` under the lock; this
     /// method always clears it.
-    /// - Throws: the build failure, after finishing every consumer stream so
-    ///   callers end their turn instead of waiting on a microphone that never
-    ///   starts.
+    /// - Throws: a *current* build's failure, after finishing every consumer
+    ///   stream so callers end their turn instead of waiting on a microphone
+    ///   that never starts. A superseded build's failure is not thrown: it is
+    ///   reconciled like any other supersession.
     private func buildUntilPublished() throws {
         while true {
             lock.lock()
@@ -260,13 +272,25 @@ public final class AudioCaptureService: AudioCaptureStreaming, @unchecked Sendab
                 }
             } catch {
                 lock.lock()
-                building = false
-                let continuations = Array(streams.values)
-                streams.removeAll()
+                // A failure is evidence about the generation it was building
+                // for and about no other. If a rebuild was requested while
+                // this one ran, the failure describes a route nobody wants
+                // any more: keep the consumers, hold the build claim, and
+                // reconcile again -- the same answer the discard path gives a
+                // superseded engine that succeeded. Only a failure that is
+                // still current ends the attached turns.
+                let obsolete = generation != generationAtStart
+                let continuations = obsolete ? [] : Array(streams.values)
+                if !obsolete {
+                    building = false
+                    streams.removeAll()
+                }
                 lock.unlock()
+
                 for continuation in continuations {
                     continuation.finish()
                 }
+                if obsolete { continue }
                 throw error
             }
 
