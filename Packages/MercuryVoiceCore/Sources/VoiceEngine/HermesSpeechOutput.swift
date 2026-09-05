@@ -84,9 +84,9 @@ public actor HermesSpeechOutput: SpeechPlaying {
 
         let player = makeFallbackPlayer()
         fallback = player
-        let finished = await player.play(data: data)
+        let playback = await player.play(data: data)
         if fallback === player { fallback = nil }
-        return finished
+        return playback == .completed
     }
 
     public func stopPlayback() async {

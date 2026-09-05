@@ -440,9 +440,9 @@ final class RecordingClipPlayer: FallbackClipPlaying, @unchecked Sendable {
     var stopCount: Int { locked { _stopCount } }
     var isPlaying: Bool { false }
 
-    func play(data: Data) async -> Bool {
+    func play(data: Data) async -> ClipPlayback {
         locked { _plays.append(data) }
-        return true
+        return .completed
     }
 
     func stop() {

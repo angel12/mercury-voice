@@ -463,15 +463,18 @@ public actor DirectSpeechSession: SpeechStreaming {
             }
             if outcome != nil { break }
 
-            started = true
             let clip = makePlayer()
             player = clip
-            let playedThrough = await clip.play(data: bytes)
+            let playback = await clip.play(data: bytes)
             if player === clip { player = nil }
-            if !playedThrough, outcome == nil {
+            // `started` is the outcome contract's "was anything audible",
+            // so it is set by playback beginning, not by attempting it
+            // (issue #69). An unplayable first clip must still fall back.
+            if playback != .neverStarted { started = true }
+            if playback != .completed, outcome == nil {
                 // Decode/route failure mid-reply (a stop settles first and
                 // never reaches here) — keep what played, don't restart.
-                settle(.done)
+                settle(started ? .done : .fallback)
                 break
             }
         }
