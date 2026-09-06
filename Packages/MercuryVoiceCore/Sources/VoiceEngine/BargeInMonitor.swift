@@ -22,6 +22,9 @@ public actor BargeInMonitor: BargeMonitoring {
     /// Testable hook: when true, `setSuspended(true)` closes the capture
     /// stream instead of only discarding samples (issue #40).
     let detachCaptureOnSuspend: Bool
+    /// Test-only: quiet-phase pre-roll after each bound, so a test can
+    /// observe an oversized append before a later hop repairs a skipped trim.
+    private let onQuietPreRoll: (@Sendable ([Float]) -> Void)?
 
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
@@ -31,11 +34,17 @@ public actor BargeInMonitor: BargeMonitoring {
         self.capture = capture
         self.detachCaptureOnSuspend = shouldDetachBargeCaptureWhileMuted(
             isIOS: bargeMuteRunsOnIOS)
+        self.onQuietPreRoll = nil
     }
 
-    init(capture: any AudioCaptureStreaming, detachCaptureOnSuspend: Bool) {
+    init(
+        capture: any AudioCaptureStreaming,
+        detachCaptureOnSuspend: Bool,
+        onQuietPreRoll: (@Sendable ([Float]) -> Void)? = nil
+    ) {
         self.capture = capture
         self.detachCaptureOnSuspend = detachCaptureOnSuspend
+        self.onQuietPreRoll = onQuietPreRoll
     }
 
     public func start(
@@ -150,6 +159,7 @@ public actor BargeInMonitor: BargeMonitoring {
                 if preRoll.count > maxPreRoll {
                     preRoll.removeFirst(preRoll.count - maxPreRoll)
                 }
+                onQuietPreRoll?(preRoll)
 
             case .tripped:
                 tripped = true
