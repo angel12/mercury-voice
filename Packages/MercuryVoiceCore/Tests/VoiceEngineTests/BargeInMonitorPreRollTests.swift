@@ -116,11 +116,9 @@ private func withMonitorScope(_ body: (MonitorScope) async throws -> Void) async
 
 // MARK: - Chunk timeline
 
-/// Same 125 ms hop as the stale-run tests: exact binary fraction, so the
-/// detector's 300 ms window does not round-trip over the fill threshold.
-private let testRate: Double = 16000
-private let hopSamples = 2000
-private let hopSeconds = Double(hopSamples) / testRate
+/// Detector hop used for speech and endpointing. 125 ms is an exact binary
+/// fraction, so the 300 ms sustained window fills in three hops.
+private let speechHopSeconds = 0.125
 
 /// Echo amplitude whose normalized RMS is 0.3 — above `bargeMinTriggerLevel`
 /// (0.075) so the old loudness-gated trim refuses to rotate, but below the
@@ -129,25 +127,42 @@ private let echoLevel = 0.3
 private let echoAmplitude = Float(echoLevel * VoiceConstants.rmsNormalizationDivisor)
 private let speechAmplitude: Float = 0.5
 
-private func echoChunk(sign: Float, samples: Int = hopSamples) -> AudioChunk {
+/// Echo long enough that an unbounded pre-roll is obviously past the 5.5 s
+/// cap. Early audio uses +echo, recent audio uses −echo, so the next
+/// interruption can be checked for contamination vs. the trailing window.
+private let earlyEchoSeconds = 8.0
+private let recentEchoSeconds = 6.0
+
+/// Counts are at `WAVEncoder.targetSampleRate` (16 kHz). The monitor may
+/// lock a different capture rate; encode always resamples to this output.
+///
+/// Constructed 16 kHz / 125 ms timeline:
+/// - 5.25 s of recent −echo inside the 5.5 s ring (two 125 ms onset hops
+///   occupy the other 0.25 s) → 84,000 samples
+/// - three 125 ms speech hops (two onset + trip) → 6,000 samples
+/// - 0 early +echo
+/// - full utterance 7.125 s → 114,000 samples (ring + trip hop + 1.375 s
+///   endpoint gap + captureEnded hop)
+private let expectedRecentEchoSamples = 84_000
+private let expectedSpeechSamples = 6_000
+private let expectedEarlyEchoSamples = 0
+private let expectedDurationSeconds = 7.125
+private let expectedWAVSamples = 114_000
+
+private func sampleCount(seconds: Double, rate: Double) -> Int {
+    Int((seconds * rate).rounded())
+}
+
+private func chunk(amplitude: Float, seconds: Double, rate: Double) -> AudioChunk {
     AudioChunk(
-        samples: [Float](repeating: sign * echoAmplitude, count: samples),
-        sampleRate: testRate)
+        samples: [Float](repeating: amplitude, count: sampleCount(seconds: seconds, rate: rate)),
+        sampleRate: rate)
 }
 
-private func speechChunk() -> AudioChunk {
-    AudioChunk(
-        samples: [Float](repeating: speechAmplitude, count: hopSamples),
-        sampleRate: testRate)
-}
-
-private func quietChunk(samples: Int = hopSamples) -> AudioChunk {
-    AudioChunk(samples: [Float](repeating: 0, count: samples), sampleRate: testRate)
-}
-
-private func endOfTurnGapChunk() -> AudioChunk {
-    let hops = ((TurnSilencePreference.seconds + hopSeconds) / hopSeconds).rounded(.up)
-    return quietChunk(samples: Int(hops) * hopSamples)
+private func endOfTurnGapChunk(rate: Double) -> AudioChunk {
+    let hops = ((TurnSilencePreference.seconds + speechHopSeconds) / speechHopSeconds)
+        .rounded(.up)
+    return chunk(amplitude: 0, seconds: hops * speechHopSeconds, rate: rate)
 }
 
 @discardableResult
@@ -171,105 +186,116 @@ private func matchesAmplitude(_ sample: Int16, _ amplitude: Float) -> Bool {
     return abs(Int(sample) - Int(expected)) <= 2
 }
 
-/// Echo long enough that an unbounded pre-roll is obviously past the 5.5 s
-/// cap. Early hops use +echo, recent hops use −echo, so the next interruption
-/// can be checked for contamination vs. the trailing window.
-private let earlyEchoHops = 64  // 8.0 s
-private let recentEchoHops = 48  // 6.0 s
-
-private var maxRetainedSeconds: Double {
-    (VoiceConstants.bargePreRollRestart + VoiceConstants.bargePreRollOnsetAllowance)
-        .asSeconds
+private func expectExactRetainedWindow(_ utterance: RecordedUtterance) {
+    #expect(utterance.heardSpeech)
+    #expect(utterance.duration.asSeconds == expectedDurationSeconds)
+    let pcm = pcm16Samples(utterance.audio)
+    #expect(pcm.count == expectedWAVSamples)
+    #expect(pcm.filter { matchesAmplitude($0, echoAmplitude) }.count == expectedEarlyEchoSamples)
+    #expect(pcm.filter { matchesAmplitude($0, -echoAmplitude) }.count == expectedRecentEchoSamples)
+    #expect(pcm.filter { matchesAmplitude($0, speechAmplitude) }.count == expectedSpeechSamples)
 }
 
-/// Post-trip audio the bound does not cover: the tripping hop plus the
-/// endpointing silence. Slack is one extra hop.
-private var postTripSlackSeconds: Double {
-    hopSeconds + TurnSilencePreference.seconds + hopSeconds + hopSeconds
+private func captureAfterSustainedEcho(
+    sampleRate: Double,
+    echoHopSeconds: Double,
+    oversizedEarlyEcho: Bool,
+    scope: MonitorScope
+) async throws -> RecordedUtterance {
+    let capture = FakeAudioCapture()
+    let gate = scope.gate()
+    let calls = BargeCallbacks()
+    let monitor = scope.monitor(capture: capture)
+    try await monitor.start(
+        isPlaying: { await gate.probe() },
+        onSpeech: { calls.speech() },
+        onUtterance: { calls.utterance($0) })
+
+    if oversizedEarlyEcho {
+        #expect(earlyEchoSeconds > 5.5)
+        #expect(
+            await feed(
+                chunk(amplitude: echoAmplitude, seconds: earlyEchoSeconds, rate: sampleRate),
+                capture, gate))
+    } else {
+        let hops = sampleCount(seconds: earlyEchoSeconds, rate: 1 / echoHopSeconds)
+        for _ in 0..<hops {
+            #expect(
+                await feed(
+                    chunk(amplitude: echoAmplitude, seconds: echoHopSeconds, rate: sampleRate),
+                    capture, gate))
+        }
+    }
+    let recentHops = sampleCount(seconds: recentEchoSeconds, rate: 1 / echoHopSeconds)
+    for _ in 0..<recentHops {
+        #expect(
+            await feed(
+                chunk(amplitude: -echoAmplitude, seconds: echoHopSeconds, rate: sampleRate),
+                capture, gate))
+    }
+    // Two loud hops fill the 300 ms window; the third trips.
+    for _ in 0..<3 {
+        #expect(
+            await feed(
+                chunk(amplitude: speechAmplitude, seconds: speechHopSeconds, rate: sampleRate),
+                capture, gate))
+    }
+    #expect(await eventually { calls.speechCount == 1 })
+    #expect(await feed(endOfTurnGapChunk(rate: sampleRate), capture, gate))
+    #expect(
+        await feed(chunk(amplitude: 0, seconds: speechHopSeconds, rate: sampleRate), capture, gate))
+    #expect(await eventually { calls.utterances.count == 1 })
+    return try #require(calls.utterances.first ?? nil)
 }
 
 @Suite("BargeInMonitor pre-roll bound")
 struct BargeInMonitorPreRollTests {
 
+    @Test func preRollCapIsFiveSecondsPlusNamedOnsetAllowance() {
+        #expect(VoiceConstants.bargePreRollRestart == .seconds(5))
+        #expect(VoiceConstants.bargePreRollOnsetAllowance == .milliseconds(500))
+        #expect(
+            sampleCount(seconds: expectedDurationSeconds, rate: WAVEncoder.targetSampleRate)
+                == expectedWAVSamples)
+    }
+
     /// Issue #70: sustained playback echo sits above the static 0.075 floor
     /// and never trips, so a loudness-gated trim never fires and the next
-    /// interruption would swallow the whole reply.
-    @Test func sustainedNontrippingEchoDoesNotGrowPreRollPastTheBound() async throws {
+    /// interruption would swallow the whole reply. The captured PCM must be
+    /// the exact 5.5 s trailing window plus post-trip audio — not merely
+    /// "shorter than unbounded" and "some recent samples present."
+    @Test func interruptionAfterSustainedEchoKeepsExactRetainedWindow() async throws {
         try await withMonitorScope { scope in
-            let capture = FakeAudioCapture()
-            let gate = scope.gate()
-            let calls = BargeCallbacks()
-            let monitor = scope.monitor(capture: capture)
-            try await monitor.start(
-                isPlaying: { await gate.probe() },
-                onSpeech: { calls.speech() },
-                onUtterance: { calls.utterance($0) })
-
-            for _ in 0..<earlyEchoHops {
-                #expect(await feed(echoChunk(sign: 1), capture, gate))
-            }
-            for _ in 0..<recentEchoHops {
-                #expect(await feed(echoChunk(sign: -1), capture, gate))
-            }
-            // Two loud hops fill the 300 ms window; the third trips.
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await eventually { calls.speechCount == 1 })
-
-            #expect(await feed(endOfTurnGapChunk(), capture, gate))
-            #expect(await feed(quietChunk(), capture, gate))
-            #expect(await eventually { calls.utterances.count == 1 })
-
-            let utterance = try #require(calls.utterances.first ?? nil)
-            #expect(utterance.heardSpeech)
-            let duration = utterance.duration.asSeconds
-            #expect(duration <= maxRetainedSeconds + postTripSlackSeconds)
-            // Unbounded 8 s + 6 s of echo would land well above 10 s.
-            #expect(duration < 10)
+            let utterance = try await captureAfterSustainedEcho(
+                sampleRate: 16_000,
+                echoHopSeconds: speechHopSeconds,
+                oversizedEarlyEcho: false,
+                scope: scope)
+            expectExactRetainedWindow(utterance)
         }
     }
 
-    /// The interruption after that echo must contain the trailing window and
-    /// the onset, not the early reply leakage.
-    @Test func interruptionAfterSustainedEchoKeepsRecentAudioNotTheEarlyEcho() async throws {
+    /// Same constructed timeline at other locked rates and chunk sizes,
+    /// including one early-echo chunk larger than the 5.5 s cap. WAV
+    /// normalization keeps the expected 16 kHz composition.
+    @Test(arguments: [
+        (8_000.0, 0.125, false),
+        (48_000.0, 0.125, false),
+        (16_000.0, 0.050, false),
+        (8_000.0, 0.125, true),
+        (16_000.0, 0.125, true),
+        (48_000.0, 0.125, true),
+    ])
+    func preRollBoundHoldsAcrossSampleRatesAndChunkSizes(
+        sampleRate: Double, echoHopSeconds: Double, oversizedEarlyEcho: Bool
+    ) async throws {
         try await withMonitorScope { scope in
-            let capture = FakeAudioCapture()
-            let gate = scope.gate()
-            let calls = BargeCallbacks()
-            let monitor = scope.monitor(capture: capture)
-            try await monitor.start(
-                isPlaying: { await gate.probe() },
-                onSpeech: { calls.speech() },
-                onUtterance: { calls.utterance($0) })
-
-            for _ in 0..<earlyEchoHops {
-                #expect(await feed(echoChunk(sign: 1), capture, gate))
-            }
-            for _ in 0..<recentEchoHops {
-                #expect(await feed(echoChunk(sign: -1), capture, gate))
-            }
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await feed(speechChunk(), capture, gate))
-            #expect(await eventually { calls.speechCount == 1 })
-            #expect(await feed(endOfTurnGapChunk(), capture, gate))
-            #expect(await feed(quietChunk(), capture, gate))
-            #expect(await eventually { calls.utterances.count == 1 })
-
-            let utterance = try #require(calls.utterances.first ?? nil)
-            let pcm = pcm16Samples(utterance.audio)
-            #expect(!pcm.isEmpty)
-
-            let earlyCount = pcm.filter { matchesAmplitude($0, echoAmplitude) }.count
-            let recentCount = pcm.filter { matchesAmplitude($0, -echoAmplitude) }.count
-            let speechCount = pcm.filter { matchesAmplitude($0, speechAmplitude) }.count
-
-            #expect(earlyCount == 0)
-            #expect(recentCount > 0)
-            #expect(speechCount > 0)
-            // Onset: at least the two pre-trip hops plus the tripping hop.
-            #expect(speechCount >= hopSamples * 3)
+            let utterance = try await captureAfterSustainedEcho(
+                sampleRate: sampleRate,
+                echoHopSeconds: echoHopSeconds,
+                oversizedEarlyEcho: oversizedEarlyEcho,
+                scope: scope)
+            expectExactRetainedWindow(utterance)
         }
     }
 }
