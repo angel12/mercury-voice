@@ -31,6 +31,44 @@ struct RESTHTTPErrorDetailTests {
         }
     }
 
+    @Test func displayCapDropsSplitScalarWithoutReplacement() {
+        let text = String(repeating: "A", count: 299) + "😀"
+        #expect(text.utf8.count == 303)
+        let detail = HTTPErrorDetail.displayed(text)
+        #expect(detail.utf8.count <= Self.displayLimit)
+        #expect(detail == String(repeating: "A", count: 299))
+        #expect(!detail.contains("\u{FFFD}"))
+        #expect(!detail.contains("😀"))
+    }
+
+    @Test func displayCapPreservesExactByteBoundary() {
+        let ascii = String(repeating: "B", count: Self.displayLimit)
+        #expect(HTTPErrorDetail.displayed(ascii) == ascii)
+
+        let emoji = String(repeating: "C", count: 296) + "😀"
+        #expect(emoji.utf8.count == Self.displayLimit)
+        #expect(HTTPErrorDetail.displayed(emoji) == emoji)
+        #expect(HTTPErrorDetail.displayed(emoji).contains("😀"))
+    }
+
+    @Test func redactsBeforeTruncatingDisplay() {
+        let secret = "sk-" + String(repeating: "S", count: 48)
+        let text = String(repeating: "A", count: 280) + " \(secret) TAIL"
+        let detail = HTTPErrorDetail.displayed(text)
+        #expect(!detail.contains("SSSSSSSS"))
+        #expect(detail.contains("«redacted»"))
+        #expect(detail.utf8.count <= Self.displayLimit)
+    }
+
+    @Test func restJSONDetailDropsSplitScalar() {
+        let message = String(repeating: "A", count: 299) + "😀"
+        let detail = HTTPErrorDetail.restJSONDetail(
+            Data("{\"detail\":\"\(message)\"}".utf8)) ?? ""
+        #expect(detail.utf8.count <= Self.displayLimit)
+        #expect(!detail.contains("\u{FFFD}"))
+        #expect(!detail.contains("😀"))
+    }
+
     @Test func authenticatorPerformCapsJSONDetail() async throws {
         let message = String(repeating: "C", count: 400) + "AUTH-TAIL"
         let body = Data("{\"detail\":\"\(message)\"}".utf8)

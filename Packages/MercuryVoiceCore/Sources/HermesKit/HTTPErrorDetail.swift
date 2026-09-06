@@ -1,7 +1,8 @@
 import Foundation
 
-/// Caps and redacts HTTP error text shown in UI notices, and bounds how much
-/// of a non-2xx body is retained while it is received.
+/// Caps and redacts HTTP error *detail* (the provider/REST string, not the
+/// full localized notice, which may add a prefix) and bounds how much of a
+/// non-2xx body is retained while it is received.
 ///
 /// Success bodies (TTS audio, profiles JSON) stay unbounded — a transport-wide
 /// cap would truncate valid speech.
@@ -49,10 +50,19 @@ package enum HTTPErrorDetail {
         return data
     }
 
+    /// Truncate to `displayLimit` bytes at a Unicode scalar boundary.
+    /// A raw `prefix(300)` can split a multibyte scalar; `String(decoding:)`
+    /// would then insert U+FFFD (3 bytes) and the result could exceed 300.
     private static func cap(_ text: String) -> String {
-        let utf8 = text.utf8
-        guard utf8.count > displayLimit else { return text }
-        return String(decoding: Data(utf8.prefix(displayLimit)), as: UTF8.self)
+        let encoded = Data(text.utf8)
+        guard encoded.count > displayLimit else { return text }
+        var end = displayLimit
+        // `end` is the first excluded index. Continuation bytes mean a scalar
+        // started inside the prefix and must be dropped entirely.
+        while end > 0, end < encoded.count, encoded[end] & 0b1100_0000 == 0b1000_0000 {
+            end -= 1
+        }
+        return String(decoding: encoded.prefix(end), as: UTF8.self)
     }
 
     private static func redact(_ text: String) -> String {

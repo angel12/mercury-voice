@@ -21,6 +21,26 @@ struct HTTPErrorDetailTests {
         return try #require(DirectTTSConfig(json: json))
     }
 
+    @Test func jsonErrorDropsSplitScalarAtDisplayLimit() {
+        let message = String(repeating: "A", count: 299) + "😀"
+        #expect(message.utf8.count == 303)
+        let detail = DirectVoiceClient.errorDetail(
+            Data("{\"error\":{\"message\":\"\(message)\"}}".utf8))
+        #expect(detail.utf8.count <= Self.displayLimit)
+        #expect(detail == String(repeating: "A", count: 299))
+        #expect(!detail.contains("\u{FFFD}"))
+        #expect(!detail.contains("😀"))
+    }
+
+    @Test func jsonErrorPreservesExactByteBoundary() {
+        let message = String(repeating: "C", count: 296) + "😀"
+        #expect(message.utf8.count == Self.displayLimit)
+        let detail = DirectVoiceClient.errorDetail(
+            Data("{\"error\":{\"message\":\"\(message)\"}}".utf8))
+        #expect(detail == message)
+        #expect(detail.contains("😀"))
+    }
+
     @Test func oversizedJSONErrorMessageIsCappedLikePlainText() {
         let message = String(repeating: "A", count: 400)
         let detail = DirectVoiceClient.errorDetail(
@@ -106,5 +126,60 @@ struct HTTPErrorDetailTests {
             Issue.record("unexpected error \(error)")
         }
         #expect(ContinuousClock.now - started < .seconds(3))
+        // Application accumulation stopped at 64 KiB and this request's TCP
+        // connection closed. That is not a bound on URLSession buffering.
+        #expect(await eventually { server.peerClosed })
+    }
+
+    @Test func errorReadRedactsSecretCutAtReadBoundary() async throws {
+        let secret = "sk-" + String(repeating: "K", count: HTTPErrorDetail.errorReadLimit)
+        let body = Data("invalid Bearer \(secret) leftover".utf8)
+        let server = try await ScriptedHTTPServer.start(status: 500, body: body)
+        defer { server.stop() }
+
+        do {
+            _ = try await DirectVoiceClient().synthesize(
+                config: try ttsConfig(port: server.port),
+                text: "Hello there, this is spoken.")
+            Issue.record("expected provider error")
+        } catch let DirectVoiceError.provider(_, _, detail) {
+            #expect(!detail.contains(String(repeating: "K", count: 16)))
+            #expect(detail.contains("«redacted»"))
+            #expect(detail.utf8.count <= Self.displayLimit)
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+    }
+
+    @Test func cancellingSynthesizeClosesTheRequest() async throws {
+        // Headers + a tiny prefix with a huge Content-Length parks production
+        // `bytes(for:)` inside `collect` so Task.cancel can hit it.
+        let server = try await ScriptedHTTPServer.start(
+            status: 200,
+            body: Data(repeating: 0x7F, count: 16),
+            contentType: "audio/mpeg",
+            declaredLength: 10_000_000,
+            stallSeconds: 15)
+        defer { server.stop() }
+
+        let task = Task {
+            try await DirectVoiceClient().synthesize(
+                config: try ttsConfig(port: server.port),
+                text: "Hello there, this is spoken.")
+        }
+        #expect(await eventually { server.responseSent })
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("expected cancellation")
+        } catch is CancellationError {
+            // Task cancellation through production `bytes(for:)`.
+        } catch let error as URLError where error.code == .cancelled {
+            // Foundation may surface the same cancel as URLError.cancelled.
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+        #expect(await eventually { server.peerClosed })
     }
 }
