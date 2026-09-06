@@ -24,6 +24,13 @@ private func loudChunk(rate: Double = 16_000) -> AudioChunk {
     AudioChunk(samples: [Float](repeating: 0.5, count: 1600), sampleRate: rate)
 }
 
+/// 100 ms of a unique ramp — loud enough for `heardSpeech`, and not a
+/// constant buffer that `discard()` could empty without a content miss.
+private func identifiableSpeech(rate: Double = 16_000) -> [Float] {
+    let count = Int(rate * 0.1)
+    return (0..<count).map { i in Float(i % 17) / 32.0 + 0.25 }
+}
+
 @Suite("MicRecorder unexpected capture EOF")
 struct MicRecorderEOFTests {
 
@@ -42,6 +49,49 @@ struct MicRecorderEOFTests {
 
         let utterance = await recorder.stop()
         #expect(utterance == nil)
+        #expect(autoStop.count == 1)
+        #expect(capture.closeCount == 1)
+    }
+
+    @Test func unexpectedEOFPreservesRecordedAudioForRecovery() async throws {
+        let capture = FakeAudioCapture()
+        let recorder = MicRecorder(capture: capture)
+        let autoStop = AutoStopCounter()
+        let rate = 16_000.0
+        let samples = identifiableSpeech(rate: rate)
+        try await recorder.start(vad: VADParameters(), onAutoStop: { autoStop.fire() })
+
+        capture.emit(AudioChunk(samples: samples, sampleRate: rate))
+        try? await Task.sleep(for: .milliseconds(50))
+        capture.finishUnexpectedly()
+        #expect(await eventually { autoStop.count == 1 })
+        #expect(capture.closeCount == 1)
+
+        let utterance = try #require(await recorder.stop())
+        #expect(utterance.heardSpeech)
+        #expect(utterance.mimeType == WAVEncoder.mimeType)
+        #expect(utterance.duration == .seconds(Double(samples.count) / rate))
+        #expect(utterance.audio == WAVEncoder.encode(samples: samples, sampleRate: rate))
+        #expect(autoStop.count == 1)
+        #expect(capture.closeCount == 1)
+    }
+
+    @Test func eofAfterVADAutoStopDoesNotNotifyTwice() async throws {
+        let capture = FakeAudioCapture()
+        let recorder = MicRecorder(capture: capture)
+        let autoStop = AutoStopCounter()
+        try await recorder.start(
+            vad: VADParameters(maxRecording: .milliseconds(10)),
+            onAutoStop: { autoStop.fire() })
+
+        capture.emit(loudChunk())
+        #expect(await eventually { autoStop.count == 1 })
+        #expect(autoStop.count == 1)
+        #expect(capture.closeCount == 0)
+        #expect(capture.activeCount == 1)
+
+        capture.finishUnexpectedly()
+        #expect(await eventually { capture.closeCount == 1 })
         #expect(autoStop.count == 1)
         #expect(capture.closeCount == 1)
     }
@@ -78,9 +128,14 @@ struct MicRecorderEOFTests {
         let firstID = try #require(capture.openedIDs.last)
         try await recorder.start(vad: VADParameters(), onAutoStop: { autoStop.fire() })
         #expect(capture.openedIDs.count == 2)
+        #expect(capture.openedIDs.first == firstID)
         #expect(capture.closeCount == 1)
+        #expect(capture.activeCount == 1)
 
-        capture.finish(firstID)
+        // Replacement `start()` already closed stream 1. That close is what
+        // releases pump 1; `capture.finish(firstID)` would be a no-op because
+        // the continuation is already gone. Wait for that pump to settle
+        // without notifying the replacement.
         try? await Task.sleep(for: .milliseconds(50))
         #expect(autoStop.count == 0)
 
