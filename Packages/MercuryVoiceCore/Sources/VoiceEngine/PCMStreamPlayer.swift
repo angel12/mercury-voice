@@ -1,31 +1,41 @@
 import AVFoundation
 import Foundation
 
-/// Gap-free playback of streamed raw int16 mono PCM: converts frames to
-/// float32 `AVAudioPCMBuffer`s at the advertised sample rate and schedules
-/// them back-to-back on an `AVAudioPlayerNode`. Carries an odd trailing byte
-/// across frames.
-final class PCMStreamPlayer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var engine: AVAudioEngine?
-    private var node: AVAudioPlayerNode?
-    private var format: AVAudioFormat?
-    private var carry = Data()
-    private var buffersInFlight = 0
-    private var stopped = false
+/// The scheduling sink beneath `PCMStreamPlayer`: PCM buffers in, completion
+/// callbacks out. `AVPlayerNodeSink` in production; tests substitute a fake so
+/// the two completion events Apple distinguishes — the player consuming the
+/// bytes, and the device finishing playing them — can be driven apart without
+/// an audio device (issue #67).
+protocol PCMBufferScheduling: AnyObject, Sendable {
+    /// Build and start the output graph for `format`. Idempotent.
+    func start(format: AVAudioFormat) throws
+    /// Schedule `buffer` behind whatever is already queued, calling
+    /// `onCompletion` at the point named by `completionType`.
+    func schedule(
+        _ buffer: AVAudioPCMBuffer,
+        completionType: AVAudioPlayerNodeCompletionCallbackType,
+        onCompletion: @escaping @Sendable () -> Void)
+    func stop()
+}
 
-    func prepare(sampleRate: Double) throws {
+/// Production sink: an `AVAudioPlayerNode` on its own `AVAudioEngine`.
+final class AVPlayerNodeSink: PCMBufferScheduling, @unchecked Sendable {
+    private let lock = NSLock()
+    private let node: AVAudioPlayerNode
+    private var engine: AVAudioEngine?
+
+    /// The node is injectable so a test can watch which completion type the
+    /// adapter asks the real API for; production always gets a fresh one.
+    init(node: AVAudioPlayerNode = AVAudioPlayerNode()) {
+        self.node = node
+    }
+
+    func start(format: AVAudioFormat) throws {
         lock.lock()
         defer { lock.unlock() }
         guard engine == nil else { return }
 
         let engine = AVAudioEngine()
-        let node = AVAudioPlayerNode()
-        guard
-            let format = AVAudioFormat(
-                standardFormatWithSampleRate: sampleRate, channels: 1)
-        else { throw MercuryAudioError.playbackSetupFailed }
-
         engine.attach(node)
         // The engine resamples from the stream rate to the hardware rate.
         engine.connect(node, to: engine.mainMixerNode, format: format)
@@ -39,7 +49,73 @@ final class PCMStreamPlayer: @unchecked Sendable {
         node.play()
 
         self.engine = engine
-        self.node = node
+    }
+
+    func schedule(
+        _ buffer: AVAudioPCMBuffer,
+        completionType: AVAudioPlayerNodeCompletionCallbackType,
+        onCompletion: @escaping @Sendable () -> Void
+    ) {
+        // `completionType` is forwarded verbatim — the choice belongs to
+        // `PCMStreamPlayer`. The handler deliberately does no more than hand
+        // control back: `AVAudioPlayerNode.h` warns that stopping a player
+        // from inside a completion handler can deadlock while it unschedules.
+        node.scheduleBuffer(buffer, completionCallbackType: completionType) { _ in
+            onCompletion()
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let engine = engine
+        self.engine = nil
+        lock.unlock()
+
+        node.stop()
+        engine?.stop()
+    }
+}
+
+/// Gap-free playback of streamed raw int16 mono PCM: converts frames to
+/// float32 `AVAudioPCMBuffer`s at the advertised sample rate and schedules
+/// them back-to-back on an `AVAudioPlayerNode`. Carries an odd trailing byte
+/// across frames.
+final class PCMStreamPlayer: @unchecked Sendable {
+    /// The completion point `buffersInFlight` counts down from.
+    ///
+    /// `.dataPlayedBack` is the only one that accounts for output-device
+    /// latency: `AVAudioPlayerNode.h` describes it as "the buffer or file has
+    /// finished playing … accounts for both (small) signal processing
+    /// latencies downstream of the player in the engine, as well as (possibly
+    /// significant) latency in the audio playback device". The plain
+    /// `scheduleBuffer(_:completionHandler:)` this used to call is documented
+    /// as equivalent to `.dataConsumed`, which reports done while the tail is
+    /// still in the output pipeline — so `isPlaying` went false, `drain()`
+    /// returned, and the caller stopped the engine mid-tail (issue #67).
+    static let completionType: AVAudioPlayerNodeCompletionCallbackType = .dataPlayedBack
+
+    private let lock = NSLock()
+    private let sink: any PCMBufferScheduling
+    private var format: AVAudioFormat?
+    private var carry = Data()
+    private var buffersInFlight = 0
+    private var stopped = false
+
+    init(sink: any PCMBufferScheduling = AVPlayerNodeSink()) {
+        self.sink = sink
+    }
+
+    func prepare(sampleRate: Double) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard format == nil else { return }
+
+        guard
+            let format = AVAudioFormat(
+                standardFormatWithSampleRate: sampleRate, channels: 1)
+        else { throw MercuryAudioError.playbackSetupFailed }
+
+        try sink.start(format: format)
         self.format = format
     }
 
@@ -51,7 +127,7 @@ final class PCMStreamPlayer: @unchecked Sendable {
 
     func schedule(_ data: Data) {
         lock.lock()
-        guard !stopped, let node, let format else {
+        guard !stopped, let format else {
             lock.unlock()
             return
         }
@@ -80,7 +156,7 @@ final class PCMStreamPlayer: @unchecked Sendable {
         buffersInFlight += 1
         lock.unlock()
 
-        node.scheduleBuffer(buffer) { [weak self] in
+        sink.schedule(buffer, completionType: Self.completionType) { [weak self] in
             guard let self else { return }
             self.lock.lock()
             self.buffersInFlight -= 1
@@ -96,16 +172,22 @@ final class PCMStreamPlayer: @unchecked Sendable {
         try? await Task.sleep(for: VoiceConstants.playbackDrainPad)
     }
 
+    /// Barge-in, or the end of a turn once `drain()` has returned.
+    ///
+    /// The node fires every outstanding handler when it is stopped, but this
+    /// must not depend on that: `stopped` closes the player under the lock
+    /// before the sink is touched, so `isPlaying` is false and any pending
+    /// `drain()` ends on its next poll whether or not a single completion ever
+    /// arrives. Late callbacks that do arrive only decrement a count nothing
+    /// reads again. The sink is stopped once — `SpeakStreamSession.stopNow()`
+    /// calls this and then `settle()` calls it a second time.
     func stop() {
         lock.lock()
-        let node = node
-        let engine = engine
+        let alreadyStopped = stopped
         stopped = true
-        self.node = nil
-        self.engine = nil
         lock.unlock()
 
-        node?.stop()
-        engine?.stop()
+        guard !alreadyStopped else { return }
+        sink.stop()
     }
 }

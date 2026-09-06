@@ -389,6 +389,7 @@ final class AppModel {
     func disconnect() {
         connectGeneration += 1  // invalidate any in-flight connect()
         browseGeneration += 1  // …and any in-flight browse load
+        conversationGeneration += 1  // …and any in-flight conversation launch
         updatePump?.cancel()
         updatePump = nil
         profilesTask?.cancel()
@@ -398,9 +399,8 @@ final class AppModel {
         browseLoading = false
         browseError = nil
         let connection = connection
-        let conversation = conversation
+        let conversation = releaseConversation()
         self.connection = nil
-        self.conversation = nil
         if connection != nil || conversation != nil {
             // Teardown closes the backend session over the gateway, so it
             // must complete before the connection stops.
@@ -617,30 +617,79 @@ final class AppModel {
 
     // MARK: Conversation lifecycle
 
+    /// Monotonic guard for conversation ownership (issue #77, finding R25).
+    /// `begin()` suspends on the session open, so a second launch — another
+    /// Browse tap, a Shortcut, a second window — can land mid-flight. Without
+    /// this the newer controller silently replaced `conversation` while the
+    /// older one carried on opening its engine, arming the mic and holding a
+    /// backend session that no event could reach any more. Every launch, end
+    /// and disconnect bumps it; a launch whose generation has moved on
+    /// releases its controller instead of publishing it.
+    private var conversationGeneration = 0
+
     func startConversation(cwd: String?, title: String? = nil) async {
-        guard let connection else { return }
-        let controller = ConversationController(
-            connection: connection, profile: selectedProfile)
-        conversation = controller
-        await controller.begin(mode: .create(cwd: cwd, title: title))
+        await launchConversation(
+            mode: .create(cwd: cwd, title: title), profile: selectedProfile)
     }
 
     func continueSession(_ session: SessionSummary) async {
-        guard let connection else { return }
-        let controller = ConversationController(
-            connection: connection,
+        await launchConversation(
+            mode: .resume(storedID: session.storedID),
             profile: session.profile ?? selectedProfile)
+    }
+
+    /// The only place a launch assigns `conversation`. Ownership changes
+    /// hands before the first await: the outgoing controller is dropped and
+    /// superseded synchronously — so an older `begin()` still inside the
+    /// session open closes that session instead of starting a voice loop —
+    /// and only then does the replacement take over.
+    ///
+    /// The outgoing teardown runs in its own task rather than inline: it ends
+    /// with a `session.close` RPC, and a wedged gateway must not hold the new
+    /// conversation behind a 60-second request timeout.
+    private func launchConversation(
+        mode: ConversationController.Mode, profile: String?
+    ) async {
+        guard let connection else { return }
+        conversationGeneration += 1
+        let generation = conversationGeneration
+        if let outgoing = releaseConversation() {
+            pendingTeardown = Task { await outgoing.teardown() }
+        }
+
+        let controller = deps.makeConversation(connection, profile)
         conversation = controller
-        await controller.begin(mode: .resume(storedID: session.storedID))
+        await controller.begin(mode: mode)
+
+        guard generation == conversationGeneration else {
+            // Superseded or ended while the session was opening: whoever took
+            // over already dropped this controller, so release it here rather
+            // than leave its engine and backend session running. Idempotent —
+            // that path normally tore it down already.
+            await controller.teardown()
+            return
+        }
     }
 
     func endConversation() {
-        let conversation = conversation
-        self.conversation = nil
-        Task {
-            await conversation?.teardown()
+        conversationGeneration += 1
+        let outgoing = releaseConversation()
+        pendingTeardown = Task {
+            await outgoing?.teardown()
             await refreshProjects()
         }
+    }
+
+    /// Give up the current conversation: unpublish it and mark it superseded
+    /// *synchronously*, before the caller's first await, so a `begin()` still
+    /// inside the session open bails instead of arming the mic. Returns it
+    /// for the caller to tear down. Callers bump `conversationGeneration`
+    /// first when they are replacing or ending it.
+    private func releaseConversation() -> ConversationController? {
+        guard let outgoing = conversation else { return nil }
+        conversation = nil
+        outgoing.supersede()
+        return outgoing
     }
 
     // MARK: Siri Shortcuts (issue #23)

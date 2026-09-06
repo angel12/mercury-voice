@@ -50,7 +50,7 @@ public actor BargeInMonitor: BargeMonitoring {
         streamID = id
         pump = Task {
             await self.run(
-                stream: stream, isPlaying: isPlaying, onSpeech: onSpeech,
+                streamID: id, stream: stream, isPlaying: isPlaying, onSpeech: onSpeech,
                 onUtterance: onUtterance)
         }
     }
@@ -77,7 +77,10 @@ public actor BargeInMonitor: BargeMonitoring {
         pump = nil
     }
 
+    /// `id` is the stream this run was born with: the pump keeps it so it can
+    /// tell, after a suspension, whether it is still the live run.
     private func run(
+        streamID id: UUID,
         stream: AsyncStream<AudioChunk>,
         isPlaying: @escaping @Sendable () async -> Bool,
         onSpeech: @escaping @Sendable () -> Void,
@@ -93,19 +96,23 @@ public actor BargeInMonitor: BargeMonitoring {
         var elapsedSamples = 0
         var tripped = false
 
+        // Drop the audio and any half-built capture so nothing heard while
+        // muted can ever trip or be delivered.
+        func discardHeardAudio() {
+            detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
+            preRoll.removeAll()
+            captured.removeAll()
+            tripped = false
+        }
+
         for await chunk in stream {
             if Task.isCancelled { return }
             let samples = resampler.normalize(chunk)
             let sampleRate = resampler.sampleRate
             guard sampleRate > 0 else { continue }
             if suspended {
-                // Deaf but attached: drop the audio and any half-built
-                // capture so nothing heard while muted can ever trip or
-                // be delivered.
-                detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
-                preRoll.removeAll()
-                captured.removeAll()
-                tripped = false
+                // Deaf but attached.
+                discardHeardAudio()
                 elapsedSamples += samples.count
                 continue
             }
@@ -113,6 +120,17 @@ public actor BargeInMonitor: BargeMonitoring {
             elapsedSamples += samples.count
 
             let playing = await isPlaying()
+            // `isPlaying` is the only suspension point inside the loop body,
+            // so Stop, a restart and mute all land here — after the checks at
+            // the top of the loop have already passed. Re-read them before
+            // anything observable happens: a run that is no longer the live
+            // one must neither fire callbacks nor tear down the stream that
+            // replaced it, and audio heard once muted must still be dropped.
+            guard !Task.isCancelled, streamID == id else { return }
+            if suspended {
+                discardHeardAudio()
+                continue
+            }
             let level = AudioLevel.normalizedRMS(samples)
             let verdict = detector.process(level: level, at: now, playing: playing)
 
