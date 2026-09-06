@@ -193,7 +193,11 @@ struct BrowseView: View {
                             Task { await model.loadMoreProjectSessions(project.id) }
                         }
                     } else if model.hasMoreSessions(in: project) {
-                        Button("Show more") {
+                        if model.noAdditionalSessionsInLastScan(in: project) {
+                            Text(AppModel.noAdditionalSessionsInScanMessage)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button(AppModel.searchOlderSessionsTitle) {
                             Task { await model.loadMoreProjectSessions(project.id) }
                         }
                     }

@@ -65,16 +65,17 @@ struct R24WorkspacePagingTests {
         await model.loadMoreProjectSessions(Self.workspaceID)
 
         #expect(model.sessions(for: project).map(\.storedID) == full.map(\.storedID))
-        #expect(!model.hasMoreSessions(in: project))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(!model.noAdditionalSessionsInLastScan(in: project))
         #expect(browse.projectCalls.map(\.projectID) == [Self.workspaceID])
         #expect(browse.projectCalls.map(\.sessionLimit) == [AppModel.workspaceSessionPageSize])
         #expect(model.projectSessionErrors[Self.workspaceID] == nil)
     }
 
     /// `projects.project_sessions` has no offset — only `session_limit`, a
-    /// newest-first scan. A page that fills that limit must keep Show more
-    /// and the next call must raise the limit rather than treat the first
-    /// page as complete.
+    /// newest-first scan. A page that fills that limit must keep older-session
+    /// search and the next call must raise the limit rather than treat the
+    /// first page as complete. A later short page is also not exhaustion.
     @Test func workspaceSessionsPastTheFirstServerLimitKeepShowMore() async throws {
         let (defaults, suiteName) = makeTestDefaults()
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -105,13 +106,15 @@ struct R24WorkspacePagingTests {
         await model.loadMoreProjectSessions(Self.workspaceID)
 
         #expect(model.sessions(for: project).map(\.storedID) == full.map(\.storedID))
-        #expect(!model.hasMoreSessions(in: project))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(!model.noAdditionalSessionsInLastScan(in: project))
         #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize, pageSize * 2])
         #expect(browse.projectCalls.map(\.projectID) == [Self.workspaceID, Self.workspaceID])
     }
 
-    /// Exact preview-count match with a known total must not offer "show more".
-    @Test func exactPreviewBoundaryDoesNotOfferMore() async throws {
+    /// Tree `sessionCount` comes from the same capped profile scan as the
+    /// previews. Matching the preview length must not hide older-session search.
+    @Test func cappedTreeSessionCountDoesNotBlockInitialSearch() async throws {
         let (defaults, suiteName) = makeTestDefaults()
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
@@ -127,7 +130,62 @@ struct R24WorkspacePagingTests {
 
         let project = try #require(model.projectTree?.projects.first { $0.id == Self.workspaceID })
         #expect(model.sessions(for: project).count == 3)
-        #expect(!model.hasMoreSessions(in: project))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(!model.noAdditionalSessionsInLastScan(in: project))
+    }
+
+    /// Other projects can consume the profile-wide `session_limit` window.
+    /// An empty or short share for this workspace is not exhaustion: keep
+    /// searching with a raised limit until older rows appear, and never claim
+    /// the workspace is fully loaded.
+    @Test func mixedProjectScanDoesNotMarkWorkspaceExhausted() async throws {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pageSize = AppModel.workspaceSessionPageSize
+        let previews = (1...3).map { session("preview-\($0)") }
+        let older = [session("older-4"), session("older-5")]
+        let shortShare = Array(previews.prefix(2))
+        let browse = ScriptedBrowseService()
+        browse.enqueueTree(tree(previews: previews, sessionCount: 3))
+        browse.enqueueRecents(previews)
+        browse.enqueueProjectSessions([])
+        browse.enqueueProjectSessions(shortShare)
+        browse.enqueueProjectSessions(previews + older)
+
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let model = await connectedModel(browse: browse, gateway: gateway, defaults: defaults)
+        await model.refreshProjects()
+
+        let project = try #require(model.projectTree?.projects.first { $0.id == Self.workspaceID })
+        #expect(model.hasMoreSessions(in: project))
+        #expect(AppModel.searchOlderSessionsTitle == "Search older sessions")
+        #expect(
+            AppModel.noAdditionalSessionsInScanMessage
+                == "No additional sessions found in this scan")
+        #expect(model.sessions(for: project).map(\.storedID) == previews.map(\.storedID))
+
+        await model.loadMoreProjectSessions(Self.workspaceID)
+
+        #expect(model.sessions(for: project).map(\.storedID) == previews.map(\.storedID))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(model.noAdditionalSessionsInLastScan(in: project))
+        #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize])
+
+        await model.loadMoreProjectSessions(Self.workspaceID)
+
+        #expect(model.sessions(for: project).map(\.storedID) == previews.map(\.storedID))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(model.noAdditionalSessionsInLastScan(in: project))
+        #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize, pageSize * 2])
+
+        await model.loadMoreProjectSessions(Self.workspaceID)
+
+        #expect(model.sessions(for: project).map(\.storedID) == (previews + older).map(\.storedID))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(!model.noAdditionalSessionsInLastScan(in: project))
+        #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize, pageSize * 2, pageSize * 3])
     }
 
     // MARK: Recents paging
@@ -288,6 +346,9 @@ struct R24WorkspacePagingTests {
         #expect(model.browseError == nil)
         let grouped = try #require(model.projectTree?.projects)
         #expect(grouped.contains { $0.previewSessions.count == AppModel.recentsPageSize })
+        let populated = try #require(
+            grouped.first { $0.previewSessions.count == AppModel.recentsPageSize })
+        #expect(!model.hasMoreSessions(in: populated))
         #expect(model.recentSessions.count == AppModel.recentsPageSize)
         #expect(model.recentsHasMore)
 

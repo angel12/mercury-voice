@@ -4,7 +4,7 @@ import HermesKit
 /// workspaces.
 ///
 /// Seamed for the same reason `SessionServicing` is: `refreshProjects` and
-/// "show more" suspend on `projects.tree`, `projects.project_sessions`, and
+/// older-session search suspend on `projects.tree`, `projects.project_sessions`, and
 /// `/api/profiles/sessions`. Tests have to script those answers and hold a
 /// call open to prove a stale page cannot land after the user switches
 /// workspace or profile. `HermesConnection` stays concrete; this is only the

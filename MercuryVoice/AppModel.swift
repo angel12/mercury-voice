@@ -76,12 +76,12 @@ final class AppModel {
     /// unchanged on failure so retry hits the same page.
     private var recentsOffset = 0
     /// Last `session_limit` successfully sent for a workspace. The RPC has
-    /// no offset; the next Show more raises this rather than paging.
+    /// no offset; the next older-session search raises this rather than paging.
     private var projectSessionFetchedLimit: [String: Int] = [:]
-    /// Workspaces whose last `project_sessions` page filled `session_limit`.
-    /// The API returns one project's share of a global newest-first scan and
-    /// no `has_more`; a short page is the only exhaustion signal it can give.
-    private var projectSessionsMayHaveMore: Set<String> = []
+    /// Workspaces whose last `project_sessions` scan added no new stored ids.
+    /// That is not exhaustion: `session_limit` applies to the profile-wide
+    /// scan, then only this project's share is returned.
+    private var projectScanFoundNoAdditional: Set<String> = []
     /// Older backends without `projects.*` group the flat REST list.
     private(set) var usesFlatFallback = false
 
@@ -89,9 +89,12 @@ final class AppModel {
     static let recentsPageSize = 30
     /// Client page for `projects.project_sessions`. The RPC has no offset —
     /// only `session_limit`, a newest-first scan across the profile (server
-    /// default 5,000). A full page is the only completeness signal the
-    /// response can give; tree `sessionCount` is itself capped.
+    /// default 5,000). The response is this project's share of that scan and
+    /// cannot prove exhaustion; tree `sessionCount` is itself capped.
     static let workspaceSessionPageSize = 30
+    static let searchOlderSessionsTitle = "Search older sessions"
+    static let noAdditionalSessionsInScanMessage =
+        "No additional sessions found in this scan"
 
     /// Listing surface for the current connection. Set with `connection` so
     /// tests can script `projects.tree` / `project_sessions` / recents.
@@ -597,7 +600,7 @@ final class AppModel {
             usesFlatFallback = false
             let profile = selectedProfile ?? "all"
             // First recents page; the workspace page shows the project-scoped
-            // grouping (previews, then `project_sessions` on "show more").
+            // grouping (previews, then `project_sessions` on older-session search).
             let sessions = try await browse.profileSessions(
                 profile: profile, limit: Self.recentsPageSize, offset: 0)
             guard generation == browseGeneration else { return }
@@ -680,19 +683,20 @@ final class AppModel {
         expandingProjects.contains(projectID)
     }
 
-    /// More rows exist than the preview, or the last `project_sessions` page
-    /// filled `session_limit`. Tree `sessionCount` is only a hint for the
-    /// first Show more — it comes from a capped scan and is not treated as
-    /// complete after expansion. Fallback paging goes through recents.
+    /// Older-session search stays available for RPC-backed workspaces.
+    /// `projects.project_sessions` applies `session_limit` to a profile-wide
+    /// newest-first scan, then returns this project's share — a short or
+    /// empty share is not exhaustion, and tree `sessionCount` is the same
+    /// capped scan. Fallback paging goes through recents.
     func hasMoreSessions(in project: ProjectInfo) -> Bool {
         if usesFlatFallback { return false }
-        if expandedProjectSessions[project.id] != nil {
-            return projectSessionsMayHaveMore.contains(project.id)
-        }
-        if let count = project.sessionCount {
-            return count > project.previewSessions.count
-        }
-        return project.previewSessions.count >= Self.workspacePreviewLimit
+        return !project.id.isEmpty
+    }
+
+    /// Last `project_sessions` scan added no new stored ids. Not a claim that
+    /// the workspace is complete — only that this scan found nothing more.
+    func noAdditionalSessionsInLastScan(in project: ProjectInfo) -> Bool {
+        projectScanFoundNoAdditional.contains(project.id)
     }
 
     /// Load the fully hydrated rows for one workspace. Generation-checked so
@@ -714,12 +718,17 @@ final class AppModel {
                 sessionLimit: requestedLimit)
             guard generation == browseGeneration else { return }
             let fallback = projectTree?.projects.first { $0.id == projectID }?.previewSessions ?? []
-            expandedProjectSessions[projectID] = rows.isEmpty ? fallback : rows
+            let previous = expandedProjectSessions[projectID] ?? fallback
+            let previousIDs = Set(previous.map(\.storedID))
+            let addedNew = rows.contains { !previousIDs.contains($0.storedID) }
+            // Prefer this scan's rows for ids it returned; keep previous ids
+            // the scan omitted so a mixed-project short page cannot hide them.
+            expandedProjectSessions[projectID] = Self.uniqueSessions(rows + previous)
             projectSessionFetchedLimit[projectID] = requestedLimit
-            if rows.count >= requestedLimit {
-                projectSessionsMayHaveMore.insert(projectID)
+            if addedNew {
+                projectScanFoundNoAdditional.remove(projectID)
             } else {
-                projectSessionsMayHaveMore.remove(projectID)
+                projectScanFoundNoAdditional.insert(projectID)
             }
         } catch let error as HermesError {
             guard generation == browseGeneration else { return }
@@ -776,7 +785,7 @@ final class AppModel {
         expandingProjects = []
         projectSessionErrors = [:]
         projectSessionFetchedLimit = [:]
-        projectSessionsMayHaveMore = []
+        projectScanFoundNoAdditional = []
         recentsHasMore = false
         recentsLoadingMore = false
         recentsOffset = 0
