@@ -55,17 +55,27 @@ public actor VoiceConfigStore {
 /// incomplete tail, flush everything at the end. Too-short fragments
 /// ("e.g. ", "1. ") stay buffered so a provider call isn't fired per
 /// abbreviation.
+///
+/// Sentence boundaries inside a fenced code block are not cut points (issue
+/// #68): each emitted sentence is sanitized on its own, so a fence split
+/// across two sentences leaves the code without its fence in the first and an
+/// orphan closing fence in the second — which `SpeechText.fencedCode` reads
+/// as an opener and follows to the end of the string. Holding the cut keeps
+/// every fence whole within one sentence.
 public enum SentenceCutter {
     static let minSentenceChars = 24
+    private static let fenceMarker = "```"
     private static let boundary = try! NSRegularExpression(
         pattern: #"[.!?…。！？]+["'”’)\]]*\s+"#)
 
     public static func cut(_ buffer: String, flush: Bool) -> (sentences: [String], rest: String) {
         var sentences: [String] = []
         let ns = buffer as NSString
+        let fences = fenceSpans(ns)
         var start = 0
         for match in boundary.matches(in: buffer, range: NSRange(location: 0, length: ns.length)) {
             let end = match.range.location + match.range.length
+            guard !splitsAFence(fences, at: end) else { continue }
             let candidate = ns.substring(with: NSRange(location: start, length: end - start))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if candidate.count >= minSentenceChars {
@@ -80,6 +90,68 @@ public enum SentenceCutter {
             rest = ""
         }
         return (sentences, rest)
+    }
+
+    /// Fence markers paired the way `SpeechText.fencedCode` pairs them: the
+    /// first opens, the next closes, and so on. `close` is nil for a marker
+    /// with no partner yet — mid-stream that block is still arriving, and at
+    /// flush the sanitizer summarises it to the end of the text.
+    static func fenceSpans(_ ns: NSString) -> [(open: Int, close: Int?)] {
+        var markers: [NSRange] = []
+        var from = 0
+        while from < ns.length {
+            let found = ns.range(
+                of: fenceMarker, range: NSRange(location: from, length: ns.length - from))
+            if found.location == NSNotFound { break }
+            markers.append(found)
+            from = found.location + found.length
+        }
+
+        var spans: [(open: Int, close: Int?)] = []
+        var index = 0
+        while index < markers.count {
+            let open = markers[index].location
+            let close =
+                index + 1 < markers.count
+                ? markers[index + 1].location + markers[index + 1].length : nil
+            spans.append((open, close))
+            index += 2
+        }
+        return spans
+    }
+
+    /// True when cutting at `offset` would land inside a fenced block. An
+    /// unterminated block extends past everything buffered so far: cutting
+    /// after it would emit the opening fence now and strand its closer in a
+    /// later sentence.
+    static func splitsAFence(_ spans: [(open: Int, close: Int?)], at offset: Int) -> Bool {
+        for span in spans where offset > span.open {
+            guard let close = span.close else { return true }
+            if offset < close { return true }
+        }
+        return false
+    }
+}
+
+// MARK: - Speech segmenter
+
+/// The streaming text pipeline for client-direct TTS, in one place: take a
+/// delta, hold the incomplete tail, hand back whatever is ready to speak.
+///
+/// This exists so the cutter and the sanitizer are composed once, in a type a
+/// test can drive delta by delta. They used to be composed inline in
+/// `DirectSpeechSession.ingest`, where the only way to exercise the pair
+/// together was to reproduce the composition in the test.
+struct SpeechSegmenter {
+    private var buffer = ""
+
+    /// Feed one streamed delta; pass `flush: true` (with `""` if there is
+    /// nothing left to add) when the reply is complete.
+    mutating func accept(_ text: String, flush: Bool) -> [String] {
+        buffer += text
+        let cut = SentenceCutter.cut(buffer, flush: flush)
+        buffer = cut.rest
+        return cut.sentences.map(SpeechText.sanitizeForSpeech).filter { !$0.isEmpty }
     }
 }
 
@@ -292,6 +364,16 @@ public struct DirectVoiceClient: Sendable {
 
 // MARK: - Direct speech session
 
+/// The one thing `DirectSpeechSession` needs from the provider client:
+/// sentence in, audio bytes out. `DirectVoiceClient` is the production
+/// conformance; tests substitute a fake so the streaming text pipeline can be
+/// driven without a network (same shape as `FallbackClipPlaying`, issue #34).
+protocol SpeechSynthesizing: Sendable {
+    func synthesize(config: DirectTTSConfig, text: String) async throws -> Data
+}
+
+extension DirectVoiceClient: SpeechSynthesizing {}
+
 /// The client-direct `SpeechStreaming`: sentence-cut the streaming reply
 /// text, synthesize each sentence with the profile's own TTS provider, play
 /// clips sequentially. Mirrors the desktop's `openClientDirectSpeechSession`
@@ -300,20 +382,30 @@ public struct DirectVoiceClient: Sendable {
 /// — re-speaking from the start would stutter).
 public actor DirectSpeechSession: SpeechStreaming {
     private let config: DirectTTSConfig
-    private let client: DirectVoiceClient
+    private let client: any SpeechSynthesizing
+    private let makePlayer: @Sendable () -> any FallbackClipPlaying
 
-    private var buffer = ""
+    private var segmenter = SpeechSegmenter()
     private var finished = false
     private var started = false
     private var queue: [String] = []
     private var pumping = false
-    private var player: FallbackClipPlayer?
+    private var player: (any FallbackClipPlaying)?
     private var outcome: SpeechStreamOutcome?
     private var waiters: [CheckedContinuation<SpeechStreamOutcome, Never>] = []
 
     public init(config: DirectTTSConfig, client: DirectVoiceClient = DirectVoiceClient()) {
+        self.init(config: config, client: client, makePlayer: { FallbackClipPlayer() })
+    }
+
+    init(
+        config: DirectTTSConfig,
+        client: any SpeechSynthesizing,
+        makePlayer: @escaping @Sendable () -> any FallbackClipPlaying
+    ) {
         self.config = config
         self.client = client
+        self.makePlayer = makePlayer
     }
 
     public var isAudiblyPlaying: Bool { player?.isPlaying ?? false }
@@ -322,14 +414,13 @@ public actor DirectSpeechSession: SpeechStreaming {
 
     public func append(_ text: String) {
         guard !text.isEmpty, !finished, outcome == nil else { return }
-        buffer += text
-        ingest(flush: false)
+        ingest(text, flush: false)
     }
 
     public func finish() {
         guard !finished, outcome == nil else { return }
         finished = true
-        ingest(flush: true)
+        ingest("", flush: true)
     }
 
     public func waitDone() async -> SpeechStreamOutcome {
@@ -345,15 +436,8 @@ public actor DirectSpeechSession: SpeechStreaming {
 
     // MARK: Internals
 
-    private func ingest(flush: Bool) {
-        let cut = SentenceCutter.cut(buffer, flush: flush)
-        buffer = cut.rest
-        for sentence in cut.sentences {
-            // Sanitize per sentence — same granularity as the server pipeline
-            // (markdown constructs can span delta boundaries, sentences can't).
-            let speakable = SpeechText.sanitizeForSpeech(sentence)
-            if !speakable.isEmpty { queue.append(speakable) }
-        }
+    private func ingest(_ text: String, flush: Bool) {
+        queue.append(contentsOf: segmenter.accept(text, flush: flush))
         if !queue.isEmpty {
             pumpIfNeeded()
         } else if flush, !pumping, outcome == nil {
@@ -380,7 +464,7 @@ public actor DirectSpeechSession: SpeechStreaming {
             if outcome != nil { break }
 
             started = true
-            let clip = FallbackClipPlayer()
+            let clip = makePlayer()
             player = clip
             let playedThrough = await clip.play(data: bytes)
             if player === clip { player = nil }
@@ -406,7 +490,7 @@ public actor DirectSpeechSession: SpeechStreaming {
         outcome = result
         player?.stop()
         player = nil
-        buffer = ""
+        segmenter = SpeechSegmenter()
         queue.removeAll()
         for waiter in waiters { waiter.resume(returning: result) }
         waiters.removeAll()
