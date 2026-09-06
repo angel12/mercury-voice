@@ -20,6 +20,20 @@ final class ConversationController {
         case resume(storedID: String)
     }
 
+    /// The hardware-facing engine inputs, grouped behind one seam so an
+    /// app-level test can drive the real `begin()` — session open, the
+    /// torn-down interleaving, and `startVoiceLoop` itself — without arming
+    /// the microphone (issue #77). Production passes nil and gets
+    /// `liveAudioStack()`, which is the construction `startVoiceLoop` used
+    /// inline before; the engine, its callbacks and its clock are the same on
+    /// both paths.
+    struct AudioStack {
+        var recorder: any VoiceRecording
+        var bargeMonitor: any BargeMonitoring
+        var transcriber: any Transcribing
+        var microphone: any MicrophoneAuthorizing
+    }
+
     // MARK: Published state
 
     private(set) var voiceState = ConversationUIState()
@@ -55,6 +69,9 @@ final class ConversationController {
     /// Session RPCs, seamed for the reconnect-ordering tests. Defaults to
     /// `connection`; nothing else about the connection is abstracted.
     private let sessionService: any SessionServicing
+    /// Replaces the microphone/transcription half of the engine under test.
+    /// nil in production: `startVoiceLoop` builds the live stack.
+    private let audio: AudioStack?
     private let profile: String?
     private var handle: SessionHandle?
     private var mode: Mode?
@@ -83,7 +100,7 @@ final class ConversationController {
         private var callObserver: CXCallObserver?
         private var callObserverDelegate: CallEndWatcher?
         /// True between an interruption's begin and end notifications.
-        private var audioInterrupted = false
+        private(set) var audioInterrupted = false
         /// True when the engine parked after a refused mic start; cleared by
         /// the foreground/interruption-ended resume.
         private var parkedForBackground = false
@@ -134,10 +151,12 @@ final class ConversationController {
         connection: HermesConnection,
         profile: String?,
         sessionService: (any SessionServicing)? = nil,
-        speech: (any SpeechPlaying)? = nil
+        speech: (any SpeechPlaying)? = nil,
+        audio: AudioStack? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
+        self.audio = audio
         self.profile = profile
         self.profileName = profile
         // One client-direct voice-config cache per conversation: STT and TTS
@@ -173,13 +192,24 @@ final class ConversationController {
 
     // MARK: Lifecycle
 
-    /// True once teardown() has run. begin() re-checks this after every
-    /// suspension point: the user can end the conversation while session
-    /// opening is still in flight (issue #38), and nothing may start after
-    /// that — teardown ran against a controller with no engine or session
-    /// yet, so a resumed begin() would otherwise arm the mic and hold a
-    /// backend session that nobody can reach anymore.
+    /// True once this controller has been dropped. begin() re-checks it after
+    /// every suspension point: the conversation can be ended (issue #38) or
+    /// superseded by a newer launch (issue #77) while session opening is
+    /// still in flight, and nothing may start after that — the drop happened
+    /// against a controller with no engine or session yet, so a resumed
+    /// begin() would otherwise arm the mic and hold a backend session that
+    /// nobody can reach anymore.
     private var isTornDown = false
+
+    /// Drop this controller *synchronously*, without waiting for the async
+    /// teardown below. `AppModel` calls this the moment a newer launch (or
+    /// the end button) takes ownership, so a `begin()` suspended inside
+    /// `session.create`/`session.resume` bails at its next resume rather than
+    /// opening its engine — the flag has to be set before the caller's first
+    /// await, which a `Task { await teardown() }` cannot promise. Every
+    /// caller still follows with `teardown()` to end the engine and close the
+    /// session (issue #77).
+    func supersede() { isTornDown = true }
 
     func begin(mode: Mode) async {
         self.mode = mode
@@ -243,15 +273,66 @@ final class ConversationController {
         }
     }
 
-    private func startVoiceLoop() async {
-        let engine = ConversationEngine(
+    // MARK: Shared capture level meter
+
+    /// The controller that currently owns the shared mic-level meter.
+    ///
+    /// `AudioCaptureService.shared.setLevelHandler` is process-global and
+    /// last-writer-wins, and a superseded controller's `teardown()` is
+    /// asynchronous — so an unconditional clear there can in principle land
+    /// after the replacement has already installed its handler and leave the
+    /// live conversation's meter dead. The launch path happens to enqueue the
+    /// outgoing teardown before the replacement can install, but that is
+    /// scheduler behaviour, not a contract, so ownership is checked rather
+    /// than assumed (issue #77).
+    ///
+    /// One isolation boundary: this static and both operations below are
+    /// main-actor state on a `@MainActor` type, and every install and clear in
+    /// the app goes through them, so no ordering between two teardowns can
+    /// take the meter from its owner.
+    ///
+    /// Weak: the owner is always the controller `AppModel.conversation` holds,
+    /// and that is only released after a teardown which clears this, so it does
+    /// not dangle in practice — weak just guarantees the static can never keep
+    /// a dead controller alive.
+    private(set) static weak var levelMeterOwner: ConversationController?
+
+    private func takeLevelMeter() {
+        Self.levelMeterOwner = self
+        capture.setLevelHandler { [weak self] level in
+            Task { @MainActor in self?.micLevel = level }
+        }
+    }
+
+    /// Clear the shared meter only while this controller still owns it. A
+    /// superseded controller reaching here after the replacement installed
+    /// must leave the replacement's handler alone.
+    private func releaseLevelMeterIfOwned() {
+        guard Self.levelMeterOwner === self else { return }
+        Self.levelMeterOwner = nil
+        capture.setLevelHandler(nil)
+    }
+
+    /// The production audio stack: the shared capture service's recorder and
+    /// barge monitor, REST transcription, and the system permission.
+    private func liveAudioStack() -> AudioStack {
+        AudioStack(
             recorder: MicRecorder(capture: capture),
             bargeMonitor: BargeInMonitor(capture: capture),
             transcriber: RestTranscriber(
                 rest: connection.rest, profile: profile, voiceConfig: voiceStore),
+            microphone: SystemMicrophoneAuthorization())
+    }
+
+    private func startVoiceLoop() async {
+        let audio = self.audio ?? liveAudioStack()
+        let engine = ConversationEngine(
+            recorder: audio.recorder,
+            bargeMonitor: audio.bargeMonitor,
+            transcriber: audio.transcriber,
             speech: speech,
             agent: tracker,
-            microphone: SystemMicrophoneAuthorization(),
+            microphone: audio.microphone,
             callbacks: ConversationCallbacks(
                 onStopWord: { [weak self] in
                     Task { @MainActor in self?.didEndByStopWord = true }
@@ -307,9 +388,7 @@ final class ConversationController {
                 #endif
             }
         }
-        capture.setLevelHandler { [weak self] level in
-            Task { @MainActor in self?.micLevel = level }
-        }
+        takeLevelMeter()
         #if os(iOS)
             startAudioKeepalive()
             observeAudioInterruptions()
@@ -325,12 +404,12 @@ final class ConversationController {
     }
 
     func teardown() async {
-        isTornDown = true
+        supersede()
         trackerEventContinuation?.finish()
         trackerEventPump?.cancel()
         stateTask?.cancel()
         captionTask?.cancel()
-        capture.setLevelHandler(nil)
+        releaseLevelMeterIfOwned()
         #if os(iOS)
             stopAudioKeepalive()
             if let interruptionObserver {
@@ -415,24 +494,34 @@ final class ConversationController {
 
         /// Pause the loop for the interruption's duration; the capture
         /// service separately rebuilds its engine on the ended signal.
+        ///
+        /// Both callbacks target `self`, not `AppModel.shared.conversation`.
+        /// Every controller installs its own pair in `startVoiceLoop`, so the
+        /// live conversation still hears the system exactly once — but a
+        /// superseded controller can no longer reach into whatever
+        /// conversation is current now. Removing the observers in `teardown()`
+        /// is not enough on its own: these are delivered on `OperationQueue`
+        /// `.main`, so a callback enqueued before the removal still runs after
+        /// it. The `isTornDown` checks in the two handlers are what make that
+        /// late delivery inert (issue #77).
         private func observeAudioInterruptions() {
             interruptionObserver = NotificationCenter.default.addObserver(
                 forName: AVAudioSession.interruptionNotification,
                 object: nil, queue: .main
-            ) { notification in
+            ) { [weak self] notification in
                 guard
                     let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
                         as? UInt,
                     let type = AVAudioSession.InterruptionType(rawValue: raw)
                 else { return }
                 MainActor.assumeIsolated {
-                    AppModel.shared.conversation?.audioInterruption(began: type == .began)
+                    self?.audioInterruption(began: type == .began)
                 }
             }
 
-            let watcher = CallEndWatcher {
+            let watcher = CallEndWatcher { [weak self] in
                 MainActor.assumeIsolated {
-                    AppModel.shared.conversation?.systemCallsEnded()
+                    self?.systemCallsEnded()
                 }
             }
             let observer = CXCallObserver()
@@ -443,13 +532,21 @@ final class ConversationController {
 
         /// Every system call is over — the reliable stand-in for the
         /// unreliable interruption `.ended`. Same recovery as foregrounding.
-        private func systemCallsEnded() {
+        ///
+        /// Internal rather than private only because `CXCall` cannot be
+        /// constructed in a test, so the superseded-controller coverage has to
+        /// invoke this entry point directly. The interruption path next door
+        /// needs no such hook — a real `AVAudioSession` notification reaches
+        /// it (issue #77).
+        func systemCallsEnded() {
+            guard !isTornDown else { return }
             audioInterrupted = false
             capture.ensureRunning()
             resumeIfUnprompted()
         }
 
         private func audioInterruption(began: Bool) {
+            guard !isTornDown else { return }
             audioInterrupted = began
             if began {
                 Task { await engine?.setPaused(true) }
