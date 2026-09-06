@@ -390,6 +390,7 @@ public actor DirectSpeechSession: SpeechStreaming {
     private var started = false
     private var queue: [String] = []
     private var pumping = false
+    private var pumpTask: Task<Void, Never>?
     private var player: (any FallbackClipPlaying)?
     private var outcome: SpeechStreamOutcome?
     private var waiters: [CheckedContinuation<SpeechStreamOutcome, Never>] = []
@@ -448,7 +449,7 @@ public actor DirectSpeechSession: SpeechStreaming {
     private func pumpIfNeeded() {
         guard !pumping, outcome == nil else { return }
         pumping = true
-        Task { await self.pump() }
+        pumpTask = Task { await self.pump() }
     }
 
     private func pump() async {
@@ -495,6 +496,10 @@ public actor DirectSpeechSession: SpeechStreaming {
         player = nil
         segmenter = SpeechSegmenter()
         queue.removeAll()
+        // Issue #72: Stop must abort the in-flight synthesis Task, not only
+        // suppress playback after the provider returns.
+        pumpTask?.cancel()
+        pumpTask = nil
         for waiter in waiters { waiter.resume(returning: result) }
         waiters.removeAll()
     }
