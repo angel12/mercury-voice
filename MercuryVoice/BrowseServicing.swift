@@ -11,7 +11,8 @@ import HermesKit
 /// listing surface.
 protocol BrowseServicing: Sendable {
     func projectsTree(previewLimit: Int, profile: String?) async throws -> ProjectTree
-    func projectSessions(projectID: String, profile: String?) async throws -> [SessionSummary]
+    func projectSessions(projectID: String, profile: String?, sessionLimit: Int?) async throws
+        -> [SessionSummary]
     func profileSessions(profile: String, limit: Int, offset: Int) async throws -> [SessionSummary]
 }
 

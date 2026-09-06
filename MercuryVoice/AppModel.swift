@@ -71,11 +71,27 @@ final class AppModel {
     private(set) var projectSessionErrors: [String: String] = [:]
     private(set) var recentsHasMore = false
     private(set) var recentsLoadingMore = false
+    /// Consumed `/api/profiles/sessions` offset. Advanced by the raw
+    /// successful page length, never by unique displayed rows, and left
+    /// unchanged on failure so retry hits the same page.
+    private var recentsOffset = 0
+    /// Last `session_limit` successfully sent for a workspace. The RPC has
+    /// no offset; the next Show more raises this rather than paging.
+    private var projectSessionFetchedLimit: [String: Int] = [:]
+    /// Workspaces whose last `project_sessions` page filled `session_limit`.
+    /// The API returns one project's share of a global newest-first scan and
+    /// no `has_more`; a short page is the only exhaustion signal it can give.
+    private var projectSessionsMayHaveMore: Set<String> = []
     /// Older backends without `projects.*` group the flat REST list.
     private(set) var usesFlatFallback = false
 
     static let workspacePreviewLimit = 3
     static let recentsPageSize = 30
+    /// Client page for `projects.project_sessions`. The RPC has no offset —
+    /// only `session_limit`, a newest-first scan across the profile (server
+    /// default 5,000). A full page is the only completeness signal the
+    /// response can give; tree `sessionCount` is itself capped.
+    static let workspaceSessionPageSize = 30
 
     /// Listing surface for the current connection. Set with `connection` so
     /// tests can script `projects.tree` / `project_sessions` / recents.
@@ -585,7 +601,8 @@ final class AppModel {
             let sessions = try await browse.profileSessions(
                 profile: profile, limit: Self.recentsPageSize, offset: 0)
             guard generation == browseGeneration else { return }
-            recentSessions = sessions
+            recentsOffset = sessions.count
+            recentSessions = Self.uniqueSessions(sessions)
             recentsHasMore = sessions.count >= Self.recentsPageSize
             browseError = nil
         } catch let error as HermesError {
@@ -611,7 +628,10 @@ final class AppModel {
                 limit: Self.recentsPageSize,
                 offset: 0)
             guard generation == browseGeneration else { return }
-            applyFlatSessions(sessions, hasMore: sessions.count >= Self.recentsPageSize)
+            recentsOffset = sessions.count
+            applyFlatSessions(
+                Self.uniqueSessions(sessions),
+                hasMore: sessions.count >= Self.recentsPageSize)
             browseError = nil
         } catch let error as HermesError {
             guard generation == browseGeneration else { return }
@@ -660,12 +680,15 @@ final class AppModel {
         expandingProjects.contains(projectID)
     }
 
-    /// More rows exist than the preview (or the preview filled the default
-    /// cap and the server omitted `sessionCount`). Expansion replaces the
-    /// preview; fallback paging goes through recents instead.
+    /// More rows exist than the preview, or the last `project_sessions` page
+    /// filled `session_limit`. Tree `sessionCount` is only a hint for the
+    /// first Show more — it comes from a capped scan and is not treated as
+    /// complete after expansion. Fallback paging goes through recents.
     func hasMoreSessions(in project: ProjectInfo) -> Bool {
         if usesFlatFallback { return false }
-        if expandedProjectSessions[project.id] != nil { return false }
+        if expandedProjectSessions[project.id] != nil {
+            return projectSessionsMayHaveMore.contains(project.id)
+        }
         if let count = project.sessionCount {
             return count > project.previewSessions.count
         }
@@ -683,12 +706,21 @@ final class AppModel {
             }
         }
         projectSessionErrors[projectID] = nil
+        let requestedLimit =
+            (projectSessionFetchedLimit[projectID] ?? 0) + Self.workspaceSessionPageSize
         do {
             let rows = try await browse.projectSessions(
-                projectID: projectID, profile: selectedProfile)
+                projectID: projectID, profile: selectedProfile,
+                sessionLimit: requestedLimit)
             guard generation == browseGeneration else { return }
             let fallback = projectTree?.projects.first { $0.id == projectID }?.previewSessions ?? []
             expandedProjectSessions[projectID] = rows.isEmpty ? fallback : rows
+            projectSessionFetchedLimit[projectID] = requestedLimit
+            if rows.count >= requestedLimit {
+                projectSessionsMayHaveMore.insert(projectID)
+            } else {
+                projectSessionsMayHaveMore.remove(projectID)
+            }
         } catch let error as HermesError {
             guard generation == browseGeneration else { return }
             projectSessionErrors[projectID] = error.errorDescription
@@ -705,15 +737,15 @@ final class AppModel {
         defer {
             if generation == browseGeneration { recentsLoadingMore = false }
         }
-        let offset = recentSessions.count
+        let offset = recentsOffset
         do {
             let page = try await browse.profileSessions(
                 profile: selectedProfile ?? "all",
                 limit: Self.recentsPageSize,
                 offset: offset)
             guard generation == browseGeneration else { return }
-            let existing = Set(recentSessions.map(\.storedID))
-            recentSessions.append(contentsOf: page.filter { !existing.contains($0.storedID) })
+            recentsOffset += page.count
+            recentSessions = Self.uniqueSessions(recentSessions + page)
             recentsHasMore = page.count >= Self.recentsPageSize
             if usesFlatFallback {
                 applyFlatSessions(recentSessions, hasMore: recentsHasMore)
@@ -728,12 +760,26 @@ final class AppModel {
         }
     }
 
+    /// First-seen stored id wins, including duplicates inside one page.
+    private static func uniqueSessions(_ rows: [SessionSummary]) -> [SessionSummary] {
+        var seen = Set<String>()
+        var unique: [SessionSummary] = []
+        unique.reserveCapacity(rows.count)
+        for row in rows where seen.insert(row.storedID).inserted {
+            unique.append(row)
+        }
+        return unique
+    }
+
     private func resetSessionPaging() {
         expandedProjectSessions = [:]
         expandingProjects = []
         projectSessionErrors = [:]
+        projectSessionFetchedLimit = [:]
+        projectSessionsMayHaveMore = []
         recentsHasMore = false
         recentsLoadingMore = false
+        recentsOffset = 0
         usesFlatFallback = false
     }
 

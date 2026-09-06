@@ -304,7 +304,7 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
     private var projectPages: [Result<[SessionSummary], any Error>] = []
     private var recentsPages: [Result<[SessionSummary], any Error>] = []
     private var _treeCalls: [(previewLimit: Int, profile: String?)] = []
-    private var _projectCalls: [(projectID: String, profile: String?)] = []
+    private var _projectCalls: [(projectID: String, profile: String?, sessionLimit: Int?)] = []
     private var _recentsCalls: [(profile: String, limit: Int, offset: Int)] = []
 
     var treeGate: CallGate?
@@ -327,7 +327,9 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
     }
 
     var treeCalls: [(previewLimit: Int, profile: String?)] { lock.withLock { _treeCalls } }
-    var projectCalls: [(projectID: String, profile: String?)] { lock.withLock { _projectCalls } }
+    var projectCalls: [(projectID: String, profile: String?, sessionLimit: Int?)] {
+        lock.withLock { _projectCalls }
+    }
     var recentsCalls: [(profile: String, limit: Int, offset: Int)] {
         lock.withLock { _recentsCalls }
     }
@@ -344,8 +346,10 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
         return try next.get()
     }
 
-    func projectSessions(projectID: String, profile: String?) async throws -> [SessionSummary] {
-        lock.withLock { _projectCalls.append((projectID, profile)) }
+    func projectSessions(projectID: String, profile: String?, sessionLimit: Int?) async throws
+        -> [SessionSummary]
+    {
+        lock.withLock { _projectCalls.append((projectID, profile, sessionLimit)) }
         let next: Result<[SessionSummary], any Error>? = lock.withLock {
             projectPages.isEmpty ? nil : projectPages.removeFirst()
         }

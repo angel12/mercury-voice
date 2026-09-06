@@ -67,7 +67,47 @@ struct R24WorkspacePagingTests {
         #expect(model.sessions(for: project).map(\.storedID) == full.map(\.storedID))
         #expect(!model.hasMoreSessions(in: project))
         #expect(browse.projectCalls.map(\.projectID) == [Self.workspaceID])
+        #expect(browse.projectCalls.map(\.sessionLimit) == [AppModel.workspaceSessionPageSize])
         #expect(model.projectSessionErrors[Self.workspaceID] == nil)
+    }
+
+    /// `projects.project_sessions` has no offset — only `session_limit`, a
+    /// newest-first scan. A page that fills that limit must keep Show more
+    /// and the next call must raise the limit rather than treat the first
+    /// page as complete.
+    @Test func workspaceSessionsPastTheFirstServerLimitKeepShowMore() async throws {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pageSize = AppModel.workspaceSessionPageSize
+        let firstPage = (1...pageSize).map { session("ws-\($0)") }
+        let full = firstPage + [session("ws-\(pageSize + 1)")]
+        let browse = ScriptedBrowseService()
+        browse.enqueueTree(tree(previews: Array(firstPage.prefix(3)), sessionCount: full.count))
+        browse.enqueueRecents(Array(firstPage.prefix(3)))
+        browse.enqueueProjectSessions(firstPage)
+        browse.enqueueProjectSessions(full)
+
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let model = await connectedModel(browse: browse, gateway: gateway, defaults: defaults)
+        await model.refreshProjects()
+
+        let project = try #require(model.projectTree?.projects.first { $0.id == Self.workspaceID })
+        #expect(model.hasMoreSessions(in: project))
+
+        await model.loadMoreProjectSessions(Self.workspaceID)
+
+        #expect(model.sessions(for: project).map(\.storedID) == firstPage.map(\.storedID))
+        #expect(model.hasMoreSessions(in: project))
+        #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize])
+
+        await model.loadMoreProjectSessions(Self.workspaceID)
+
+        #expect(model.sessions(for: project).map(\.storedID) == full.map(\.storedID))
+        #expect(!model.hasMoreSessions(in: project))
+        #expect(browse.projectCalls.map(\.sessionLimit) == [pageSize, pageSize * 2])
+        #expect(browse.projectCalls.map(\.projectID) == [Self.workspaceID, Self.workspaceID])
     }
 
     /// Exact preview-count match with a known total must not offer "show more".
@@ -120,6 +160,108 @@ struct R24WorkspacePagingTests {
         #expect(browse.recentsCalls.map(\.limit) == [
             AppModel.recentsPageSize, AppModel.recentsPageSize,
         ])
+    }
+
+    /// Overlapping pages must advance the server offset by the raw page
+    /// length, not by unique displayed rows. Offsets stay `[0, 30, 60]`.
+    @Test func recentsOverlappingPagesAdvanceTheServerOffset() async {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pageSize = AppModel.recentsPageSize
+        let page1 = (1...pageSize).map { session("recent-\($0)") }
+        let overlap = page1[pageSize - 1]
+        let page2New = (pageSize + 1...pageSize * 2 - 1).map { session("recent-\($0)") }
+        let page2 = [overlap] + page2New
+        let page3 = (pageSize * 2 + 1...pageSize * 2 + 5).map { session("recent-\($0)") }
+        let browse = ScriptedBrowseService()
+        browse.enqueueTree(tree(previews: Array(page1.prefix(3)), sessionCount: 65))
+        browse.enqueueRecents(page1)
+        browse.enqueueRecents(page2)
+        browse.enqueueRecents(page3)
+
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let model = await connectedModel(browse: browse, gateway: gateway, defaults: defaults)
+        await model.refreshProjects()
+        #expect(browse.recentsCalls.map(\.offset) == [0])
+
+        await model.loadMoreRecentSessions()
+        #expect(model.recentSessions.count == pageSize + page2New.count)
+        #expect(model.recentsHasMore)
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize])
+
+        await model.loadMoreRecentSessions()
+        #expect(model.recentSessions.map(\.storedID) == (page1 + page2New + page3).map(\.storedID))
+        #expect(!model.recentsHasMore)
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize, pageSize * 2])
+    }
+
+    /// Duplicates inside one fetched page are dropped, but the consumed
+    /// offset still advances by that page's raw length.
+    @Test func recentsDedupWithinAPageAndStillAdvanceRawOffset() async {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pageSize = AppModel.recentsPageSize
+        let page1 = (1...pageSize).map { session("recent-\($0)") }
+        let uniqueTail = (pageSize + 2...pageSize * 2 - 1).map { session("recent-\($0)") }
+        let withinPage = session("recent-\(pageSize + 1)")
+        let page2 = [withinPage, withinPage] + uniqueTail
+        #expect(page2.count == pageSize)
+        let page3 = [session("recent-\(pageSize * 2 + 1)")]
+        let browse = ScriptedBrowseService()
+        browse.enqueueTree(tree(previews: Array(page1.prefix(3)), sessionCount: 62))
+        browse.enqueueRecents(page1)
+        browse.enqueueRecents(page2)
+        browse.enqueueRecents(page3)
+
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let model = await connectedModel(browse: browse, gateway: gateway, defaults: defaults)
+        await model.refreshProjects()
+
+        await model.loadMoreRecentSessions()
+        #expect(model.recentSessions.map(\.storedID) == (page1 + [withinPage] + uniqueTail).map(\.storedID))
+        #expect(model.recentsHasMore)
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize])
+
+        await model.loadMoreRecentSessions()
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize, pageSize * 2])
+        #expect(model.recentSessions.last?.storedID == "recent-\(pageSize * 2 + 1)")
+    }
+
+    /// A failed recents page must retry at the same offset, not skip ahead.
+    @Test func recentsFailedPageRetriesTheSameOffset() async {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pageSize = AppModel.recentsPageSize
+        let page1 = (1...pageSize).map { session("recent-\($0)") }
+        let page2 = (1...5).map { session("older-recent-\($0)") }
+        let browse = ScriptedBrowseService()
+        browse.enqueueTree(tree(previews: Array(page1.prefix(3)), sessionCount: 35))
+        browse.enqueueRecents(page1)
+        browse.enqueueRecentsFailure(HermesError.httpError(status: 503, detail: "down"))
+        browse.enqueueRecents(page2)
+
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let model = await connectedModel(browse: browse, gateway: gateway, defaults: defaults)
+        await model.refreshProjects()
+        #expect(model.recentsHasMore)
+
+        await model.loadMoreRecentSessions()
+        #expect(model.browseError != nil)
+        #expect(model.recentSessions.count == pageSize)
+        #expect(model.recentsHasMore)
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize])
+
+        await model.loadMoreRecentSessions()
+        #expect(model.browseError == nil)
+        #expect(model.recentSessions.map(\.storedID) == (page1 + page2).map(\.storedID))
+        #expect(!model.recentsHasMore)
+        #expect(browse.recentsCalls.map(\.offset) == [0, pageSize, pageSize])
     }
 
     // MARK: Flat fallback
