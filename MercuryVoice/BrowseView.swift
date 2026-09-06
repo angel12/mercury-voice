@@ -137,6 +137,16 @@ struct BrowseView: View {
                 ForEach(model.recentSessions) { session in
                     sessionRow(session)
                 }
+                if model.recentsLoadingMore {
+                    HStack {
+                        ProgressView()
+                        Text("Loading more…").foregroundStyle(.secondary)
+                    }
+                } else if model.recentsHasMore {
+                    Button("Load more") {
+                        Task { await model.loadMoreRecentSessions() }
+                    }
+                }
             }
         }
         .navigationTitle(model.profileDisplayName(model.selectedProfile) ?? "Sessions")
@@ -171,6 +181,34 @@ struct BrowseView: View {
                     ForEach(profileSessions(in: project)) { session in
                         sessionRow(session)
                     }
+                    if model.isExpandingProject(project.id) {
+                        HStack {
+                            ProgressView()
+                            Text("Loading sessions…").foregroundStyle(.secondary)
+                        }
+                    } else if let error = model.projectSessionErrors[project.id] {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                        Button("Retry") {
+                            Task { await model.loadMoreProjectSessions(project.id) }
+                        }
+                    } else if model.hasMoreSessions(in: project) {
+                        Button("Show more") {
+                            Task { await model.loadMoreProjectSessions(project.id) }
+                        }
+                    }
+                }
+            }
+            if model.usesFlatFallback {
+                if model.recentsLoadingMore {
+                    HStack {
+                        ProgressView()
+                        Text("Loading more…").foregroundStyle(.secondary)
+                    }
+                } else if model.recentsHasMore {
+                    Button("Load more") {
+                        Task { await model.loadMoreRecentSessions() }
+                    }
                 }
             }
         }
@@ -186,8 +224,9 @@ struct BrowseView: View {
     /// sessions (rows without a profile tag come from older backends — keep
     /// them rather than hide them).
     private func profileSessions(in project: ProjectInfo) -> [SessionSummary] {
-        guard let selected = model.selectedProfile else { return project.previewSessions }
-        return project.previewSessions.filter { $0.profile == nil || $0.profile == selected }
+        let rows = model.sessions(for: project)
+        guard let selected = model.selectedProfile else { return rows }
+        return rows.filter { $0.profile == nil || $0.profile == selected }
     }
 
     // MARK: Shared pieces
@@ -211,6 +250,10 @@ struct BrowseView: View {
             Section {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.red)
+                Button("Retry") {
+                    Task { await model.refreshProjects() }
+                }
+                .disabled(model.browseLoading)
             }
         }
         // A token rotation mid-session can fail to write the keychain, and

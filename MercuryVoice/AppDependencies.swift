@@ -104,6 +104,11 @@ struct AppDependencies {
     /// launch path.
     var makeConversation: (HermesConnection, String?) -> ConversationController
 
+    /// Browse listing for the connected gateway (issue #76). Production
+    /// forwards to `HermesConnection`; tests pass a scripted stand-in so
+    /// `refreshProjects` / "show more" run on the real `AppModel` path.
+    var makeBrowse: (HermesConnection) -> any BrowseServicing
+
     static var live: AppDependencies {
         AppDependencies(
             credentialStore: KeychainTokenStore(),
@@ -114,6 +119,7 @@ struct AppDependencies {
             startGateway: { await $0.start() },
             stopGateway: { await $0.stop() },
             gatewayUpdates: { await $0.updates() },
-            makeConversation: { ConversationController(connection: $0, profile: $1) })
+            makeConversation: { ConversationController(connection: $0, profile: $1) },
+            makeBrowse: { $0 })
     }
 }

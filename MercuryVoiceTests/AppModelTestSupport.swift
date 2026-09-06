@@ -297,6 +297,79 @@ func makeTestDefaults(
     return (defaults, suiteName)
 }
 
+/// Scripted `projects.tree` / `project_sessions` / recents list (issue #76).
+final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var trees: [Result<ProjectTree, any Error>] = []
+    private var projectPages: [Result<[SessionSummary], any Error>] = []
+    private var recentsPages: [Result<[SessionSummary], any Error>] = []
+    private var _treeCalls: [(previewLimit: Int, profile: String?)] = []
+    private var _projectCalls: [(projectID: String, profile: String?)] = []
+    private var _recentsCalls: [(profile: String, limit: Int, offset: Int)] = []
+
+    var treeGate: CallGate?
+    var projectSessionsGate: CallGate?
+    var profileSessionsGate: CallGate?
+
+    func enqueueTree(_ tree: ProjectTree) { lock.withLock { trees.append(.success(tree)) } }
+    func enqueueTreeFailure(_ error: any Error) { lock.withLock { trees.append(.failure(error)) } }
+    func enqueueProjectSessions(_ rows: [SessionSummary]) {
+        lock.withLock { projectPages.append(.success(rows)) }
+    }
+    func enqueueProjectSessionsFailure(_ error: any Error) {
+        lock.withLock { projectPages.append(.failure(error)) }
+    }
+    func enqueueRecents(_ rows: [SessionSummary]) {
+        lock.withLock { recentsPages.append(.success(rows)) }
+    }
+    func enqueueRecentsFailure(_ error: any Error) {
+        lock.withLock { recentsPages.append(.failure(error)) }
+    }
+
+    var treeCalls: [(previewLimit: Int, profile: String?)] { lock.withLock { _treeCalls } }
+    var projectCalls: [(projectID: String, profile: String?)] { lock.withLock { _projectCalls } }
+    var recentsCalls: [(profile: String, limit: Int, offset: Int)] {
+        lock.withLock { _recentsCalls }
+    }
+
+    func projectsTree(previewLimit: Int, profile: String?) async throws -> ProjectTree {
+        lock.withLock { _treeCalls.append((previewLimit, profile)) }
+        let next: Result<ProjectTree, any Error>? = lock.withLock {
+            trees.isEmpty ? nil : trees.removeFirst()
+        }
+        if let treeGate { await treeGate.arrive() }
+        guard let next else {
+            throw HermesError.malformedResponse("no scripted projects.tree answer")
+        }
+        return try next.get()
+    }
+
+    func projectSessions(projectID: String, profile: String?) async throws -> [SessionSummary] {
+        lock.withLock { _projectCalls.append((projectID, profile)) }
+        let next: Result<[SessionSummary], any Error>? = lock.withLock {
+            projectPages.isEmpty ? nil : projectPages.removeFirst()
+        }
+        if let projectSessionsGate { await projectSessionsGate.arrive() }
+        guard let next else {
+            throw HermesError.malformedResponse("no scripted project_sessions answer")
+        }
+        return try next.get()
+    }
+
+    func profileSessions(profile: String, limit: Int, offset: Int) async throws -> [SessionSummary]
+    {
+        lock.withLock { _recentsCalls.append((profile, limit, offset)) }
+        let next: Result<[SessionSummary], any Error>? = lock.withLock {
+            recentsPages.isEmpty ? nil : recentsPages.removeFirst()
+        }
+        if let profileSessionsGate { await profileSessionsGate.arrive() }
+        guard let next else {
+            throw HermesError.malformedResponse("no scripted profileSessions answer")
+        }
+        return try next.get()
+    }
+}
+
 @MainActor
 extension AppDependencies {
     /// Fully controllable dependencies. Every seam defaults to something inert
@@ -308,6 +381,7 @@ extension AppDependencies {
         oauthSignIn: ScriptedOAuthSignIn = ScriptedOAuthSignIn(),
         gateway: GatewayRecorder = GatewayRecorder(),
         conversations: ConversationRecorder = ConversationRecorder(),
+        browse: (any BrowseServicing)? = nil,
         defaults: UserDefaults
     ) -> AppDependencies {
         AppDependencies(
@@ -319,6 +393,7 @@ extension AppDependencies {
             startGateway: { gateway.start($0) },
             stopGateway: { gateway.stop($0) },
             gatewayUpdates: { gateway.updates($0) },
-            makeConversation: { conversations.make(connection: $0, profile: $1) })
+            makeConversation: { conversations.make(connection: $0, profile: $1) },
+            makeBrowse: { connection in browse ?? connection })
     }
 }
