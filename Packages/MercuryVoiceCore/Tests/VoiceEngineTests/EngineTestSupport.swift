@@ -171,6 +171,14 @@ final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
         }
         continuation?.finish()
     }
+
+    /// Broadcast a chunk to every open consumer, like the engine's input tap.
+    func emit(_ chunk: AudioChunk) {
+        let continuations: [AsyncStream<AudioChunk>.Continuation] = locked {
+            Array(streams.values)
+        }
+        for continuation in continuations { continuation.yield(chunk) }
+    }
 }
 
 final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
