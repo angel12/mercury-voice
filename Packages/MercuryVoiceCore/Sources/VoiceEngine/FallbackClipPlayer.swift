@@ -1,13 +1,31 @@
 import AVFoundation
 import Foundation
 
-/// The whole-clip fallback sink: a synthesized clip in, "did it finish" out.
+/// What became of one clip.
+///
+/// This used to be a `Bool` meaning "did it finish", which collapsed four
+/// different endings into `false`: undecodable data, `play()` refusing, a
+/// stop, and a decode error after audio was already coming out of the
+/// speaker. Callers that must know whether the user heard anything — the
+/// direct session's `.fallback` decision (issue #69) — cannot recover that
+/// from one bit.
+enum ClipPlayback: Sendable {
+    /// Played to the end.
+    case completed
+    /// Became audible and was cut short: a stop, or a decode error mid-clip.
+    case interrupted
+    /// Never became audible: the data would not decode, `play()` refused, or
+    /// a Stop had already made this player terminal.
+    case neverStarted
+}
+
+/// The whole-clip fallback sink: a synthesized clip in, what became of it out.
 /// `FallbackClipPlayer` in production; tests substitute a fake so the
 /// fallback path can be driven without an audio device (issue #34).
 protocol FallbackClipPlaying: AnyObject, Sendable {
     var isPlaying: Bool { get }
-    /// Resolves when playback finishes (true) or is stopped/fails (false).
-    func play(data: Data) async -> Bool
+    /// Resolves when playback ends, however it ends.
+    func play(data: Data) async -> ClipPlayback
     func stop()
 }
 
@@ -44,13 +62,20 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
     /// `finish` on the same thread and deadlock a non-recursive lock. On the
     /// reentrant path `player` and `finishContinuation` are already published,
     /// so `finish` resolves once and the outer `play` merely unlocks (#65).
+    /// `began` deliberately is *not* published yet on that path — nothing was
+    /// audible, so a synchronous failure has to read it as false (#69).
     private let lock = NSRecursiveLock()
     private var player: PlayableClip?
-    private var finishContinuation: CheckedContinuation<Bool, Never>?
+    private var finishContinuation: CheckedContinuation<ClipPlayback, Never>?
     private let makeClip: ClipFactory
     /// Set by `stop()` and never cleared. Guards the window in which this
     /// player exists but `play` has not run yet.
     private var stopped = false
+    /// Latched where the distinction is actually known: `startPlaying()`
+    /// returning true is the moment the clip became audible. Everything after
+    /// that is an interruption, not a failure to start. Only ever read under
+    /// the lock, and only ever set while the start still holds it.
+    private var began = false
 
     override convenience init() {
         self.init(makeClip: FallbackClipPlayer.makeAudioPlayerClip)
@@ -67,16 +92,17 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
         return player?.isPlaying ?? false
     }
 
-    /// Resolves when playback finishes (true) or is stopped/fails (false).
-    func play(data: Data) async -> Bool {
+    /// Resolves when playback ends, however it ends.
+    func play(data: Data) async -> ClipPlayback {
         await withCheckedContinuation { continuation in
             lock.lock()
             // A Stop that arrived before the clip was built stays decided:
             // the caller has already been told this clip is cancelled, and
-            // finally reaching `play` must not undo that.
+            // finally reaching `play` must not undo that. Nothing was ever
+            // audible, so this is `neverStarted` rather than an interruption.
             guard !stopped else {
                 lock.unlock()
-                continuation.resume(returning: false)
+                continuation.resume(returning: .neverStarted)
                 return
             }
             do {
@@ -88,19 +114,38 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
                 // refused above, or waits here and stops a clip that really
                 // did start.
                 let started = player.startPlaying()
+                // Latched only on a successful start, and only after the call
+                // returns. Serializing the start under the lock is what makes
+                // this safe and what makes it necessary (#65 + #69):
+                //
+                //  - An asynchronous completion runs `finish` on another
+                //    thread, which blocks on this same lock until the latch is
+                //    published, so it can never read a stale `false`. That is
+                //    the race that forced the latch *before* the start while
+                //    `play` still unlocked first.
+                //  - A clip that completes synchronously from `startPlaying()`
+                //    re-enters `finish` on this thread with `began` still
+                //    false, so a synchronous failure resolves `neverStarted`
+                //    rather than claiming the user heard something. Latching
+                //    first would reintroduce the #69 defect on that path.
+                //
+                // Setting it afterwards on an already-resolved continuation is
+                // harmless: the player is single-use and terminal.
+                if started { began = true }
                 lock.unlock()
                 if !started {
+                    // A no-op when a synchronous completion already resolved.
                     finish(success: false)
                 }
             } catch {
                 lock.unlock()
-                continuation.resume(returning: false)
+                continuation.resume(returning: .neverStarted)
             }
         }
     }
 
     /// Stop playback and make this player terminal: any later `play` resolves
-    /// `false` without starting anything.
+    /// `neverStarted` without starting anything.
     func stop() {
         lock.lock()
         stopped = true
@@ -134,8 +179,10 @@ final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPla
         let continuation = finishContinuation
         finishContinuation = nil
         player = nil
+        let started = began
+        began = false
         lock.unlock()
-        continuation?.resume(returning: success)
+        continuation?.resume(returning: success ? .completed : (started ? .interrupted : .neverStarted))
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
