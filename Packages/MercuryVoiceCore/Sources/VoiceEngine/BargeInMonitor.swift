@@ -137,12 +137,17 @@ public actor BargeInMonitor: BargeMonitoring {
             switch verdict {
             case .quiet:
                 preRoll.append(contentsOf: samples)
-                // Bounded pre-roll: keep the trailing window only while quiet
-                // (trimming mid-speech would lose the onset — the loudness
-                // check keeps loud-but-not-yet-tripped audio intact).
+                // Unconditional bound: adaptive echo can sit above the static
+                // 0.075 floor and still be classified quiet (issue #70), so a
+                // loudness-gated trim lets a long reply grow without limit.
+                // Keep the trailing quiet window plus a bounded onset
+                // allowance so the first syllable of a real interruption
+                // still survives.
                 let maxPreRoll = Int(
-                    VoiceConstants.bargePreRollRestart.asSeconds * sampleRate)
-                if level < VoiceConstants.bargeMinTriggerLevel, preRoll.count > maxPreRoll {
+                    (VoiceConstants.bargePreRollRestart
+                        + VoiceConstants.bargePreRollOnsetAllowance).asSeconds
+                        * sampleRate)
+                if preRoll.count > maxPreRoll {
                     preRoll.removeFirst(preRoll.count - maxPreRoll)
                 }
 

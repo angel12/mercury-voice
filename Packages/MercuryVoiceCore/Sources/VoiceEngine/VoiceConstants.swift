@@ -72,6 +72,11 @@ public enum VoiceConstants {
     public static let bargeFloorSampleCap = 200
     /// Pre-roll segment rotation while quiet, so the first syllable survives.
     public static let bargePreRollRestart: Duration = .seconds(5)
+    /// Extra retained samples beyond the quiet window so a not-yet-tripped
+    /// onset is not rotated out. The bound is unconditional (issue #70):
+    /// adaptive echo can sit above `bargeMinTriggerLevel` and still be
+    /// classified quiet, so a loudness-gated trim would grow without limit.
+    public static let bargePreRollOnsetAllowance: Duration = .milliseconds(500)
     /// Post-trip endpointing: trailing silence / hard cap.
     public static let bargeUtteranceSilence: Duration = .milliseconds(1250)
     public static let bargeUtteranceMax: Duration = .seconds(30)
