@@ -131,13 +131,14 @@ final class FakeRecorder: VoiceRecording, @unchecked Sendable {
     }
 }
 
-/// In-memory capture used with the real `BargeInMonitor` so tests can assert
-/// consumer lifetime without starting `AVAudioEngine`.
+/// In-memory capture used with the real `BargeInMonitor` and `MicRecorder`
+/// so tests can assert consumer lifetime without starting `AVAudioEngine`.
 final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
     private let lock = NSLock()
     private var streams: [UUID: AsyncStream<AudioChunk>.Continuation] = [:]
     private var _openCount = 0
     private var _closeCount = 0
+    private var _openedIDs: [UUID] = []
 
     private func locked<T>(_ body: () -> T) -> T {
         lock.lock()
@@ -150,6 +151,7 @@ final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
     var activeCount: Int { locked { streams.count } }
     /// True once a started stream has been closed (the hardware-mic analogue).
     var streamClosed: Bool { locked { _openCount > 0 && streams.isEmpty } }
+    var openedIDs: [UUID] { locked { _openedIDs } }
 
     func openStream() throws -> (id: UUID, stream: AsyncStream<AudioChunk>) {
         let id = UUID()
@@ -159,6 +161,7 @@ final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
         }
         locked {
             streams[id] = continuation
+            _openedIDs.append(id)
             _openCount += 1
         }
         return (id, stream)
@@ -168,6 +171,26 @@ final class FakeAudioCapture: AudioCaptureStreaming, @unchecked Sendable {
         let continuation: AsyncStream<AudioChunk>.Continuation? = locked {
             _closeCount += 1
             return streams.removeValue(forKey: id)
+        }
+        continuation?.finish()
+    }
+
+    /// Finish every open stream the way a current-generation rebuild failure
+    /// does: consumers see EOF without having called `closeStream`.
+    func finishUnexpectedly() {
+        let continuations: [AsyncStream<AudioChunk>.Continuation] = locked {
+            let values = Array(streams.values)
+            streams.removeAll()
+            return values
+        }
+        for continuation in continuations { continuation.finish() }
+    }
+
+    /// Finish one stream without going through `closeStream` — an obsolete
+    /// consumer's continuation ending after it has already been replaced.
+    func finish(_ id: UUID) {
+        let continuation: AsyncStream<AudioChunk>.Continuation? = locked {
+            streams.removeValue(forKey: id)
         }
         continuation?.finish()
     }

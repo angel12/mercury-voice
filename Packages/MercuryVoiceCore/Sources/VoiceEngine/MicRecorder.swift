@@ -6,7 +6,7 @@ import Foundation
 /// Time is measured in sample counts (deterministic; no wall-clock races with
 /// the audio callback cadence).
 public actor MicRecorder: VoiceRecording {
-    private let capture: AudioCaptureService
+    private let capture: any AudioCaptureStreaming
 
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
@@ -29,6 +29,12 @@ public actor MicRecorder: VoiceRecording {
         self.capture = capture
     }
 
+    /// Test seam: inject the capture protocol without starting `AVAudioEngine`
+    /// (issue #71).
+    init(capture: any AudioCaptureStreaming) {
+        self.capture = capture
+    }
+
     public func start(
         vad: VADParameters, onAutoStop: @escaping @Sendable () -> Void
     ) async throws {
@@ -38,10 +44,16 @@ public actor MicRecorder: VoiceRecording {
 
         let (id, stream) = try capture.openStream()
         streamID = id
-        pump = Task {
+        pump = Task { [id] in
             for await chunk in stream {
                 self.process(chunk)
             }
+            // Capture-rebuild failure finishes the continuation; without this
+            // the pump exits silently and the engine waits on the hard-cap
+            // timer (issue #71). Intentional detach nils `streamID` first
+            // (and cancels this task) while still on the actor, so Stop and
+            // a replacement start cannot notify.
+            self.handleStreamEnd(id)
         }
     }
 
@@ -100,6 +112,15 @@ public actor MicRecorder: VoiceRecording {
         guard !autoStopFired else { return }
         autoStopFired = true
         onAutoStop?()
+    }
+
+    /// Unexpected EOF of the live stream: notify once and close the consumer.
+    /// Obsolete pumps (restart) and cancelled pumps (Stop/cancel) are ignored.
+    private func handleStreamEnd(_ endedID: UUID) {
+        guard !Task.isCancelled else { return }
+        guard streamID == endedID else { return }
+        fireAutoStop()
+        detach()
     }
 
     private func discard() {
