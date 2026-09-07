@@ -432,14 +432,35 @@ enum Fixtures {
         return event
     }
 
-    static func replayBatch(
+    /// The result object `session.events.since` answers with — every field
+    /// the gateway writes (`events`, `latest_seq`, `truncated`, `count`,
+    /// `epoch`), so a test can drop or corrupt exactly one of them with the
+    /// rest left conforming.
+    static func replayResult(
         _ events: [JSONValue], epoch: String? = "epoch-1", truncated: Bool = false
-    ) -> EventReplayBatch {
+    ) -> JSONValue {
         var object: [String: JSONValue] = [
             "events": .array(events),
             "truncated": .bool(truncated),
+            "count": .number(Double(events.count)),
+            "latest_seq": .number(Double(events.compactMap { $0["seq"]?.intValue }.max() ?? 0)),
         ]
         if let epoch { object["epoch"] = .string(epoch) }
+        return .object(object)
+    }
+
+    static func replayBatch(
+        _ events: [JSONValue], epoch: String? = "epoch-1", truncated: Bool = false
+    ) -> EventReplayBatch {
+        EventReplayBatch(result: replayResult(events, epoch: epoch, truncated: truncated))
+    }
+
+    /// The conforming batch with one field replaced — `nil` removes the key.
+    static func replayBatch(
+        _ events: [JSONValue], replacing field: String, with value: JSONValue?
+    ) -> EventReplayBatch {
+        var object = replayResult(events).objectValue ?? [:]
+        object[field] = value
         return EventReplayBatch(result: .object(object))
     }
 }

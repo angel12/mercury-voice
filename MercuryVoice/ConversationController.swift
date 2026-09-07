@@ -949,8 +949,9 @@ final class ConversationController {
 
     /// Fetch the frames missed during the outage, or nil when a lossless
     /// replay is not available (no watermark, a recycled runtime id, a
-    /// changed replay epoch, a backend without the method, or a batch that
-    /// overran the ring). Applies nothing: the caller decides that after the
+    /// changed replay epoch, a backend without the method, a batch that
+    /// overran the ring, or an answer that cannot be shown to be the whole
+    /// gap). Applies nothing: the caller decides that after the
     /// prompt read, so a fetch that turns out to be unusable costs one
     /// discarded round trip and no state.
     private func fetchMissedEvents(
@@ -968,8 +969,11 @@ final class ConversationController {
             let batch = try? await sessionService.eventsSince(
                 sessionID: handle.runtimeID, lastSeen: watermark),
             !isTornDown,
-            !batch.truncated,
-            batch.epoch == nil || batch.epoch == previousEpoch
+            // Fail closed (issue #58): only a response that proves it carries
+            // every frame after the watermark, under this epoch, may stand in
+            // for the refresh. A batch that leaves any of that unsaid is not
+            // evidence of "nothing was missed".
+            batch.isLossless(under: previousEpoch)
         else { return nil }
         return batch.events
     }

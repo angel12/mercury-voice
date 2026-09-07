@@ -55,23 +55,82 @@ public struct GatewayEvent: Sendable, Equatable {
 
 /// Result of `session.events.since` — the missed-event replay a reconnecting
 /// client requests with its last observed seq.
+///
+/// A batch is applied *instead of* a full refresh, so everything it does not
+/// carry is taken to have never happened. Decoding is therefore fail-closed:
+/// the gateway answers every call with `events`, `latest_seq`, `truncated`,
+/// `count` and `epoch` (`tui_gateway/methods_session.py`), and a response that
+/// leaves any of the gap questions unanswered is reported as unusable rather
+/// than read as a reassuring default. `isLossless(under:)` is that verdict.
 public struct EventReplayBatch: Sendable, Equatable {
     public var events: [GatewayEvent]
     public var latestSeq: Int?
     /// The requested watermark predates the ring buffer — a gap exists, so
     /// the caller must fall back to a full state refresh instead of replaying.
+    /// Also true when the response never answered the question: an absent or
+    /// unreadable field is not a "no gap".
     public var truncated: Bool
     /// Process identity of the seq numbering; compare against the
     /// `replay_epoch` learned at `gateway.ready` — a mismatch means the
     /// backend restarted and every watermark is stale.
     public var epoch: String?
+    /// The response could not be read as a whole batch: `events` absent or
+    /// not an array, an entry that is not a decodable event frame, an
+    /// unreadable `truncated`, or a `count` disagreeing with the entries
+    /// decoded. The frames in hand are then a subset of what was sent — a
+    /// gap, not a replay.
+    public var malformed: Bool
 
     public init(result: JSONValue) {
-        self.events =
-            result["events"]?.arrayValue?.compactMap(GatewayEvent.init(eventParams:)) ?? []
+        let entries = result["events"]?.arrayValue
+        let decoded = entries?.compactMap(GatewayEvent.init(eventParams:)) ?? []
+        self.events = decoded
         self.latestSeq = result["latest_seq"]?.intValue
-        self.truncated = result["truncated"]?.truthy ?? false
+        let gap = Self.boolean(result["truncated"])
+        self.truncated = gap ?? true
         self.epoch = result["epoch"]?.stringValue
+        // `count` is the gateway's own tally of what it put in `events`
+        // (`len(frames)`), so it is the one field that can contradict an
+        // entry dropped on the way in. A backend that omits it says nothing,
+        // and the per-entry check already covers the drop.
+        let countField = result["count"]
+        self.malformed =
+            gap == nil
+            || entries == nil
+            || entries?.count != decoded.count
+            || (countField != nil && countField?.intValue != decoded.count)
+    }
+
+    /// Whether these frames are provably every event after the watermark they
+    /// were requested with: the response decoded whole, the ring did not
+    /// overrun, and the numbering identity is the one `expected` — the epoch
+    /// the watermark was taken under.
+    ///
+    /// The epoch must be present and equal. It has been echoed here since the
+    /// same gateway commit that first advertised `replay_epoch` at
+    /// `gateway.ready`, so a caller holding an epoch is by construction
+    /// talking to a gateway that returns one; an older backend leaves the
+    /// caller with no epoch at all and never reaches this check.
+    public func isLossless(under expected: String) -> Bool {
+        !truncated && !malformed && epoch == expected
+    }
+
+    /// A JSON boolean, or the loose spellings a Python backend may use for
+    /// one; nil for anything that is not a boolean at all — including a
+    /// missing field, which for `truncated` means the gap question went
+    /// unanswered.
+    private static func boolean(_ value: JSONValue?) -> Bool? {
+        switch value {
+        case .bool(let flag): return flag
+        case .number(let number) where number == 0 || number == 1: return number == 1
+        case .string(let text):
+            switch text.lowercased() {
+            case "true", "1": return true
+            case "false", "0": return false
+            default: return nil
+            }
+        default: return nil
+        }
     }
 }
 

@@ -97,7 +97,7 @@ struct EventReplayDecodingTests {
                  "latest_seq": 8, "truncated": false, "count": 2, "epoch": "abc123"}
                 """))
 
-        #expect(batch.events.count == 2)  // the typeless frame is dropped
+        #expect(batch.events.count == 2)  // the typeless frame does not decode
         #expect(batch.events[0].type == "message.delta")
         #expect(batch.events[0].seq == 7)
         #expect(batch.events[0].sessionID == "s1")
@@ -105,6 +105,130 @@ struct EventReplayDecodingTests {
         #expect(batch.latestSeq == 8)
         #expect(batch.truncated == false)
         #expect(batch.epoch == "abc123")
+        // …and the frames that did decode are not the whole answer, so this
+        // response cannot be replayed as one.
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "abc123"))
+    }
+
+    /// The shape the gateway actually answers with — `methods_session.py`
+    /// writes events/latest_seq/truncated/count/epoch on every reply.
+    @Test func aConformingAnswerReplaysLosslessly() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11,
+                     "payload": {"text": "hello"}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": 1, "epoch": "abc123"}
+                """))
+        #expect(batch.events.count == 1)
+        #expect(batch.isLossless(under: "abc123"))
+    }
+
+    /// Nothing missed is a perfectly good lossless answer.
+    @Test func anEmptyConformingAnswerIsStillLossless() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#))
+        #expect(batch.events.isEmpty)
+        #expect(batch.isLossless(under: "e1"))
+    }
+
+    // MARK: Fail-closed decoding (issue #58, finding R05)
+
+    /// `truncated` is the gateway's answer to "did the ring drop frames you
+    /// asked for", and every gateway that serves the method writes it. A
+    /// response that does not answer it has not said "no gap" — reading the
+    /// absence as `false` is what let an unreadable reply pass as a lossless
+    /// replay.
+    @Test func aMissingTruncatedFlagReadsAsAGap() throws {
+        let batch = EventReplayBatch(
+            result: try json(#"{"events": [], "latest_seq": 4, "count": 0, "epoch": "e1"}"#))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1"))
+    }
+
+    @Test(arguments: ["\"maybe\"", "null", "{}", "[]", "2"])
+    func anUnreadableTruncatedFlagReadsAsAGap(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1"))
+    }
+
+    /// Fail-closed is for answers that cannot be read, not for ones a Python
+    /// backend spells loosely: `0`/`"false"` still mean false.
+    @Test(arguments: ["false", "0", "\"false\""])
+    func looseFalseTruncatedFlagsStillDecode(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(!batch.truncated)
+        #expect(batch.isLossless(under: "e1"))
+    }
+
+    @Test(arguments: ["true", "1", "\"true\""])
+    func looseTrueTruncatedFlagsStillDecode(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1"))
+    }
+
+    /// No `events` array at all is an unread response, not an empty replay.
+    @Test(arguments: [#"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#])
+    func absentOrNonArrayEventsIsUnusable(document: String) throws {
+        let batch = EventReplayBatch(result: try json(document))
+        #expect(batch.events.isEmpty)
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1"))
+    }
+
+    /// `count` is the gateway's own tally of the frames it put in `events`,
+    /// so a disagreement means the batch in hand is not the batch sent.
+    @Test(arguments: ["5", "\"1\"", "null"])
+    func aCountDisagreeingWithTheFramesIsUnusable(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11, "payload": {}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": \(literal), "epoch": "e1"}
+                """))
+        #expect(batch.events.count == 1)
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1"))
+    }
+
+    /// `epoch` is the identity of the numbering the watermark was taken
+    /// under, and it has been echoed by this method since the same commit
+    /// that first advertised `replay_epoch` at `gateway.ready` — so a caller
+    /// that knows an epoch is talking to a gateway that sends one back, and
+    /// an answer without it cannot be shown to be about the same numbering.
+    @Test(arguments: ["", #""epoch": null,"#, #""epoch": 7,"#, #""epoch": "e2","#])
+    func anEpochThatIsNotTheWatermarksIsNotAContinuation(fragment: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "truncated": false, "count": 0, \(fragment)
+                 "session_id": "s1"}
+                """))
+        #expect(!batch.isLossless(under: "e1"))
     }
 
     @Test func truncatedBatchSurvivesMissingFields() throws {
