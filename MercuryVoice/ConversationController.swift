@@ -80,7 +80,7 @@ final class ConversationController {
     private var engine: ConversationEngine<ContinuousClock>?
     private let speech: any SpeechPlaying
     private let voiceStore: VoiceConfigStore
-    private let capture = AudioCaptureService.shared
+    private let capture: AudioCaptureService
     private let cues = ConversationCuePlayer()
     private var stateTask: Task<Void, Never>?
     private var captionTask: Task<Void, Never>?
@@ -142,21 +142,71 @@ final class ConversationController {
         }
     }
 
-    /// Tracker events must be applied in arrival order (deltas garble
-    /// otherwise) — handle() yields into this serial pump.
-    private var trackerEventContinuation: AsyncStream<GatewayEvent>.Continuation?
+    /// MainActor admits both events and resets to this one FIFO. A direct
+    /// tracker reset would overtake old deltas still buffered in the stream.
+    private var trackerEventContinuation: AsyncStream<TrackerInput>.Continuation?
     private var trackerEventPump: Task<Void, Never>?
+    private enum TrackerInput: Sendable {
+        case event(GatewayEvent)
+        case reset(busy: Bool, id: UUID)
+    }
+
+    /// Owns reset acknowledgements independently of the pump's buffered inputs.
+    /// Removal under the lock makes completion/cancellation/retirement single-shot.
+    private final class TrackerResets: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: [UUID: AsyncStream<Bool>.Continuation] = [:]
+        private var retired = false
+
+        func register(_ id: UUID) -> AsyncStream<Bool> {
+            let pair = AsyncStream.makeStream(of: Bool.self)
+            lock.lock()
+            if retired { pair.continuation.finish() } else { pending[id] = pair.continuation }
+            lock.unlock()
+            return pair.stream
+        }
+
+        func complete(_ id: UUID, applied: Bool) {
+            lock.lock()
+            let continuation = pending.removeValue(forKey: id)
+            lock.unlock()
+            if applied { continuation?.yield(true) }
+            continuation?.finish()
+        }
+
+        var count: Int { lock.withLock { pending.count } }
+
+        func retire() {
+            lock.lock()
+            retired = true
+            let continuations = Array(pending.values)
+            pending.removeAll()
+            lock.unlock()
+            for continuation in continuations { continuation.finish() }
+        }
+    }
+
+    private let trackerResets = TrackerResets()
+    private let trackerResetRequested: (@MainActor @Sendable () -> Void)?
+    private let trackerPumpWillJoin: (@MainActor @Sendable () -> Void)?
 
     init(
         connection: HermesConnection,
         profile: String?,
         sessionService: (any SessionServicing)? = nil,
         speech: (any SpeechPlaying)? = nil,
-        audio: AudioStack? = nil
+        audio: AudioStack? = nil,
+        capture: AudioCaptureService? = nil,
+        beforeTrackerEvent: (@Sendable (GatewayEvent) async -> Void)? = nil,
+        trackerResetRequested: (@MainActor @Sendable () -> Void)? = nil,
+        trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
         self.audio = audio
+        self.trackerResetRequested = trackerResetRequested
+        self.trackerPumpWillJoin = trackerPumpWillJoin
+        self.capture = capture ?? .shared
         self.profile = profile
         self.profileName = profile
         // One client-direct voice-config cache per conversation: STT and TTS
@@ -180,13 +230,71 @@ final class ConversationController {
                 try? await connection.interruptSession(sessionID: sid)
             })
 
-        let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let (stream, continuation) = AsyncStream.makeStream(of: TrackerInput.self)
         trackerEventContinuation = continuation
         let tracker = self.tracker
+        let resets = trackerResets
         trackerEventPump = Task.detached {
-            for await event in stream {
-                await tracker.handle(event: event)
+            defer { resets.retire() }
+            for await input in stream {
+                guard !Task.isCancelled else { break }
+                switch input {
+                case .event(let event):
+                    if let beforeTrackerEvent { await beforeTrackerEvent(event) }
+                    guard !Task.isCancelled else { break }
+                    await tracker.handle(event: event)
+                case .reset(let busy, let id):
+                    await tracker.reset(busy: busy)
+                    resets.complete(id, applied: !Task.isCancelled)
+                }
             }
+        }
+    }
+
+    /// Diagnostic only: drain the finite input and join the actual detached
+    /// pump without cancelling buffered events. Not used by live lifecycle.
+    func diagnosticFinishTrackerEvents() async {
+        trackerEventContinuation?.finish()
+        await trackerEventPump?.value
+    }
+
+    var diagnosticPendingTrackerResets: Int { trackerResets.count }
+
+    func diagnosticCancelTrackerEvents() {
+        trackerEventPump?.cancel()
+    }
+
+    /// Read the same actor that the real voice engine uses, without starting
+    /// that engine or installing any process-global audio handlers.
+    func diagnosticTrackerState() async -> (text: String, busy: Bool, pendingText: String?) {
+        let text = await tracker.visibleAssistantText
+        let busy = await tracker.isBusy
+        let pendingText = await tracker.pendingSpeech()?.text
+        return (text, busy, pendingText)
+    }
+
+    /// Enqueue on MainActor with live events; success means the pump applied
+    /// the reset, not merely admitted it. Internal for deterministic lifecycle tests.
+    /// Cancelling a waiter does not retract its already-admitted reset: it
+    /// remains a FIFO boundary for live events drained behind it. Retirement
+    /// instead cancels the whole pump and resolves every outstanding waiter.
+    func resetTracker(busy: Bool) async -> Bool {
+        guard !isTornDown, !Task.isCancelled else { return false }
+        let id = UUID()
+        let resets = trackerResets
+        let completion = resets.register(id)
+        switch trackerEventContinuation?.yield(.reset(busy: busy, id: id)) {
+        case .enqueued: break
+        default: resets.complete(id, applied: false)
+        }
+        trackerResetRequested?()
+        return await withTaskCancellationHandler {
+            for await applied in completion {
+                return applied && !Task.isCancelled && !isTornDown
+            }
+            return false
+        } onCancel: {
+            resets.complete(id, applied: false)
         }
     }
 
@@ -209,14 +317,19 @@ final class ConversationController {
     /// await, which a `Task { await teardown() }` cannot promise. Every
     /// caller still follows with `teardown()` to end the engine and close the
     /// session (issue #77).
-    func supersede() { isTornDown = true }
+    func supersede() {
+        isTornDown = true
+        trackerResets.retire()
+        trackerEventContinuation?.finish()
+        trackerEventPump?.cancel()
+    }
 
     func begin(mode: Mode) async {
         self.mode = mode
         do {
             try await openSession(mode: mode)
         } catch {
-            guard !isTornDown else { return }
+            guard !isTornDown, !Task.isCancelled else { return }
             setupError = (error as? HermesError)?.errorDescription ?? error.localizedDescription
             return
         }
@@ -252,7 +365,10 @@ final class ConversationController {
         usage = nil  // new session identity; the first turn re-reports
         lastSeenSeq = nil
         replayEpoch = await sessionService.replayEpoch
-        await tracker.reset(busy: running)
+        guard await resetTracker(busy: running) else {
+            await closeSessionIfOpen()
+            throw CancellationError()
+        }
         // A resumed live session can be parked on a prompt that was emitted
         // while no client was attached; replay it. Nothing to clear on a
         // fresh controller.
@@ -405,8 +521,6 @@ final class ConversationController {
 
     func teardown() async {
         supersede()
-        trackerEventContinuation?.finish()
-        trackerEventPump?.cancel()
         stateTask?.cancel()
         captionTask?.cancel()
         approvalAnnouncement?.cancel()
@@ -425,6 +539,8 @@ final class ConversationController {
         await tracker.setOnChange(nil)
         if let engine { await engine.end() }
         await closeSessionIfOpen()
+        trackerPumpWillJoin?()
+        await trackerEventPump?.value
     }
 
     /// Consumes the runtime session id so teardown and a torn-down begin()
@@ -630,7 +746,7 @@ final class ConversationController {
             GatewayEvent.Kind.messageInterim,
             GatewayEvent.Kind.messageComplete,
             GatewayEvent.Kind.error:
-            trackerEventContinuation?.yield(event)
+            trackerEventContinuation?.yield(.event(event))
             if event.type == GatewayEvent.Kind.messageComplete {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")
@@ -1030,11 +1146,12 @@ final class ConversationController {
                 // would swallow every frame after it.
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
-                await tracker.reset(busy: running)
+                let resetApplied = await resetTracker(busy: running)
                 guard !isTornDown else {
                     await closeSessionIfOpen()
                     return
                 }
+                guard resetApplied else { return }
                 adoptPendingPrompts(from: handle, clearStale: true)
             }
             notice = "Reconnected."
