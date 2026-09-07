@@ -436,3 +436,231 @@ struct BargeInMonitorStaleRunTests {
         }
     }
 }
+
+// MARK: - Capture flag
+//
+// The suite below is about `BargeInMonitor.isCapturing` — the synchronous flag
+// the engine reads to answer "does a barge capture own the mic?" (issue #87).
+// The engine's guards are only as good as *when* the monitor raises and drops
+// it, and that ordering is invisible to the engine tests, which use a fake
+// monitor. It is asserted here on the real one, on the gate, chunk timeline
+// and scope above.
+
+/// Samples `isCapturing` from *inside* the monitor's own callbacks. The
+/// invariant is an ordering — up before `onSpeech`, down before `onUtterance`
+/// — and a sample taken after a callback has returned cannot see it.
+private final class CaptureFlagLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _atSpeech: [Bool] = []
+    private var _atUtterance: [Bool] = []
+    private var _utterances: [RecordedUtterance?] = []
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    /// The flag as each `onSpeech` saw it, in order.
+    var atSpeech: [Bool] { locked { _atSpeech } }
+    /// The flag as each `onUtterance` saw it, in order.
+    var atUtterance: [Bool] { locked { _atUtterance } }
+    var utterances: [RecordedUtterance?] { locked { _utterances } }
+
+    func speech(_ flag: Bool) { locked { _atSpeech.append(flag) } }
+
+    func utterance(_ flag: Bool, _ value: RecordedUtterance?) {
+        locked {
+            _atUtterance.append(flag)
+            _utterances.append(value)
+        }
+    }
+}
+
+/// A started real monitor whose callbacks sample the flag, plus the fake
+/// capture and gate that drive it.
+private struct FlagRig {
+    let capture: FakeAudioCapture
+    let gate: PlayingGate
+    let log: CaptureFlagLog
+    let monitor: BargeInMonitor
+
+    init(_ scope: MonitorScope, detachCaptureOnSuspend: Bool = false) async throws {
+        capture = FakeAudioCapture()
+        gate = scope.gate()
+        log = CaptureFlagLog()
+        monitor = scope.monitor(
+            capture: capture, detachCaptureOnSuspend: detachCaptureOnSuspend)
+        let (monitor, log, gate) = (self.monitor, self.log, self.gate)
+        try await monitor.start(
+            isPlaying: { await gate.probe() },
+            onSpeech: { log.speech(monitor.isCapturing) },
+            onUtterance: { log.utterance(monitor.isCapturing, $0) })
+    }
+
+    /// Calibrate, then trip, returning only once `onSpeech` has fired — so the
+    /// flag has settled before anything is judged.
+    func trip() async -> Bool {
+        guard await feedUpToTheTrippingHop(capture, gate) else { return false }
+        guard await feed(loudChunk(), capture, gate) else { return false }
+        return await eventually { log.atSpeech.count == 1 }
+    }
+}
+
+@Suite("BargeInMonitor capture flag")
+struct BargeInMonitorCaptureFlagTests {
+
+    /// The ordering the engine's guard rests on. `onSpeech` only reaches the
+    /// engine an actor hop later, so the flag has to be up *before* it fires;
+    /// the capture is the engine's business from the moment it is handed over,
+    /// so the flag has to be down *before* `onUtterance` fires.
+    @Test func theFlagIsUpInsideOnSpeechAndDownInsideOnUtterance() async throws {
+        try await withMonitorScope { scope in
+            let rig = try await FlagRig(scope)
+            #expect(!rig.monitor.isCapturing)
+
+            #expect(await rig.trip())
+            #expect(rig.log.atSpeech == [true])
+            #expect(rig.monitor.isCapturing)
+
+            // A `.capturing` hop leaves it up.
+            #expect(await feed(loudChunk(), rig.capture, rig.gate))
+            #expect(rig.monitor.isCapturing)
+
+            #expect(await feed(endOfTurnGapChunk(), rig.capture, rig.gate))
+            #expect(await feed(quietChunk(), rig.capture, rig.gate))
+            #expect(await eventually { rig.log.utterances.count == 1 })
+            #expect(rig.log.atUtterance == [false])
+            #expect(!rig.monitor.isCapturing)
+
+            let utterance = try #require(rig.log.utterances.first ?? nil)
+            #expect(utterance.heardSpeech)
+            #expect(rig.capture.activeCount == 0)
+        }
+    }
+
+    /// Stop under a live capture. Nothing will ever be delivered, so `detach`
+    /// clearing the flag is the only thing that stops the engine from reading
+    /// a capture that no longer exists.
+    @Test func stopUnderALiveCaptureClearsTheFlag() async throws {
+        try await withMonitorScope { scope in
+            let rig = try await FlagRig(scope)
+            #expect(await rig.trip())
+            #expect(rig.monitor.isCapturing)
+
+            await rig.monitor.stop()
+            #expect(!rig.monitor.isCapturing)
+            #expect(!(await eventually(timeout: 0.3) { !rig.log.utterances.isEmpty }))
+            #expect(rig.capture.activeCount == 0)
+        }
+    }
+
+    /// Mute under the macOS policy: the stream stays attached and the pump
+    /// discards what it hears, so the flag must come down on the mute itself
+    /// rather than on some later chunk.
+    @Test func muteUnderALiveCaptureClearsTheFlagOnTheMacOSPolicy() async throws {
+        try await withMonitorScope { scope in
+            let rig = try await FlagRig(scope, detachCaptureOnSuspend: false)
+            #expect(await rig.trip())
+            #expect(rig.monitor.isCapturing)
+
+            await rig.monitor.setSuspended(true)
+            #expect(!rig.monitor.isCapturing)
+            #expect(rig.capture.activeCount == 1)
+
+            // Audio heard while muted must not raise it again. No lock-step
+            // wait on the gate here: the suspended branch `continue`s before
+            // the probe, so nothing would ever enter it.
+            rig.capture.emit(loudChunk())
+            #expect(!(await eventually(timeout: 0.3) { rig.monitor.isCapturing }))
+        }
+    }
+
+    /// Mute under the iOS policy, which detaches the capture consumer. Same
+    /// invariant by a different route.
+    @Test func muteUnderALiveCaptureClearsTheFlagOnTheIOSPolicy() async throws {
+        try await withMonitorScope { scope in
+            let rig = try await FlagRig(scope, detachCaptureOnSuspend: true)
+            #expect(await rig.trip())
+            #expect(rig.monitor.isCapturing)
+
+            await rig.monitor.setSuspended(true)
+            #expect(!rig.monitor.isCapturing)
+            #expect(rig.capture.streamClosed)
+            #expect(!(await eventually(timeout: 0.3) { !rig.log.utterances.isEmpty }))
+        }
+    }
+
+    /// The stream ends under a live capture without an endpoint — an external
+    /// stop, the path that delivers from the bottom of `run` instead of from
+    /// `detach`. The run is over either way, so the flag has to come down with
+    /// it: left up, it would outlive the pump that owns it and the engine
+    /// would go on believing a dead capture holds the mic.
+    @Test func anExternalStreamEndClearsTheFlagBeforeDelivering() async throws {
+        try await withMonitorScope { scope in
+            let rig = try await FlagRig(scope)
+            #expect(await rig.trip())
+            #expect(rig.monitor.isCapturing)
+
+            rig.capture.finishUnexpectedly()
+            #expect(await eventually { rig.log.utterances.count == 1 })
+            #expect(rig.log.atUtterance == [false])
+            #expect(!rig.monitor.isCapturing)
+        }
+    }
+
+    /// A restart lands while the previous run is parked in the `isPlaying`
+    /// hop, and the replacement then trips: the flag now belongs to the new
+    /// run. The stale run resumes into the post-hop guard, which `return`s.
+    /// It must not instead leave the loop — the stream-end cleanup at the
+    /// bottom of `run` clears the flag unconditionally, and clearing it here
+    /// would hand the mic back while the replacement is still capturing.
+    @Test func aStaleRunResumingFromTheHopCannotClearTheReplacementsFlag() async throws {
+        try await withMonitorScope { scope in
+            let capture = FakeAudioCapture()
+            let monitor = scope.monitor(capture: capture, detachCaptureOnSuspend: false)
+
+            let firstGate = scope.gate()
+            let first = CaptureFlagLog()
+            try await monitor.start(
+                isPlaying: { await firstGate.probe() },
+                onSpeech: { first.speech(monitor.isCapturing) },
+                onUtterance: { first.utterance(monitor.isCapturing, $0) })
+
+            #expect(await feedUpToTheTrippingHop(capture, firstGate))
+            #expect(await feed(loudChunk(), capture, firstGate))
+            #expect(await eventually { first.atSpeech.count == 1 })
+            #expect(monitor.isCapturing)
+
+            // Park the outgoing run mid-capture, with the flag up.
+            firstGate.hold()
+            capture.emit(loudChunk())
+            #expect(await eventually { firstGate.parked == 1 })
+
+            // Re-arm. `start` stops the old run first, which drops the flag…
+            let secondGate = scope.gate()
+            let second = CaptureFlagLog()
+            try await monitor.start(
+                isPlaying: { await secondGate.probe() },
+                onSpeech: { second.speech(monitor.isCapturing) },
+                onUtterance: { second.utterance(monitor.isCapturing, $0) })
+            #expect(!monitor.isCapturing)
+            #expect(capture.openCount == 2)
+
+            // …and the replacement raises it for a capture of its own.
+            #expect(await feedUpToTheTrippingHop(capture, secondGate))
+            #expect(await feed(loudChunk(), capture, secondGate))
+            #expect(await eventually { second.atSpeech.count == 1 })
+            #expect(monitor.isCapturing)
+
+            firstGate.open()
+            // Past the gate — as in the restart test above, that is not proof
+            // the stale run finished its post-hop work, so the flag is then
+            // watched for a window rather than sampled once.
+            #expect(await eventually { firstGate.resumed == 1 })
+            #expect(!(await eventually(timeout: 0.3) { !monitor.isCapturing }))
+            #expect(first.utterances.isEmpty)
+            #expect(second.atSpeech == [true])
+        }
+    }
+}
