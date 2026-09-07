@@ -92,11 +92,13 @@ private final class MonitorScope: @unchecked Sendable {
 
     func monitor(
         capture: any AudioCaptureStreaming,
+        utteranceSilence: Duration,
         onQuietPreRoll: (@Sendable ([Float]) -> Void)? = nil
     ) -> BargeInMonitor {
         let monitor = BargeInMonitor(
             capture: capture,
             detachCaptureOnSuspend: false,
+            utteranceSilence: utteranceSilence,
             onQuietPreRoll: onQuietPreRoll)
         locked { monitors.append(monitor) }
         return monitor
@@ -157,7 +159,9 @@ private func preRollCapSeconds() -> Double {
         .asSeconds
 }
 
-private func retainedWindow(hopSeconds: Double) -> RetainedWindow {
+private func retainedWindow(
+    hopSeconds: Double, silence: Duration = VoiceConstants.endOfTurnSilence
+) -> RetainedWindow {
     let wavRate = WAVEncoder.targetSampleRate
     let capSeconds = preRollCapSeconds()
     let majoritySpan =
@@ -170,7 +174,7 @@ private func retainedWindow(hopSeconds: Double) -> RetainedWindow {
     let onsetSeconds = Double(tripHops - 1) * hopSeconds
     let speechSeconds = Double(tripHops) * hopSeconds
     let recentEcho = capSeconds - onsetSeconds
-    let gapHops = ((TurnSilencePreference.seconds + hopSeconds) / hopSeconds).rounded(.up)
+    let gapHops = ((silence.asSeconds + hopSeconds) / hopSeconds).rounded(.up)
     let gapSeconds = gapHops * hopSeconds
     let recentEchoSamples = sampleCount(seconds: recentEcho, rate: wavRate)
     let speechSamples = sampleCount(seconds: speechSeconds, rate: wavRate)
@@ -206,8 +210,8 @@ private func mixedOversizedChunk(rate: Double) -> AudioChunk {
     return AudioChunk(samples: prefix + tail, sampleRate: rate)
 }
 
-private func endOfTurnGapChunk(hopSeconds: Double, rate: Double) -> AudioChunk {
-    let hops = ((TurnSilencePreference.seconds + hopSeconds) / hopSeconds).rounded(.up)
+private func endOfTurnGapChunk(hopSeconds: Double, rate: Double, silence: Duration) -> AudioChunk {
+    let hops = ((silence.asSeconds + hopSeconds) / hopSeconds).rounded(.up)
     return chunk(amplitude: 0, seconds: hops * hopSeconds, rate: rate)
 }
 
@@ -263,13 +267,14 @@ private final class PreRollSnapshots: @unchecked Sendable {
 private func captureAfterSustainedEcho(
     sampleRate: Double,
     hopSeconds: Double,
+    silence: Duration = VoiceConstants.endOfTurnSilence,
     scope: MonitorScope
 ) async throws -> RecordedUtterance {
-    let window = retainedWindow(hopSeconds: hopSeconds)
+    let window = retainedWindow(hopSeconds: hopSeconds, silence: silence)
     let capture = FakeAudioCapture()
     let gate = scope.gate()
     let calls = BargeCallbacks()
-    let monitor = scope.monitor(capture: capture)
+    let monitor = scope.monitor(capture: capture, utteranceSilence: silence)
     try await monitor.start(
         isPlaying: { await gate.probe() },
         onSpeech: { calls.speech() },
@@ -296,7 +301,10 @@ private func captureAfterSustainedEcho(
                 capture, gate))
     }
     #expect(await eventually { calls.speechCount == 1 })
-    #expect(await feed(endOfTurnGapChunk(hopSeconds: hopSeconds, rate: sampleRate), capture, gate))
+    #expect(
+        await feed(
+            endOfTurnGapChunk(hopSeconds: hopSeconds, rate: sampleRate, silence: silence),
+            capture, gate))
     #expect(
         await feed(chunk(amplitude: 0, seconds: hopSeconds, rate: sampleRate), capture, gate))
     #expect(await eventually { calls.utterances.count == 1 })
@@ -306,11 +314,12 @@ private func captureAfterSustainedEcho(
 private func tripAfterPreRoll(
     hopSeconds: Double,
     sampleRate: Double,
+    silence: Duration = VoiceConstants.endOfTurnSilence,
     capture: FakeAudioCapture,
     gate: PlayingGate,
     calls: BargeCallbacks
 ) async throws -> RecordedUtterance {
-    let window = retainedWindow(hopSeconds: hopSeconds)
+    let window = retainedWindow(hopSeconds: hopSeconds, silence: silence)
     for _ in 0..<window.tripHops {
         #expect(
             await feed(
@@ -318,7 +327,10 @@ private func tripAfterPreRoll(
                 capture, gate))
     }
     #expect(await eventually { calls.speechCount == 1 })
-    #expect(await feed(endOfTurnGapChunk(hopSeconds: hopSeconds, rate: sampleRate), capture, gate))
+    #expect(
+        await feed(
+            endOfTurnGapChunk(hopSeconds: hopSeconds, rate: sampleRate, silence: silence),
+            capture, gate))
     #expect(
         await feed(chunk(amplitude: 0, seconds: hopSeconds, rate: sampleRate), capture, gate))
     #expect(await eventually { calls.utterances.count == 1 })
@@ -361,6 +373,43 @@ struct BargeInMonitorPreRollTests {
         }
     }
 
+    /// The endpoint gap the monitor waits out must come from the silence the
+    /// test pinned, not from whatever the process-wide preference happens to
+    /// hold while suites run in parallel. At 2 s silence and 125 ms hops the
+    /// gap rounds up to 17 hops (2.125 s), so the window is 5.25 + 0.375 +
+    /// 2.125 + 0.125 s.
+    @Test func capturedWindowFollowsInjectedSilenceNotTheGlobal() async throws {
+        try await withMonitorScope { scope in
+            let silence = Duration.seconds(2)
+            let window = retainedWindow(hopSeconds: binaryHopSeconds, silence: silence)
+            #expect(window.durationSeconds == 7.875)
+            let utterance = try await captureAfterSustainedEcho(
+                sampleRate: 16_000,
+                hopSeconds: binaryHopSeconds,
+                silence: silence,
+                scope: scope)
+            expectExactRetainedWindow(utterance, window)
+        }
+    }
+
+    /// The same pin below the default. A gap sized for 0.6 s is shorter than
+    /// the 1.25 s default, so a detector still reading the process-wide
+    /// preference never endpoints and no utterance is ever delivered — the
+    /// monitor has to take the silence the test gave it.
+    @Test func endpointGapFollowsInjectedSilenceUnderTheDefault() async throws {
+        try await withMonitorScope { scope in
+            let silence = Duration.milliseconds(600)
+            let window = retainedWindow(hopSeconds: binaryHopSeconds, silence: silence)
+            #expect(window.durationSeconds == 6.5)
+            let utterance = try await captureAfterSustainedEcho(
+                sampleRate: 16_000,
+                hopSeconds: binaryHopSeconds,
+                silence: silence,
+                scope: scope)
+            expectExactRetainedWindow(utterance, window)
+        }
+    }
+
     /// Each case carries its hop through echo, onset, endpoint silence, and
     /// the final chunk, then asserts its own WAV-rate composition.
     @Test(arguments: [
@@ -393,7 +442,10 @@ struct BargeInMonitorPreRollTests {
             let capture = FakeAudioCapture()
             let gate = scope.gate()
             let calls = BargeCallbacks()
-            let monitor = scope.monitor(capture: capture, onQuietPreRoll: { snapshots.add($0) })
+            let monitor = scope.monitor(
+                capture: capture,
+                utteranceSilence: VoiceConstants.endOfTurnSilence,
+                onQuietPreRoll: { snapshots.add($0) })
             try await monitor.start(
                 isPlaying: { await gate.probe() },
                 onSpeech: { calls.speech() },

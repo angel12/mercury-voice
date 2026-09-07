@@ -118,8 +118,10 @@ private func loudChunk() -> AudioChunk {
 
 /// A single quiet hop long enough that the *next* hop endpoints the capture,
 /// rounded up to a whole number of hops so the timeline stays exact.
-private func endOfTurnGapChunk() -> AudioChunk {
-    let hops = ((TurnSilencePreference.seconds + hopSeconds) / hopSeconds).rounded(.up)
+private func endOfTurnGapChunk(
+    silence: Duration = VoiceConstants.endOfTurnSilence
+) -> AudioChunk {
+    let hops = ((silence.asSeconds + hopSeconds) / hopSeconds).rounded(.up)
     return quietChunk(samples: Int(hops) * hopSamples)
 }
 
@@ -171,11 +173,15 @@ private final class MonitorScope: @unchecked Sendable {
         return gate
     }
 
-    func monitor(capture: any AudioCaptureStreaming, detachCaptureOnSuspend: Bool)
-        -> BargeInMonitor
-    {
+    func monitor(
+        capture: any AudioCaptureStreaming,
+        detachCaptureOnSuspend: Bool,
+        utteranceSilence: Duration = VoiceConstants.endOfTurnSilence
+    ) -> BargeInMonitor {
         let monitor = BargeInMonitor(
-            capture: capture, detachCaptureOnSuspend: detachCaptureOnSuspend)
+            capture: capture,
+            detachCaptureOnSuspend: detachCaptureOnSuspend,
+            utteranceSilence: utteranceSilence)
         locked { monitors.append(monitor) }
         return monitor
     }

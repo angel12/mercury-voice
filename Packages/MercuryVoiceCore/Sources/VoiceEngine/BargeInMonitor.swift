@@ -25,6 +25,10 @@ public actor BargeInMonitor: BargeMonitoring {
     /// Test-only: quiet-phase pre-roll after each bound, so a test can
     /// observe an oversized append before a later hop repairs a skipped trim.
     private let onQuietPreRoll: (@Sendable ([Float]) -> Void)?
+    /// Test-only: pins the endpoint silence instead of re-reading the
+    /// user's preference, so a test's timeline is not a function of a
+    /// process-wide default other suites can be writing.
+    private let utteranceSilence: Duration?
 
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
@@ -35,15 +39,18 @@ public actor BargeInMonitor: BargeMonitoring {
         self.detachCaptureOnSuspend = shouldDetachBargeCaptureWhileMuted(
             isIOS: bargeMuteRunsOnIOS)
         self.onQuietPreRoll = nil
+        self.utteranceSilence = nil
     }
 
     init(
         capture: any AudioCaptureStreaming,
         detachCaptureOnSuspend: Bool,
+        utteranceSilence: Duration? = nil,
         onQuietPreRoll: (@Sendable ([Float]) -> Void)? = nil
     ) {
         self.capture = capture
         self.detachCaptureOnSuspend = detachCaptureOnSuspend
+        self.utteranceSilence = utteranceSilence
         self.onQuietPreRoll = onQuietPreRoll
     }
 
@@ -77,6 +84,12 @@ public actor BargeInMonitor: BargeMonitoring {
         }
     }
 
+    /// Re-read per run so a preference change applies from the next turn,
+    /// unless a test pinned one.
+    private var endpointSilence: Duration {
+        utteranceSilence ?? TurnSilencePreference.duration
+    }
+
     private func detach() {
         if let id = streamID {
             streamID = nil
@@ -95,7 +108,7 @@ public actor BargeInMonitor: BargeMonitoring {
         onSpeech: @escaping @Sendable () -> Void,
         onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
     ) async {
-        var detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
+        var detector = BargeDetector(utteranceSilence: endpointSilence)
         var preRoll: [Float] = []
         var captured: [Float] = []
         // Locks to the first chunk's rate; route-change chunks at other rates
@@ -108,7 +121,7 @@ public actor BargeInMonitor: BargeMonitoring {
         // Drop the audio and any half-built capture so nothing heard while
         // muted can ever trip or be delivered.
         func discardHeardAudio() {
-            detector = BargeDetector(utteranceSilence: TurnSilencePreference.duration)
+            detector = BargeDetector(utteranceSilence: endpointSilence)
             preRoll.removeAll()
             captured.removeAll()
             tripped = false
