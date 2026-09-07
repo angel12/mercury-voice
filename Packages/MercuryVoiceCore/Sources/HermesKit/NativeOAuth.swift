@@ -56,11 +56,19 @@ extension Data {
 /// One-shot HTTP listener on 127.0.0.1 that catches the authorize redirect.
 /// Start it, put `http://127.0.0.1:<port><path>` in the authorize URL, and
 /// await `waitForCode()`; it resolves with the authorization code, or throws
-/// on IDP denial, state mismatch, or `cancel()`.
+/// on IDP denial, an incoherent callback for this flow, or `cancel()`.
+/// Requests that don't carry the expected `state` — including denials — are
+/// answered with an HTTP rejection and leave the wait running: only the flow
+/// that knows the state can end it.
 public actor LoopbackRedirectListener {
     public enum RedirectError: Error, LocalizedError, Equatable {
         case cancelled
         case denied(String)
+        /// A callback that proved the expected `state` but carried nothing
+        /// this flow can act on — no usable `code` and no `error`. Callbacks
+        /// that fail the state check never reach here: they are rejected
+        /// over HTTP and the wait keeps running. (Case name kept for API
+        /// compatibility; it no longer implies a mismatched state.)
         case stateMismatch
         case listenerFailed(String)
         case timedOut
@@ -72,7 +80,7 @@ public actor LoopbackRedirectListener {
             switch self {
             case .cancelled: return "Sign-in was cancelled."
             case .denied(let detail): return "Sign-in was denied: \(detail)"
-            case .stateMismatch: return "Sign-in response failed validation (state mismatch)."
+            case .stateMismatch: return "Sign-in response failed validation. Try again."
             case .timedOut: return "Sign-in timed out. Try again."
             case .presentationFailed: return "Couldn't open the sign-in browser. Try again."
             case .listenerFailed(let detail): return "Couldn't listen for the sign-in redirect: \(detail)"
@@ -209,8 +217,25 @@ public actor LoopbackRedirectListener {
             respond(on: connection, status: "404 Not Found", body: "Not found.")
             return
         }
+        // Exactly-one lookup: a repeated parameter is ambiguous input, and
+        // resolving it in the sender's favour (first match wins) is how a
+        // smuggled second `state=` slips past validation.
         let query = { (name: String) -> String? in
-            components.queryItems?.first(where: { $0.name == name })?.value
+            let values = (components.queryItems ?? []).filter { $0.name == name }
+            guard values.count == 1 else { return nil }
+            return values[0].value
+        }
+
+        // State first, for denials as much as for successes: a callback that
+        // can't prove it belongs to this flow gets an HTTP rejection and the
+        // listener keeps waiting, so a stray browser request or a hostile
+        // local process can neither hijack the sign-in nor kill it (an
+        // unauthenticated `?error=access_denied` used to be enough).
+        guard let state = query("state"), state == expectedState else {
+            respond(
+                on: connection, status: "400 Bad Request",
+                body: "Sign-in response failed validation. Restart sign-in from the app.")
+            return
         }
 
         if let error = query("error") {
@@ -221,7 +246,10 @@ public actor LoopbackRedirectListener {
             finish(.failure(RedirectError.denied(detail)))
             return
         }
-        guard query("state") == expectedState, let code = query("code"), !code.isEmpty
+        // Right state, no usable code and no error: our own flow answering
+        // incoherently, so fail the wait instead of holding a flow that
+        // nothing can complete.
+        guard let code = query("code"), !code.isEmpty
         else {
             respond(
                 on: connection, status: "400 Bad Request",
@@ -235,11 +263,14 @@ public actor LoopbackRedirectListener {
         finish(.success(code))
     }
 
+    /// `body` is plain text — it can carry the server's `error_description`,
+    /// which a real browser would otherwise render as markup — so it is
+    /// escaped into the page rather than interpolated.
     private func respond(on connection: NWConnection, status: String, body: String) {
         let html =
             "<!doctype html><meta charset=\"utf-8\"><title>Mercury Voice</title>"
             + "<body style=\"font-family:-apple-system,sans-serif;padding:2em\">"
-            + "<p>\(body)</p></body>"
+            + "<p>\(Self.htmlEscaped(body))</p></body>"
         let payload = Data(html.utf8)
         let head =
             "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -247,6 +278,29 @@ public actor LoopbackRedirectListener {
         connection.send(
             content: Data(head.utf8) + payload,
             completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    /// Escapes per Unicode scalar, which is what an HTML tokenizer reads.
+    /// Iterating `Character` would leave a bypass: a grapheme cluster can
+    /// swallow a delimiter, because a Prepend code point (U+0600, U+0D4E,
+    /// U+110BD…) does not break before the next code point (UAX #29 GB9b),
+    /// so `U+0600 <` is one Character that matches none of these cases and
+    /// used to be appended verbatim — enough to open a tag, with the `>` of
+    /// the surrounding `</p>` closing it.
+    private static func htmlEscaped(_ text: String) -> String {
+        var escaped = ""
+        escaped.unicodeScalars.reserveCapacity(text.unicodeScalars.count)
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "&": escaped += "&amp;"
+            case "<": escaped += "&lt;"
+            case ">": escaped += "&gt;"
+            case "\"": escaped += "&quot;"
+            case "'": escaped += "&#39;"
+            default: escaped.unicodeScalars.append(scalar)
+            }
+        }
+        return escaped
     }
 
     private func finish(_ result: Result<String, Error>) {
