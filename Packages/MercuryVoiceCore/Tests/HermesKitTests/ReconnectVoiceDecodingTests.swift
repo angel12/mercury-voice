@@ -131,7 +131,8 @@ struct EventReplayDecodingTests {
     @Test func anEmptyConformingAnswerIsStillLossless() throws {
         let batch = EventReplayBatch(
             result: try json(
-                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#))
+                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#)
+        )
         #expect(batch.events.isEmpty)
         #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10))
     }
@@ -189,8 +190,10 @@ struct EventReplayDecodingTests {
     }
 
     /// No `events` array at all is an unread response, not an empty replay.
-    @Test(arguments: [#"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
-        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#])
+    @Test(arguments: [
+        #"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+    ])
     func absentOrNonArrayEventsIsUnusable(document: String) throws {
         let batch = EventReplayBatch(result: try json(document))
         #expect(batch.events.isEmpty)
@@ -252,8 +255,10 @@ struct EventReplayDecodingTests {
 
     /// The gateway writes `latest_seq` on every answer; without a readable
     /// one there is no evidence about the numbering at all.
-    @Test(arguments: ["", #""latest_seq": null,"#, #""latest_seq": "12","#,
-        #""latest_seq": 11.5,"#, #""latest_seq": 1e19,"#])
+    @Test(arguments: [
+        "", #""latest_seq": null,"#, #""latest_seq": "12","#,
+        #""latest_seq": 11.5,"#, #""latest_seq": 1e19,"#,
+    ])
     func anAbsentOrUnreadableLatestSeqIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(
@@ -290,7 +295,8 @@ struct EventReplayDecodingTests {
     /// whole rather than partially applied.
     @Test(arguments: [[12, 11], [11, 13], [11, 11], [15], [10, 11], [11, 12, 14]])
     func framesMustAscendByOneFromTheWatermark(seqs: [Int]) throws {
-        let frames = seqs
+        let frames =
+            seqs
             .map {
                 #"{"type": "message.complete", "session_id": "s1", "seq": \#($0), "payload": {}}"#
             }
@@ -329,8 +335,10 @@ struct EventReplayDecodingTests {
     /// beyond `Double` — `1e400` — never reaches here at all: `JSONValue`
     /// itself refuses to decode it, so the RPC result throws and the caller
     /// takes the same fallback.)
-    @Test(arguments: ["", #""seq": null,"#, #""seq": "12","#, #""seq": 11.5,"#,
-        #""seq": -12,"#, #""seq": 1e19,"#])
+    @Test(arguments: [
+        "", #""seq": null,"#, #""seq": "12","#, #""seq": 11.5,"#,
+        #""seq": -12,"#, #""seq": 1e19,"#,
+    ])
     func aFrameWithoutAnIntegerSeqIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(
@@ -366,8 +374,10 @@ struct EventReplayDecodingTests {
     /// to none) would land on this conversation. `events_since` reads one
     /// session's ring and `_stamp_event` records only frames that name a
     /// session, so such a frame is not this answer.
-    @Test(arguments: ["", #""session_id": null,"#, #""session_id": "s2","#,
-        #""session_id": 1,"#])
+    @Test(arguments: [
+        "", #""session_id": null,"#, #""session_id": "s2","#,
+        #""session_id": 1,"#,
+    ])
     func aFrameFromAnotherSessionIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(
