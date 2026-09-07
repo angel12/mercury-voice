@@ -1274,6 +1274,9 @@ final class ConversationController {
             return
         }
         let draftAtSubmission = textDraft
+        // Completion events may arrive before the submit ACK. Reserve the
+        // ordering boundary, not a sent bubble; failed delivery stays uncertain.
+        let precedingMessageID = devMessages.last?.id
         pendingText = trimmed
         textSubmissionError = nil
         textSubmissionTask = Task {
@@ -1281,7 +1284,11 @@ final class ConversationController {
             do {
                 try await tracker.submit(text: trimmed, interrupted: false)
                 guard !isTornDown else { return }
-                appendDevMessage(role: "user", text: trimmed)
+                let insertionIndex =
+                    precedingMessageID.flatMap { id in
+                        devMessages.firstIndex { $0.id == id }.map { $0 + 1 }
+                    } ?? 0
+                appendDevMessage(role: "user", text: trimmed, at: insertionIndex)
                 failedText = nil
                 if textDraft == draftAtSubmission,
                     draftAtSubmission.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
@@ -1311,9 +1318,9 @@ final class ConversationController {
         }
     }
 
-    private func appendDevMessage(role: String, text: String) {
+    private func appendDevMessage(role: String, text: String, at index: Int? = nil) {
         guard !text.isEmpty else { return }
-        devMessages.append(DevMessage(role: role, text: text))
+        devMessages.insert(DevMessage(role: role, text: text), at: index ?? devMessages.endIndex)
         if devMessages.count > 100 { devMessages.removeFirst(devMessages.count - 100) }
     }
 }
