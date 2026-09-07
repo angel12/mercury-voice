@@ -15,13 +15,19 @@ public enum TurnSilencePreference {
     public static let defaultSeconds = VoiceConstants.endOfTurnSilence.asSeconds
 
     public static var seconds: Double {
-        get {
-            guard UserDefaults.standard.object(forKey: key) != nil else {
-                return defaultSeconds
-            }
-            return UserDefaults.standard.double(forKey: key).clamped(to: range)
-        }
-        set { UserDefaults.standard.set(newValue.clamped(to: range), forKey: key) }
+        get { seconds(in: .standard) }
+        set { setSeconds(newValue, in: .standard) }
+    }
+
+    /// The same read and write against an explicit store, so the clamping can
+    /// be exercised without a process-global write other suites would see.
+    static func seconds(in defaults: UserDefaults) -> Double {
+        guard defaults.object(forKey: key) != nil else { return defaultSeconds }
+        return defaults.double(forKey: key).clamped(to: range)
+    }
+
+    static func setSeconds(_ newValue: Double, in defaults: UserDefaults) {
+        defaults.set(newValue.clamped(to: range), forKey: key)
     }
 
     public static var duration: Duration { .seconds(seconds) }

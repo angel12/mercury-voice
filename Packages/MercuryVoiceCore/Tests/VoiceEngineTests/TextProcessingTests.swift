@@ -376,31 +376,47 @@ struct BargeDetectorTests {
 
 @Suite("Turn silence preference")
 struct TurnSilencePreferenceTests {
-    /// Serialized through one test to avoid parallel writers on the shared
-    /// UserDefaults key; restores whatever was stored before.
-    @Test func defaultsAndClamping() {
-        let defaults = UserDefaults.standard
-        let saved = defaults.object(forKey: TurnSilencePreference.key)
-        defer {
-            if let saved {
-                defaults.set(saved, forKey: TurnSilencePreference.key)
-            } else {
-                defaults.removeObject(forKey: TurnSilencePreference.key)
-            }
-        }
+    /// Runs against a private suite, never `.standard`: the key is a
+    /// process-global one that the barge and VAD paths read, and a write here
+    /// would be visible to every suite running in parallel.
+    @Test func defaultsAndClamping() throws {
+        let suiteName = "TurnSilencePreferenceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        defaults.removeObject(forKey: TurnSilencePreference.key)
-        #expect(TurnSilencePreference.seconds == TurnSilencePreference.defaultSeconds)
-        #expect(TurnSilencePreference.duration == VoiceConstants.endOfTurnSilence)
+        #expect(
+            TurnSilencePreference.seconds(in: defaults) == TurnSilencePreference.defaultSeconds)
+        #expect(
+            Duration.seconds(TurnSilencePreference.seconds(in: defaults))
+                == VoiceConstants.endOfTurnSilence)
 
-        TurnSilencePreference.seconds = 2.0
-        #expect(TurnSilencePreference.seconds == 2.0)
-        #expect(TurnSilencePreference.duration == .seconds(2))
+        TurnSilencePreference.setSeconds(2.0, in: defaults)
+        #expect(TurnSilencePreference.seconds(in: defaults) == 2.0)
 
         // Out-of-range values clamp on both write and read.
-        TurnSilencePreference.seconds = 99
-        #expect(TurnSilencePreference.seconds == TurnSilencePreference.range.upperBound)
+        TurnSilencePreference.setSeconds(99, in: defaults)
+        #expect(
+            TurnSilencePreference.seconds(in: defaults) == TurnSilencePreference.range.upperBound)
         defaults.set(0.01, forKey: TurnSilencePreference.key)
-        #expect(TurnSilencePreference.seconds == TurnSilencePreference.range.lowerBound)
+        #expect(
+            TurnSilencePreference.seconds(in: defaults) == TurnSilencePreference.range.lowerBound)
+    }
+
+    /// The private-suite discipline above is what keeps the barge and VAD
+    /// suites deterministic, so assert it rather than trusting the reading.
+    @Test func exercisingThePreferenceLeavesTheStandardStoreUntouched() throws {
+        let before = UserDefaults.standard.object(forKey: TurnSilencePreference.key) as? Double
+        let suiteName = "TurnSilencePreferenceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        TurnSilencePreference.setSeconds(3.0, in: defaults)
+        #expect(TurnSilencePreference.seconds(in: defaults) == 3.0)
+        #expect(
+            UserDefaults.standard.object(forKey: TurnSilencePreference.key) as? Double == before)
+        // The shipped accessors are the same read, bound to `.standard`.
+        #expect(TurnSilencePreference.seconds == TurnSilencePreference.seconds(in: .standard))
+        #expect(TurnSilencePreference.duration == .seconds(TurnSilencePreference.seconds))
     }
 }
