@@ -90,6 +90,14 @@ public actor LoopbackRedirectListener {
 
     public let path: String
     private let expectedState: String
+    /// How long an accepted connection has to deliver a complete request line
+    /// before it is dropped. A loopback redirect arrives in milliseconds; the
+    /// bound exists so a connection that opens and then stalls cannot hold a
+    /// receive (and its buffer) for the whole sign-in.
+    private let requestDeadline: Duration
+    /// Cap on what one connection may accumulate while its request line is
+    /// still unterminated. A callback request line is a few hundred bytes.
+    private static let maxRequestLineBytes = 16384
     private var listener: NWListener?
     private var startWaiter: CheckedContinuation<UInt16, Error>?
     private var codeWaiter: CheckedContinuation<String, Error>?
@@ -100,6 +108,15 @@ public actor LoopbackRedirectListener {
     public init(expectedState: String, path: String = "/oauth/callback") {
         self.expectedState = expectedState
         self.path = path
+        self.requestDeadline = .seconds(10)
+    }
+
+    /// Test seam for the accept deadline; the public initializer keeps the
+    /// production value.
+    init(expectedState: String, path: String = "/oauth/callback", requestDeadline: Duration) {
+        self.expectedState = expectedState
+        self.path = path
+        self.requestDeadline = requestDeadline
     }
 
     /// Bind to an ephemeral 127.0.0.1 port and return it.
@@ -194,17 +211,72 @@ public actor LoopbackRedirectListener {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) {
-            [weak self] data, _, _, _ in
-            guard let self else { return connection.cancel() }
-            Task { await self.handle(request: data, on: connection) }
+        // A peer that opens the connection and then stalls — mid-request-line
+        // or before writing a byte — would otherwise hold an idle receive for
+        // as long as the flow lives, so give it a deadline of its own.
+        let deadline = Task { [requestDeadline] in
+            try? await Task.sleep(for: requestDeadline)
+            guard !Task.isCancelled else { return }
+            connection.cancel()
+        }
+        receiveRequestLine(on: connection, accumulated: Data(), deadline: deadline)
+    }
+
+    /// One TCP receive is not one HTTP request: the redirect's request line
+    /// may arrive split across segments, so accumulate until it is terminated,
+    /// the peer stops writing, or the byte bound is reached.
+    private func receiveRequestLine(
+        on connection: NWConnection, accumulated: Data, deadline: Task<Void, Never>
+    ) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: Self.maxRequestLineBytes - accumulated.count
+        ) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                deadline.cancel()
+                return connection.cancel()
+            }
+            Task {
+                await self.received(
+                    data, endOfStream: isComplete || error != nil,
+                    on: connection, accumulated: accumulated, deadline: deadline)
+            }
         }
     }
 
-    private func handle(request data: Data?, on connection: NWConnection) {
-        guard let data, let text = String(data: data, encoding: .utf8),
-            let requestLine = text.split(separator: "\r\n").first
-        else {
+    private func received(
+        _ data: Data?, endOfStream: Bool, on connection: NWConnection,
+        accumulated: Data, deadline: Task<Void, Never>
+    ) {
+        var buffer = accumulated
+        if let data { buffer += data }
+
+        if let terminator = buffer.range(of: Data("\r\n".utf8)) {
+            deadline.cancel()
+            handle(requestLine: buffer[..<terminator.lowerBound], on: connection)
+        } else if endOfStream {
+            deadline.cancel()
+            // No CRLF, but the peer is done writing: what it sent is all the
+            // request line there will ever be.
+            if buffer.isEmpty {
+                connection.cancel()
+            } else {
+                handle(requestLine: buffer, on: connection)
+            }
+        } else if buffer.count >= Self.maxRequestLineBytes {
+            // Past the bound with no end in sight. Drop it unanswered rather
+            // than act on a truncated line: a truncation splits cleanly enough
+            // to parse, which is how a half-delivered callback could hand the
+            // flow a truncated `code` and consume the one-shot sign-in.
+            deadline.cancel()
+            connection.cancel()
+        } else {
+            receiveRequestLine(on: connection, accumulated: buffer, deadline: deadline)
+        }
+    }
+
+    private func handle(requestLine bytes: Data, on connection: NWConnection) {
+        guard let requestLine = String(data: bytes, encoding: .utf8) else {
             connection.cancel()
             return
         }
