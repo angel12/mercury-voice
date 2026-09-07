@@ -67,12 +67,31 @@ public protocol BargeMonitoring: Sendable {
         onSpeech: @escaping @Sendable () -> Void,
         onUtterance: @escaping @Sendable (RecordedUtterance?) -> Void
     ) async throws
+    /// True from the instant sustained speech trips the monitor until the
+    /// capture is delivered, dropped or the monitor is stopped.
+    ///
+    /// Synchronous on purpose (issue #87): the engine asks this from actor
+    /// jobs that must decide "does a barge capture own the mic?" without
+    /// suspending first, and its own bookkeeping only flips once `onSpeech`
+    /// has hopped onto the engine actor — for the length of that hop the
+    /// monitor is already recording while the engine still believes nothing
+    /// is in flight, and a teardown decided in that window loses the
+    /// utterance for good.
+    var isCapturing: Bool { get }
     func stop() async
     /// Mute/pause: make the monitor deaf. macOS keeps the mic stream open and
     /// discards audio (stopping a voice-processing unit mid-TTS kills
     /// playback). iOS detaches the capture consumer so the hardware mic can
     /// stop; the engine restarts the monitor on unmute.
     func setSuspended(_ suspended: Bool) async
+}
+
+extension BargeMonitoring {
+    /// Existing conformers keep compiling and keep their old behaviour: a
+    /// monitor that never claims the mic leaves the engine exactly as blind
+    /// as it was before `isCapturing` existed. Anything that can trip must
+    /// override it — the default is compatibility, not correctness.
+    public var isCapturing: Bool { false }
 }
 
 public protocol Transcribing: Sendable {

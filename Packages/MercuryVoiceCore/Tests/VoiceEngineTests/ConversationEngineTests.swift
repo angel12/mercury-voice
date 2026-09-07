@@ -253,6 +253,63 @@ struct ConversationEngineTests {
         #expect(await h.status(is: .idle))
     }
 
+    /// Issue #87: the monitor trips and starts recording before its
+    /// `onSpeech` callback can hop onto the engine actor. A `drive()` that
+    /// runs in that window sees a turn that is no longer busy and no capture
+    /// of its own on record — it must still not read that as a tool-only turn
+    /// and stop the monitor, or the utterance already being captured (here a
+    /// stop word) is lost and the mic re-arms instead.
+    @Test func bargeTripStillInFlightSurvivesTheToolOnlyDrive() async {
+        let h = Harness()
+        await h.enterThinking()
+        _ = await eventually { h.barge.isActive }
+
+        h.agent.setBusy(false)  // the turn settles
+        h.transcriber.queue("stop")
+        h.barge.tripDeferred()  // capturing; the engine has not been told yet
+        await h.engine.agentStateChanged()
+
+        #expect(h.barge.stopCount == 0)  // the monitor was left alone
+        h.barge.flushDeferredTrip()  // the trip's hop finally lands
+        h.barge.deliver(makeUtterance())
+
+        #expect(await eventually { h.stopWords.count == 1 })
+        #expect(h.agent.submissions.count == 1)  // only the kickoff turn
+        #expect(h.recorder.startCount == 1)  // no re-arm behind the capture
+        #expect(await h.status(is: .idle))
+    }
+
+    /// The same in-flight trip, but landing while the reply's speech settles
+    /// — `settleAfterSpeech` asks the same question and must give the mic to
+    /// the capture rather than drop the session (issue #87).
+    @Test func bargeTripStillInFlightSurvivesSpeechSettling() async {
+        let h = Harness()
+        await h.enterThinking()
+        h.agent.setPending(PendingSpeech(id: "0", text: "reply", pending: true))
+        await h.engine.agentStateChanged()
+        #expect(await h.status(is: .speaking))
+        // Re-read the stream on every poll: .speaking becomes visible before
+        // runLiveSpeech has opened it, so a snapshot here can still be nil.
+        #expect(await eventually { h.speech.currentStream?.appendedText == "reply" })
+
+        h.barge.tripDeferred()  // capturing; the engine has not been told yet
+        h.transcriber.queue("stop")
+        // The turn finishes and playback ends (the server's `end` for this
+        // reply), which takes the engine into settleAfterSpeech.
+        h.agent.setBusy(false)
+        h.speech.currentStream?.settle(.done)
+        #expect(await h.status(is: .listening))  // the capture owns the mic
+
+        #expect(h.barge.stopCount == 0)  // the monitor was left alone
+        h.barge.flushDeferredTrip()
+        h.barge.deliver(makeUtterance())
+
+        #expect(await eventually { h.stopWords.count == 1 })
+        #expect(h.agent.submissions.count == 1)
+        #expect(h.recorder.startCount == 1)
+        #expect(await h.status(is: .idle))
+    }
+
     @Test func bargeCaptureEchoingTheReplyIsDroppedNotSubmitted() async {
         // Issue #12: with speakers on, the mic hears the agent's own speech;
         // its transcript must never be submitted back as a user turn.
