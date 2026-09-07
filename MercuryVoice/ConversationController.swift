@@ -62,6 +62,11 @@ final class ConversationController {
         var text: String
     }
     private(set) var devMessages: [DevMessage] = []
+    var textDraft = ""
+    private(set) var pendingText: String?
+    private(set) var failedText: String?
+    private(set) var textSubmissionError: String?
+    private(set) var textSubmissionTask: Task<Void, Never>?
 
     // MARK: Wiring
 
@@ -152,7 +157,8 @@ final class ConversationController {
         profile: String?,
         sessionService: (any SessionServicing)? = nil,
         speech: (any SpeechPlaying)? = nil,
-        audio: AudioStack? = nil
+        audio: AudioStack? = nil,
+        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
@@ -172,8 +178,12 @@ final class ConversationController {
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
                 guard let sid = box.runtimeID else { throw HermesError.notConnected }
-                try await connection.submitPrompt(
-                    sessionID: sid, text: text, interrupted: interrupted)
+                if let submitPrompt {
+                    try await submitPrompt(sid, text, interrupted)
+                } else {
+                    try await connection.submitPrompt(
+                        sessionID: sid, text: text, interrupted: interrupted)
+                }
             },
             interrupt: {
                 guard let sid = box.runtimeID else { return }
@@ -209,7 +219,11 @@ final class ConversationController {
     /// await, which a `Task { await teardown() }` cannot promise. Every
     /// caller still follows with `teardown()` to end the engine and close the
     /// session (issue #77).
-    func supersede() { isTornDown = true }
+    func supersede() {
+        isTornDown = true
+        pendingText = nil
+        textSubmissionTask?.cancel()
+    }
 
     func begin(mode: Mode) async {
         self.mode = mode
@@ -1233,12 +1247,58 @@ final class ConversationController {
 
     // MARK: Dev text path
 
+    func dismissFailedText() {
+        guard !isTornDown, pendingText == nil else { return }
+        failedText = nil
+        textSubmissionError = nil
+    }
+
     func submitTextPrompt(_ text: String) {
+        guard !isTornDown, pendingText == nil else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        appendDevMessage(role: "user", text: trimmed)
-        Task {
-            try? await tracker.submit(text: trimmed, interrupted: false)
+        guard !trimmed.isEmpty, failedText == nil || failedText == trimmed else { return }
+        guard connectionHealthy else {
+            failedText = trimmed
+            textSubmissionError =
+                textSubmissionError
+                ?? "Not connected to the Hermes server. Reconnect, then retry."
+            return
+        }
+        let draftAtSubmission = textDraft
+        pendingText = trimmed
+        textSubmissionError = nil
+        textSubmissionTask = Task {
+            guard !isTornDown else { return }
+            do {
+                try await tracker.submit(text: trimmed, interrupted: false)
+                guard !isTornDown else { return }
+                appendDevMessage(role: "user", text: trimmed)
+                failedText = nil
+                if textDraft == draftAtSubmission,
+                    draftAtSubmission.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
+                {
+                    textDraft = ""
+                }
+            } catch {
+                guard !isTornDown else { return }
+                failedText = trimmed
+                // Transport failures may follow server acceptance. Never echo
+                // raw error text (which can contain tokens, paths or IDs).
+                textSubmissionError =
+                    "Delivery is uncertain. Check the conversation before retrying; "
+                    + "retrying may send this message twice."
+                if let hermesError = error as? HermesError,
+                    let reason = hermesError.rpcReason,
+                    [
+                        HermesError.RefusalReason.sessionNotOwned,
+                        HermesError.RefusalReason.maxConcurrentSessions,
+                        HermesError.RefusalReason.coordinationUnavailable,
+                    ].contains(reason)
+                {
+                    textSubmissionError = hermesError.errorDescription
+                }
+            }
+            pendingText = nil
         }
     }
 

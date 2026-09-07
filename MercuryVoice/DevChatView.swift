@@ -4,8 +4,7 @@ import SwiftUI
 /// as a debugging console during voice conversations.
 struct DevChatView: View {
     @Environment(\.dismiss) private var dismiss
-    let controller: ConversationController
-    @State private var draft = ""
+    @Bindable var controller: ConversationController
 
     var body: some View {
         NavigationStack {
@@ -36,13 +35,41 @@ struct DevChatView: View {
                 .defaultScrollAnchor(.bottom)
 
                 Divider()
+                if let pending = controller.pendingText {
+                    VStack(alignment: .leading) {
+                        ProgressView("Sending…")
+                        Text(pending).textSelection(.enabled)
+                    }
+                    .padding()
+                }
+                if let error = controller.textSubmissionError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error).foregroundStyle(.red)
+                        if let failed = controller.failedText {
+                            Text(failed).textSelection(.enabled)
+                            Button("Retry message") {
+                                controller.submitTextPrompt(failed)
+                            }
+                            .disabled(controller.pendingText != nil)
+                            Button("Dismiss failed message", action: controller.dismissFailedText)
+                                .disabled(controller.pendingText != nil)
+                            Text("Retry or dismiss this message before sending another.")
+                                .font(.caption)
+                        }
+                    }
+                    .padding()
+                }
                 HStack {
-                    TextField("Type a message", text: $draft)
+                    TextField("Type a message", text: $controller.textDraft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(send)
                     Button("Send", action: send)
                         .buttonStyle(.borderedProminent)
-                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(
+                            controller.pendingText != nil || controller.failedText != nil
+                                || controller.textDraft.trimmingCharacters(
+                                    in: .whitespacesAndNewlines
+                                ).isEmpty)
                 }
                 .padding()
             }
@@ -58,8 +85,7 @@ struct DevChatView: View {
         #endif
     }
 
-    private func send() {
-        controller.submitTextPrompt(draft)
-        draft = ""
+    func send() {
+        controller.submitTextPrompt(controller.textDraft)
     }
 }
