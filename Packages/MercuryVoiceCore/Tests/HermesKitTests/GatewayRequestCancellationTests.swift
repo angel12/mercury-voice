@@ -180,7 +180,8 @@ struct GatewayRequestCancellationTests {
         }
         await socket.awaitSend(count: 1)
 
-        #expect(await settled(call) == .failure(HermesError.timeout("gateway.ping").errorDescription!))
+        #expect(
+            await settled(call) == .failure(HermesError.timeout("gateway.ping").errorDescription!))
         #expect(await client.pendingRequestCount == 0)
         #expect(await client.liveRequestTimeouts == 0)
         await client.close(reason: "test over")

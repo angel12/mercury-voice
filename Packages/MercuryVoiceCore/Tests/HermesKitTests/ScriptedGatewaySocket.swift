@@ -28,7 +28,8 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
 
     private let lock = NSLock()
     private var inbound: [Result<URLSessionWebSocketTask.Message, Error>] = []
-    private var receiveWaiter: CheckedContinuation<Result<URLSessionWebSocketTask.Message, Error>, Never>?
+    private var receiveWaiter:
+        CheckedContinuation<Result<URLSessionWebSocketTask.Message, Error>, Never>?
     private var writes: [PendingWrite] = []
     private var unacknowledged: [Int: PendingWrite] = [:]
     private var sendWaiters: [(count: Int, cont: CheckedContinuation<Void, Never>)] = []
@@ -104,13 +105,15 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
     }
 
     func deliverReply(id: Int, result: String) {
-        deliverText("""
+        deliverText(
+            """
             {"jsonrpc":"2.0","id":\(id),"result":\(result)}
             """)
     }
 
     func deliverErrorReply(id: Int, code: Int, message: String) {
-        deliverText("""
+        deliverText(
+            """
             {"jsonrpc":"2.0","id":\(id),"error":{"code":\(code),"message":"\(message)"}}
             """)
     }
