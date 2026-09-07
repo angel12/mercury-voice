@@ -105,6 +105,10 @@ public actor HermesConnection {
     public func request(
         _ method: String, params: JSONValue? = nil, timeout: TimeInterval = 60
     ) async throws -> JSONValue {
+        // A caller that already gave up gets its own answer: reporting the
+        // socket's state instead would blame the server for a local decision
+        // (and, while ready, would still put the frame on the wire).
+        try Task.checkCancellation()
         guard let gateway, case .ready = phase else { throw HermesError.notConnected }
         return try await gateway.request(method, params: params, timeout: timeout)
     }
@@ -128,6 +132,10 @@ public actor HermesConnection {
         guard case .ready = phase, let gateway else { return }
         do {
             _ = try await gateway.request("gateway.ping", timeout: timeout)
+        } catch is CancellationError {
+            // The probe was abandoned locally; that is no evidence about the
+            // socket, and dropping a healthy one would cost a reconnect.
+            return
         } catch let error as HermesError {
             if case .rpcError = error { return }  // server answered — alive
             await gateway.close(reason: "heartbeat probe failed")

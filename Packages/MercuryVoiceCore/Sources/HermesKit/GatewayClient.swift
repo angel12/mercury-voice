@@ -1,5 +1,25 @@
 import Foundation
 
+/// The socket surface `GatewayClient` drives. `URLSessionWebSocketTask` is the
+/// only production conformer; tests script one so a reply, a close, a write
+/// completion and a caller's cancellation can be ordered against each other
+/// exactly instead of hoped for.
+protocol GatewaySocket: AnyObject, Sendable {
+    var closeCode: URLSessionWebSocketTask.CloseCode { get }
+    func resume()
+    func receiveFrame() async throws -> URLSessionWebSocketTask.Message
+    func sendText(_ text: String, completion: @escaping @Sendable (Error?) -> Void)
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+}
+
+extension URLSessionWebSocketTask: GatewaySocket {
+    func receiveFrame() async throws -> Message { try await receive() }
+
+    func sendText(_ text: String, completion: @escaping @Sendable (Error?) -> Void) {
+        send(.string(text), completionHandler: completion)
+    }
+}
+
 /// One live JSON-RPC 2.0 connection to `/api/ws`.
 ///
 /// Single-connection lifetime: dial once, use until it drops, then discard.
@@ -27,7 +47,8 @@ public actor GatewayClient {
     private let endpoint: ServerEndpoint
     private let authenticator: HermesAuthenticator
     private let urlSession: URLSession
-    private var task: URLSessionWebSocketTask?
+    private let makeSocket: @Sendable (URL) -> any GatewaySocket
+    private var task: (any GatewaySocket)?
     private var receiveLoop: Task<Void, Never>?
 
     private var nextRequestID = 0
@@ -40,21 +61,45 @@ public actor GatewayClient {
     public private(set) var replayEpoch: String?
     private var readyWaiters: [CheckedContinuation<Void, Error>] = []
 
+    /// Request-lifecycle probes for tests: whatever ends a request — reply,
+    /// error, close, timeout, caller cancellation — must leave behind neither
+    /// a suspended continuation nor a running timeout timer.
+    var pendingRequestCount: Int { pending.count }
+    private(set) var liveRequestTimeouts = 0
+
     /// Backend contract version reported in gateway payloads (session.info's
     /// `desktop_contract`); the app warns when older than what it was built
     /// against.
     public static let builtAgainstDesktopContract = 6
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
-        self.endpoint = endpoint
-        self.authenticator = authenticator
-
         let config = URLSessionConfiguration.ephemeral
         // Long agent turns stall frames for minutes; never let URLSession
         // kill the socket for resource-timeout reasons under us.
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 7 * 24 * 3600
-        self.urlSession = URLSession(configuration: config)
+        let session = URLSession(configuration: config)
+
+        self.init(endpoint: endpoint, authenticator: authenticator, urlSession: session) { url in
+            let task = session.webSocketTask(with: url)
+            // Tolerate large inbound frames (session.info / transcripts).
+            task.maximumMessageSize = 64 * 1024 * 1024
+            return task
+        }
+    }
+
+    /// Socket-injecting initializer (tests). Everything else — connect,
+    /// receive loop, request bookkeeping — is the production path.
+    init(
+        endpoint: ServerEndpoint,
+        authenticator: HermesAuthenticator,
+        urlSession: URLSession = URLSession(configuration: .ephemeral),
+        makeSocket: @escaping @Sendable (URL) -> any GatewaySocket
+    ) {
+        self.endpoint = endpoint
+        self.authenticator = authenticator
+        self.urlSession = urlSession
+        self.makeSocket = makeSocket
     }
 
     public init(endpoint: ServerEndpoint, token: String?) {
@@ -88,9 +133,7 @@ public actor GatewayClient {
         }
         let url = endpoint.webSocketURL("/api/ws", query: query)
 
-        let task = urlSession.webSocketTask(with: url)
-        // Tolerate large inbound frames (session.info / transcripts).
-        task.maximumMessageSize = 64 * 1024 * 1024
+        let task = makeSocket(url)
         self.task = task
         task.resume()
 
@@ -120,11 +163,31 @@ public actor GatewayClient {
     // MARK: Requests
 
     /// Send a JSON-RPC request and await its response.
+    ///
+    /// Cancellation is local and immediate: a cancelled caller stops waiting
+    /// with `CancellationError` and its continuation is dropped, rather than
+    /// staying suspended until a reply, a close, or the timeout — which for
+    /// `prompt.submit` is 1,800 seconds. Two things it deliberately does NOT
+    /// do:
+    ///
+    /// - It never interrupts the backend. A frame already handed to the
+    ///   socket cannot be unsent, so the turn it started keeps running;
+    ///   whoever wants it stopped must say so with `session.interrupt`.
+    /// - It never closes the socket. Other requests and the event stream
+    ///   share it.
+    ///
+    /// A request whose cancellation is seen *before* the frame reaches the
+    /// socket is never sent at all — the actor step that registers the
+    /// continuation and hands the text to the socket is the linearization
+    /// point, and cancellation observed before it wins.
     public func request(
         _ method: String,
         params: JSONValue? = nil,
         timeout: TimeInterval = 60
     ) async throws -> JSONValue {
+        // Before anything else: an abandoned call must not reach the wire.
+        // A `prompt.submit` nobody is waiting for still starts a turn.
+        try Task.checkCancellation()
         guard state == .ready, let task else { throw HermesError.notConnected }
 
         nextRequestID += 1
@@ -141,18 +204,56 @@ public actor GatewayClient {
             throw HermesError.malformedResponse("could not encode request")
         }
 
+        liveRequestTimeouts += 1
         let timeoutTask = Task {
             try? await Task.sleep(for: .seconds(timeout))
             self.timeOutRequest(id: id, method: method)
         }
-        defer { timeoutTask.cancel() }
+        defer {
+            timeoutTask.cancel()
+            liveRequestTimeouts -= 1
+        }
 
-        return try await withCheckedThrowingContinuation { cont in
-            pending[id] = cont
-            task.send(.string(text)) { [weak self] error in
-                guard let error else { return }
-                Task { await self?.failRequest(id: id, error: error) }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                // This closure runs synchronously on the actor as part of the
+                // calling task, so registering the continuation and handing
+                // the frame to the socket are one indivisible step, and
+                // `Task.isCancelled` here is this caller's own flag.
+                if Task.isCancelled {
+                    // Cancelled while this call waited its turn on the actor
+                    // (or during the hop into the handler above): nothing has
+                    // been sent yet, so nothing needs unsending.
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                if case .closed(let reason) = state {
+                    // The socket went away while we hopped; answer exactly as
+                    // close()'s sweep would have, instead of registering a
+                    // continuation nobody will ever resume.
+                    cont.resume(throwing: HermesError.connectionClosed(reason))
+                    return
+                }
+                pending[id] = cont
+                task.sendText(text) { [weak self] error in
+                    guard let error else { return }
+                    Task { await self?.failRequest(id: id, error: error) }
+                }
             }
+        } onCancel: {
+            // The handler cannot touch actor state directly; it hops. If a
+            // reply, a close or the timeout got there first the entry is
+            // already gone and this is a no-op — whoever removes the
+            // continuation is the one that resumes it, exactly once.
+            Task { await self.cancelRequest(id: id) }
+        }
+    }
+
+    /// Cancellation seen after the request registered: forget it and release
+    /// the caller. The frame stays sent — see `request(_:params:timeout:)`.
+    private func cancelRequest(id: Int) {
+        if let cont = pending.removeValue(forKey: id) {
+            cont.resume(throwing: CancellationError())
         }
     }
 
@@ -213,10 +314,10 @@ public actor GatewayClient {
 
     // MARK: Receive loop
 
-    private func runReceiveLoop(_ task: URLSessionWebSocketTask) async {
+    private func runReceiveLoop(_ task: any GatewaySocket) async {
         while !Task.isCancelled {
             do {
-                let message = try await task.receive()
+                let message = try await task.receiveFrame()
                 switch message {
                 case .string(let text):
                     handleFrame(text)
