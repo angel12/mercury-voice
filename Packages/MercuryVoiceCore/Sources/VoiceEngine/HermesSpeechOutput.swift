@@ -67,7 +67,17 @@ public actor HermesSpeechOutput: SpeechPlaying {
         return session
     }
 
+    public func playAnnouncement(text: String, expectedSequence: Int) async -> Bool {
+        await playFallback(text: text, expectedSequence: expectedSequence, isAnnouncement: true)
+    }
+
     public func playFallback(text: String, expectedSequence: Int) async -> Bool {
+        await playFallback(text: text, expectedSequence: expectedSequence, isAnnouncement: false)
+    }
+
+    private func playFallback(
+        text: String, expectedSequence: Int, isAnnouncement: Bool
+    ) async -> Bool {
         // Client-side sanitization mirrors the desktop's playSpeechText; the
         // streaming path sends raw deltas because the server strips markdown
         // per sentence itself.
@@ -78,13 +88,30 @@ public actor HermesSpeechOutput: SpeechPlaying {
         // adopting the newer value would play a clip the user cancelled.
         // Synthesis is also a suspension with no player yet, so the same
         // value is checked again when the clip arrives (#34).
-        guard sequence == expectedSequence else { return false }
+        guard sequence == expectedSequence, !isAnnouncement || !Task.isCancelled else {
+            return false
+        }
         guard let data = await synthesizeClip(sanitized) else { return false }
-        guard sequence == expectedSequence else { return false }
+        guard sequence == expectedSequence, !isAnnouncement || !Task.isCancelled else {
+            return false
+        }
 
         let player = makeFallbackPlayer()
         fallback = player
-        let playback = await player.play(data: data)
+        let playback: ClipPlayback
+        if isAnnouncement {
+            // Registration also handles cancellation between synthesis and this
+            // handoff. Stop is synchronous and terminal on this single-use sink,
+            // so cancellation before play cannot be undone by a later start.
+            // Capture the local player, never the shared/newer fallback slot.
+            playback = await withTaskCancellationHandler {
+                await player.play(data: data)
+            } onCancel: {
+                player.stop()
+            }
+        } else {
+            playback = await player.play(data: data)
+        }
         if fallback === player { fallback = nil }
         return playback == .completed
     }

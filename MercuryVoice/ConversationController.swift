@@ -50,8 +50,15 @@ final class ConversationController {
     /// the authoritative `message.complete` usage. nil until the first turn
     /// reports, or when the backend doesn't report usage at all.
     private(set) var usage: SessionUsage?
-    var approval: ApprovalRequest?
-    var clarify: ClarifyRequest?
+    // Every sheet write retires its previous notice, including UI dismissal,
+    // confirmed responses and authoritative reconnect reads. Cancellation is
+    // synchronous and scoped to that notice, not the shared speech output.
+    var approval: ApprovalRequest? {
+        willSet { approvalAnnouncement?.cancel() }
+    }
+    var clarify: ClarifyRequest? {
+        willSet { clarifyAnnouncement?.cancel() }
+    }
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -223,6 +230,8 @@ final class ConversationController {
         isTornDown = true
         pendingText = nil
         textSubmissionTask?.cancel()
+        approvalAnnouncement?.cancel()
+        clarifyAnnouncement?.cancel()
     }
 
     func begin(mode: Mode) async {
@@ -833,9 +842,9 @@ final class ConversationController {
     /// ended or superseded (issues #38, #77), the prompt can expire, be
     /// answered, be replaced, or be retired by the post-reconnect prompt read,
     /// and playback can be stopped. Cancelling the task is not enough on its
-    /// own: one already suspended past its last cancellation check resumes and
-    /// runs to completion regardless. So each fact is captured before the
-    /// first suspension and re-checked after it.
+    /// own: the output must consume it after synthesis and stop that notice's
+    /// single-use player during delivery. Before handing off, each controller
+    /// fact is captured before suspension and re-checked after it.
     ///
     /// The speech generation is one of those facts, which is why this passes
     /// its own snapshot rather than calling the `playFallback(text:)`
@@ -854,7 +863,7 @@ final class ConversationController {
         guard isCurrent(notice) else { return }
         await engine?.setPaused(true)
         guard isCurrent(notice) else { return }
-        _ = await speech.playFallback(text: notice.text, expectedSequence: sequence)
+        _ = await speech.playAnnouncement(text: notice.text, expectedSequence: sequence)
     }
 
     /// True while `notice` still describes a prompt on screen, in a
