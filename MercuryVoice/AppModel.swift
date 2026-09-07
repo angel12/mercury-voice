@@ -64,6 +64,42 @@ final class AppModel {
     private(set) var browseLoading = false
     var browseError: String?
 
+    /// Full session rows for a workspace that has been expanded past the
+    /// `projects.tree` preview (issue #76). Keyed by project id.
+    private(set) var expandedProjectSessions: [String: [SessionSummary]] = [:]
+    private(set) var expandingProjects: Set<String> = []
+    private(set) var projectSessionErrors: [String: String] = [:]
+    private(set) var recentsHasMore = false
+    private(set) var recentsLoadingMore = false
+    /// Consumed `/api/profiles/sessions` offset. Advanced by the raw
+    /// successful page length, never by unique displayed rows, and left
+    /// unchanged on failure so retry hits the same page.
+    private var recentsOffset = 0
+    /// Last `session_limit` successfully sent for a workspace. The RPC has
+    /// no offset; the next older-session search raises this rather than paging.
+    private var projectSessionFetchedLimit: [String: Int] = [:]
+    /// Workspaces whose last `project_sessions` scan added no new stored ids.
+    /// That is not exhaustion: `session_limit` applies to the profile-wide
+    /// scan, then only this project's share is returned.
+    private var projectScanFoundNoAdditional: Set<String> = []
+    /// Older backends without `projects.*` group the flat REST list.
+    private(set) var usesFlatFallback = false
+
+    static let workspacePreviewLimit = 3
+    static let recentsPageSize = 30
+    /// Client page for `projects.project_sessions`. The RPC has no offset —
+    /// only `session_limit`, a newest-first scan across the profile (server
+    /// default 5,000). The response is this project's share of that scan and
+    /// cannot prove exhaustion; tree `sessionCount` is itself capped.
+    static let workspaceSessionPageSize = 30
+    static let searchOlderSessionsTitle = "Search older sessions"
+    static let noAdditionalSessionsInScanMessage =
+        "No additional sessions found in this scan"
+
+    /// Listing surface for the current connection. Set with `connection` so
+    /// tests can script `projects.tree` / `project_sessions` / recents.
+    private var browse: (any BrowseServicing)?
+
     // MARK: Conversation
 
     var conversation: ConversationController?
@@ -257,6 +293,7 @@ final class AppModel {
 
         let connection = HermesConnection(endpoint: endpoint, authenticator: authenticator)
         self.connection = connection
+        self.browse = deps.makeBrowse(connection)
         startUpdatePump(connection)
         await deps.startGateway(connection)
     }
@@ -401,6 +438,7 @@ final class AppModel {
         let connection = connection
         let conversation = releaseConversation()
         self.connection = nil
+        self.browse = nil
         if connection != nil || conversation != nil {
             // Teardown closes the backend session over the gateway, so it
             // must complete before the connection stops.
@@ -414,6 +452,7 @@ final class AppModel {
         projectTree = nil
         recentSessions = []
         selectedProfile = nil
+        resetSessionPaging()
     }
 
     /// Foreground recovery: probe a seemingly-ready socket with
@@ -540,9 +579,10 @@ final class AppModel {
     }
 
     func refreshProjects() async {
-        guard let connection else { return }
+        guard let browse else { return }
         browseGeneration += 1  // supersede any in-flight load
         let generation = browseGeneration
+        resetSessionPaging()
         browseLoading = true
         defer {
             // A superseding refresh owns the flag now; only the newest
@@ -553,15 +593,20 @@ final class AppModel {
             // Server-side profile scoping (current gateways bind the profile's
             // HERMES_HOME; older ones ignore the param and the client-side
             // preview filter in BrowseView still applies).
-            let tree = try await connection.projectsTree(profile: selectedProfile)
+            let tree = try await browse.projectsTree(
+                previewLimit: Self.workspacePreviewLimit, profile: selectedProfile)
             guard generation == browseGeneration else { return }
             projectTree = tree
+            usesFlatFallback = false
             let profile = selectedProfile ?? "all"
-            // The full recent list for the profile; the workspace page shows
-            // the project-scoped grouping, so no de-duplication needed here.
-            let sessions = try await connection.rest.profileSessions(profile: profile, limit: 30)
+            // First recents page; the workspace page shows the project-scoped
+            // grouping (previews, then `project_sessions` on older-session search).
+            let sessions = try await browse.profileSessions(
+                profile: profile, limit: Self.recentsPageSize, offset: 0)
             guard generation == browseGeneration else { return }
-            recentSessions = sessions
+            recentsOffset = sessions.count
+            recentSessions = Self.uniqueSessions(sessions)
+            recentsHasMore = sessions.count >= Self.recentsPageSize
             browseError = nil
         } catch let error as HermesError {
             guard generation == browseGeneration else { return }
@@ -579,12 +624,28 @@ final class AppModel {
     }
 
     private func degradeToFlatSessions(generation: Int) async {
-        guard let connection else { return }
-        guard
-            let sessions = try? await connection.rest.profileSessions(
-                profile: selectedProfile ?? "all", limit: 50),
-            generation == browseGeneration
-        else { return }
+        guard let browse else { return }
+        do {
+            let sessions = try await browse.profileSessions(
+                profile: selectedProfile ?? "all",
+                limit: Self.recentsPageSize,
+                offset: 0)
+            guard generation == browseGeneration else { return }
+            recentsOffset = sessions.count
+            applyFlatSessions(
+                Self.uniqueSessions(sessions),
+                hasMore: sessions.count >= Self.recentsPageSize)
+            browseError = nil
+        } catch let error as HermesError {
+            guard generation == browseGeneration else { return }
+            browseError = error.errorDescription
+        } catch {
+            guard generation == browseGeneration else { return }
+            browseError = error.localizedDescription
+        }
+    }
+
+    private func applyFlatSessions(_ sessions: [SessionSummary], hasMore: Bool) {
         var groups: [String: [SessionSummary]] = [:]
         for session in sessions {
             let key = session.gitRepoRoot ?? session.cwd ?? ProjectInfo.noProjectID
@@ -598,11 +659,137 @@ final class AppModel {
                         ? "Home" : (key as NSString).lastPathComponent),
             ]
             if key != ProjectInfo.noProjectID { json["primary_path"] = .string(key) }
-            return ProjectInfo(json: .object(json))!
+            var info = ProjectInfo(json: .object(json))!
+            info.previewSessions = rows
+            info.sessionCount = rows.count
+            return info
         }
-        projectTree = ProjectTree(json: .object(["projects": .array([])]))
-        projectTree?.projects = projects.sorted { $0.name < $1.name }
+        var tree = ProjectTree(json: .object(["projects": .array([])]))
+        tree.projects = projects.sorted { $0.name < $1.name }
+        projectTree = tree
         recentSessions = sessions
+        recentsHasMore = hasMore
+        usesFlatFallback = true
+        expandedProjectSessions = [:]
+    }
+
+    /// Rows the workspace page should render for a project: the expanded
+    /// `project_sessions` list once loaded, otherwise the tree preview.
+    func sessions(for project: ProjectInfo) -> [SessionSummary] {
+        expandedProjectSessions[project.id] ?? project.previewSessions
+    }
+
+    func isExpandingProject(_ projectID: String) -> Bool {
+        expandingProjects.contains(projectID)
+    }
+
+    /// Older-session search stays available for RPC-backed workspaces.
+    /// `projects.project_sessions` applies `session_limit` to a profile-wide
+    /// newest-first scan, then returns this project's share — a short or
+    /// empty share is not exhaustion, and tree `sessionCount` is the same
+    /// capped scan. Fallback paging goes through recents.
+    func hasMoreSessions(in project: ProjectInfo) -> Bool {
+        if usesFlatFallback { return false }
+        return !project.id.isEmpty
+    }
+
+    /// Last `project_sessions` scan added no new stored ids. Not a claim that
+    /// the workspace is complete — only that this scan found nothing more.
+    func noAdditionalSessionsInLastScan(in project: ProjectInfo) -> Bool {
+        projectScanFoundNoAdditional.contains(project.id)
+    }
+
+    /// Load the fully hydrated rows for one workspace. Generation-checked so
+    /// a response cannot land after a newer refresh or profile switch.
+    func loadMoreProjectSessions(_ projectID: String) async {
+        guard let browse, expandingProjects.insert(projectID).inserted else { return }
+        let generation = browseGeneration
+        defer {
+            if generation == browseGeneration {
+                expandingProjects.remove(projectID)
+            }
+        }
+        projectSessionErrors[projectID] = nil
+        let requestedLimit =
+            (projectSessionFetchedLimit[projectID] ?? 0) + Self.workspaceSessionPageSize
+        do {
+            let rows = try await browse.projectSessions(
+                projectID: projectID, profile: selectedProfile,
+                sessionLimit: requestedLimit)
+            guard generation == browseGeneration else { return }
+            let fallback = projectTree?.projects.first { $0.id == projectID }?.previewSessions ?? []
+            let previous = expandedProjectSessions[projectID] ?? fallback
+            let previousIDs = Set(previous.map(\.storedID))
+            let addedNew = rows.contains { !previousIDs.contains($0.storedID) }
+            // Prefer this scan's rows for ids it returned; keep previous ids
+            // the scan omitted so a mixed-project short page cannot hide them.
+            expandedProjectSessions[projectID] = Self.uniqueSessions(rows + previous)
+            projectSessionFetchedLimit[projectID] = requestedLimit
+            if addedNew {
+                projectScanFoundNoAdditional.remove(projectID)
+            } else {
+                projectScanFoundNoAdditional.insert(projectID)
+            }
+        } catch let error as HermesError {
+            guard generation == browseGeneration else { return }
+            projectSessionErrors[projectID] = error.errorDescription
+        } catch {
+            guard generation == browseGeneration else { return }
+            projectSessionErrors[projectID] = error.localizedDescription
+        }
+    }
+
+    func loadMoreRecentSessions() async {
+        guard let browse, recentsHasMore, !recentsLoadingMore else { return }
+        let generation = browseGeneration
+        recentsLoadingMore = true
+        defer {
+            if generation == browseGeneration { recentsLoadingMore = false }
+        }
+        let offset = recentsOffset
+        do {
+            let page = try await browse.profileSessions(
+                profile: selectedProfile ?? "all",
+                limit: Self.recentsPageSize,
+                offset: offset)
+            guard generation == browseGeneration else { return }
+            recentsOffset += page.count
+            recentSessions = Self.uniqueSessions(recentSessions + page)
+            recentsHasMore = page.count >= Self.recentsPageSize
+            if usesFlatFallback {
+                applyFlatSessions(recentSessions, hasMore: recentsHasMore)
+            }
+            browseError = nil
+        } catch let error as HermesError {
+            guard generation == browseGeneration else { return }
+            browseError = error.errorDescription
+        } catch {
+            guard generation == browseGeneration else { return }
+            browseError = error.localizedDescription
+        }
+    }
+
+    /// First-seen stored id wins, including duplicates inside one page.
+    private static func uniqueSessions(_ rows: [SessionSummary]) -> [SessionSummary] {
+        var seen = Set<String>()
+        var unique: [SessionSummary] = []
+        unique.reserveCapacity(rows.count)
+        for row in rows where seen.insert(row.storedID).inserted {
+            unique.append(row)
+        }
+        return unique
+    }
+
+    private func resetSessionPaging() {
+        expandedProjectSessions = [:]
+        expandingProjects = []
+        projectSessionErrors = [:]
+        projectSessionFetchedLimit = [:]
+        projectScanFoundNoAdditional = []
+        recentsHasMore = false
+        recentsLoadingMore = false
+        recentsOffset = 0
+        usesFlatFallback = false
     }
 
     func selectProfile(_ name: String) async {
@@ -612,6 +799,7 @@ final class AppModel {
         // the sessions page shows its loading state, then refresh everything.
         recentSessions = []
         projectTree = nil
+        resetSessionPaging()
         await refreshProjects()
     }
 

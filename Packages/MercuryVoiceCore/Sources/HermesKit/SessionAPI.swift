@@ -176,11 +176,19 @@ extension HermesConnection {
 
     /// `projects.project_sessions` — the fully hydrated rows for one
     /// project, nested under `project` as repo → lane → sessions.
+    ///
+    /// `sessionLimit` maps to the handler's `session_limit` (server default
+    /// 5000). There is no offset: the backend scans the newest N sessions
+    /// across the profile, then returns this project's share. Omit to leave
+    /// the default in place.
     public func projectSessions(
-        projectID: String, profile: String? = nil
+        projectID: String, profile: String? = nil, sessionLimit: Int? = nil
     ) async throws -> [SessionSummary] {
         var params: [String: JSONValue] = ["project_id": .string(projectID)]
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
+        if let sessionLimit {
+            params["session_limit"] = .number(Double(sessionLimit))
+        }
         let result = try await request("projects.project_sessions", params: .object(params))
         guard let project = result["project"] else { return [] }
         return ProjectInfo.hydratedSessions(in: project)
