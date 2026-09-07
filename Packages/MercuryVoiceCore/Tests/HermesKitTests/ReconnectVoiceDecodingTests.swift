@@ -131,9 +131,38 @@ struct EventReplayDecodingTests {
     @Test func anEmptyConformingAnswerIsStillLossless() throws {
         let batch = EventReplayBatch(
             result: try json(
-                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#))
+                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#)
+        )
         #expect(batch.events.isEmpty)
         #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    @Test(arguments: ["", "null", "[]", "true", "7", "\"text\""])
+    func malformedReplayPayloadRejectsWholeBatch(literal: String) throws {
+        let payload = literal.isEmpty ? "" : " , \"payload\": \(literal)"
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type":"message.complete","session_id":"s1","seq":11,"payload":{}},
+                    {"type":"message.delta","session_id":"s1","seq":12\(payload)}
+                ],"latest_seq":12,"truncated":false,"count":2,"epoch":"e1"}
+                """))
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    @Test(arguments: ["", " ", "\t\n", "future.event"])
+    func replayRequiresUsableTypeButLiveDecodingStaysPermissive(type: String) {
+        let frame: JSONValue = [
+            "type": .string(type), "session_id": "s1", "seq": 11, "payload": [:],
+        ]
+        let batch = EventReplayBatch(result: [
+            "events": .array([frame]), "latest_seq": 11, "truncated": false, "epoch": "e1",
+        ])
+        #expect(GatewayEvent(eventParams: frame)?.type == type)
+        #expect(
+            batch.isLossless(under: "e1", forSession: "s1", after: 10) == (type == "future.event"))
     }
 
     // MARK: Fail-closed decoding (issue #58, finding R05)
@@ -162,22 +191,21 @@ struct EventReplayDecodingTests {
         #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
     }
 
-    /// Fail-closed is for answers that cannot be read, not for ones a Python
-    /// backend spells loosely: `0`/`"false"` still mean false.
-    @Test(arguments: ["false", "0", "\"false\""])
-    func looseFalseTruncatedFlagsStillDecode(literal: String) throws {
+    @Test(arguments: ["0", "1", "\"false\"", "\"0\"", "\"true\"", "\"1\""])
+    func nonBooleanTruncatedFlagsAreMalformed(literal: String) throws {
         let batch = EventReplayBatch(
             result: try json(
                 """
                 {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
                  "truncated": \(literal)}
                 """))
-        #expect(!batch.truncated)
-        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 4))
+        #expect(batch.malformed)
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
     }
 
-    @Test(arguments: ["true", "1", "\"true\""])
-    func looseTrueTruncatedFlagsStillDecode(literal: String) throws {
+    @Test(arguments: ["true"])
+    func trueTruncatedFlagStillDecodes(literal: String) throws {
         let batch = EventReplayBatch(
             result: try json(
                 """
@@ -189,8 +217,10 @@ struct EventReplayDecodingTests {
     }
 
     /// No `events` array at all is an unread response, not an empty replay.
-    @Test(arguments: [#"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
-        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#])
+    @Test(arguments: [
+        #"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+    ])
     func absentOrNonArrayEventsIsUnusable(document: String) throws {
         let batch = EventReplayBatch(result: try json(document))
         #expect(batch.events.isEmpty)
@@ -252,8 +282,10 @@ struct EventReplayDecodingTests {
 
     /// The gateway writes `latest_seq` on every answer; without a readable
     /// one there is no evidence about the numbering at all.
-    @Test(arguments: ["", #""latest_seq": null,"#, #""latest_seq": "12","#,
-        #""latest_seq": 11.5,"#, #""latest_seq": 1e19,"#])
+    @Test(arguments: [
+        "", #""latest_seq": null,"#, #""latest_seq": "12","#,
+        #""latest_seq": 11.5,"#, #""latest_seq": 1e19,"#,
+    ])
     func anAbsentOrUnreadableLatestSeqIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(
@@ -264,10 +296,8 @@ struct EventReplayDecodingTests {
         #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
     }
 
-    /// `latest_seq` is read after the frames, so it can legitimately be
-    /// *ahead* of the last one (an event stamped in between; it arrives on
-    /// the live socket). Behind the last frame it cannot be: that answer did
-    /// not come from one ring.
+    /// Latest behind the frames contradicts coverage, just as latest ahead
+    /// leaves an unproven tail. Neither is accepted as lossless.
     @Test func aLatestSeqBehindTheLastFrameIsUnusable() throws {
         let batch = EventReplayBatch(
             result: try json(
@@ -290,7 +320,8 @@ struct EventReplayDecodingTests {
     /// whole rather than partially applied.
     @Test(arguments: [[12, 11], [11, 13], [11, 11], [15], [10, 11], [11, 12, 14]])
     func framesMustAscendByOneFromTheWatermark(seqs: [Int]) throws {
-        let frames = seqs
+        let frames =
+            seqs
             .map {
                 #"{"type": "message.complete", "session_id": "s1", "seq": \#($0), "payload": {}}"#
             }
@@ -305,8 +336,7 @@ struct EventReplayDecodingTests {
         #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
     }
 
-    /// A contiguous run is the answer the gateway sends, and it still
-    /// replays — including when `latest_seq` has moved on ahead of it.
+    /// A contiguous prefix alone does not prove coverage of an absent tail.
     @Test(arguments: [12, 13, 99])
     func aContiguousRunStillReplays(latest: Int) throws {
         let batch = EventReplayBatch(
@@ -318,7 +348,14 @@ struct EventReplayDecodingTests {
                  ],
                  "latest_seq": \(latest), "truncated": false, "count": 2, "epoch": "e1"}
                 """))
-        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10))
+        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10) == (latest == 12))
+    }
+
+    @Test func emptyBatchCannotOmitANewerTail() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                #"{"events":[],"latest_seq":12,"truncated":false,"count":0,"epoch":"e1"}"#))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
     }
 
     /// Every replayed frame is stamped (`_stamp_event`), so one whose `seq`
@@ -327,10 +364,12 @@ struct EventReplayDecodingTests {
     /// gate would let it through without advancing the watermark. Reading it
     /// must not trap either: the number is server-controlled. (A magnitude
     /// beyond `Double` — `1e400` — never reaches here at all: `JSONValue`
-    /// itself refuses to decode it, so the RPC result throws and the caller
-    /// takes the same fallback.)
-    @Test(arguments: ["", #""seq": null,"#, #""seq": "12","#, #""seq": 11.5,"#,
-        #""seq": -12,"#, #""seq": 1e19,"#])
+    /// itself refuses to decode it. The transport drops that response and
+    /// the RPC eventually fails by timeout/disconnect, reaching fallback.)
+    @Test(arguments: [
+        "", #""seq": null,"#, #""seq": "12","#, #""seq": 11.5,"#,
+        #""seq": -12,"#, #""seq": 1e19,"#,
+    ])
     func aFrameWithoutAnIntegerSeqIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(
@@ -366,8 +405,10 @@ struct EventReplayDecodingTests {
     /// to none) would land on this conversation. `events_since` reads one
     /// session's ring and `_stamp_event` records only frames that name a
     /// session, so such a frame is not this answer.
-    @Test(arguments: ["", #""session_id": null,"#, #""session_id": "s2","#,
-        #""session_id": 1,"#])
+    @Test(arguments: [
+        "", #""session_id": null,"#, #""session_id": "s2","#,
+        #""session_id": 1,"#,
+    ])
     func aFrameFromAnotherSessionIsUnusable(fragment: String) throws {
         let batch = EventReplayBatch(
             result: try json(

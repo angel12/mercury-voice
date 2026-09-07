@@ -84,10 +84,18 @@ public struct EventReplayBatch: Sendable, Equatable {
 
     public init(result: JSONValue) {
         let entries = result["events"]?.arrayValue
-        let decoded = entries?.compactMap(GatewayEvent.init(eventParams:)) ?? []
+        // Replay needs structural evidence; the ordinary live decoder remains permissive.
+        let decoded =
+            entries?.compactMap { entry -> GatewayEvent? in
+                guard let type = entry["type"]?.stringValue,
+                    !type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    entry["payload"]?.objectValue != nil
+                else { return nil }
+                return GatewayEvent(eventParams: entry)
+            } ?? []
         self.events = decoded
         self.latestSeq = result["latest_seq"]?.intValue
-        let gap = Self.boolean(result["truncated"])
+        let gap = result["truncated"]?.boolValue
         self.truncated = gap ?? true
         self.epoch = result["epoch"]?.stringValue
         // `count` is the gateway's own tally of what it put in `events`
@@ -108,9 +116,9 @@ public struct EventReplayBatch: Sendable, Equatable {
     /// "this answer is not evidence that nothing was missed", and the caller
     /// must refresh instead of replaying.
     ///
-    /// What a conforming answer from the gateway always satisfies, and what
-    /// is therefore required here (`tui_gateway/event_replay.py`,
-    /// `methods_session.py`, `server.py:write_json`):
+    /// Required evidence, based on `tui_gateway/event_replay.py` and
+    /// `methods_session.py`. The backend reads frames and metadata separately;
+    /// requiring complete coverage may conservatively reject a racing answer:
     ///
     /// - The epoch is present and equal. It has been echoed here since the
     ///   same gateway commit that first advertised `replay_epoch` at
@@ -135,9 +143,13 @@ public struct EventReplayBatch: Sendable, Equatable {
     ///   from another session invalidates the batch as a whole rather than
     ///   the frame alone — the caller applies all of it or none of it.
     ///
+    /// Numeric validation operates on JSONValue's Double representation, not
+    /// lexical JSON numbers: rounded fractions and large counters cannot be
+    /// recovered here. Int(exactly:) checks the represented value only.
+    ///
     /// Residual, and a backend limitation rather than something a client can
-    /// see: a session whose ring was evicted and has since emitted more than
-    /// `watermark` new events answers exactly like a real continuation. Only
+    /// see: an evicted session whose new counter catches up to `watermark`
+    /// can answer exactly like a real continuation. Only
     /// a per-session epoch (or an `is_truncated` that reported a missing
     /// ring) could distinguish it.
     public func isLossless(
@@ -155,25 +167,9 @@ public struct EventReplayBatch: Sendable, Equatable {
             guard !overflowed, seq == next else { return false }
             previous = next
         }
-        return previous <= latest
-    }
-
-    /// A JSON boolean, or the loose spellings a Python backend may use for
-    /// one; nil for anything that is not a boolean at all — including a
-    /// missing field, which for `truncated` means the gap question went
-    /// unanswered.
-    private static func boolean(_ value: JSONValue?) -> Bool? {
-        switch value {
-        case .bool(let flag): return flag
-        case .number(let number) where number == 0 || number == 1: return number == 1
-        case .string(let text):
-            switch text.lowercased() {
-            case "true", "1": return true
-            case "false", "0": return false
-            default: return nil
-            }
-        default: return nil
-        }
+        // Separate backend reads can race with stamping. An absent tail is
+        // still unproven coverage, even if it might arrive on the live socket.
+        return previous == latest
     }
 }
 
