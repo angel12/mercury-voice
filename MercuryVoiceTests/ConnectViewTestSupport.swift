@@ -9,30 +9,68 @@ import Testing
 // The view reaches `ConnectFormState` through two computed `Binding`s and
 // reads it back in the Connect button's action. Those are only exercised when
 // the controls the view hands them to are the ones a test drives, so each
-// control registers what it was given (`Binding.probed(_:)`,
-// `ConnectControl.probing(_:)`) and this hosts the real view long enough for
-// that registration to happen.
+// control registers what it was given (`ConnectView.probed(_:_:)`) with the
+// `ConnectControlRecorder` in its environment, and this hosts the real view
+// with such a recorder long enough for that registration to happen.
 //
 // Hosting rather than rendering-free reflection is forced by
 // `@Environment(AppModel.self)`: a `View`'s `body` cannot be evaluated, and its
 // `@State` cannot be read, until SwiftUI has installed it.
+//
+// Each host owns its recorder, so what it drives is its own view's controls:
+// no other `ConnectView` in this process — another host's, or the app window's
+// — can write there, and tearing a host down touches nobody else's.
 
 /// The shipping `ConnectView`, rendered in an off-screen window with `model`
 /// in its environment.
 @MainActor
 final class ConnectViewHost {
+    /// What this host's view registered. Nothing else can reach it.
+    let controls: ConnectControlRecorder
+
     #if os(macOS)
         private var window: NSWindow?
     #else
         private var window: UIWindow?
     #endif
 
-    /// Renders the view and returns once its controls have registered.
-    init(model: AppModel, sourceLocation: SourceLocation = #_sourceLocation) async {
-        ConnectControlProbe.reset()
-        ConnectControlProbe.isRecording = true
+    /// Renders the view with `controls` in its environment and returns once
+    /// its controls have registered there.
+    init(
+        model: AppModel, controls: ConnectControlRecorder = ConnectControlRecorder(),
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        self.controls = controls
+        render(ConnectView().environment(\.connectControlRecorder, controls), for: model)
 
-        let root = ConnectView().environment(model)
+        let registered = await wait(for: {
+            controls.field(.server) != nil
+                && controls.field(.token) != nil
+                && controls.action(.connect) != nil
+        })
+        if !registered {
+            Issue.record(
+                """
+                ConnectView rendered without registering its server field, token field and \
+                Connect action with this host's recorder. Either a control no longer routes \
+                through the bindings that own the ConnectFormState rules, or the view did \
+                not render at all.
+                """,
+                sourceLocation: sourceLocation)
+        }
+    }
+
+    /// Renders the view the way the app's own window does: with no recorder
+    /// anywhere in its environment. This host's `controls` therefore stay
+    /// empty, and so must every other host's.
+    init(ordinaryAppViewFor model: AppModel) async {
+        controls = ConnectControlRecorder()
+        render(ConnectView(), for: model)
+        await pump()
+    }
+
+    private func render(_ root: some View, for model: AppModel) {
+        let root = root.environment(model)
         #if os(macOS)
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 600, height: 900),
@@ -45,24 +83,9 @@ final class ConnectViewHost {
         #endif
         self.window = window
         layOut()
-
-        let registered = await wait(for: {
-            ConnectControlProbe.field(.server) != nil
-                && ConnectControlProbe.field(.token) != nil
-                && ConnectControlProbe.action(.connect) != nil
-        })
-        if !registered {
-            Issue.record(
-                """
-                ConnectView rendered without registering its server field, token field and \
-                Connect action. Either a control no longer routes through the bindings that \
-                own the ConnectFormState rules, or the view did not render at all.
-                """,
-                sourceLocation: sourceLocation)
-        }
     }
 
-    /// Drops the window and everything the probe recorded. Call from a test's
+    /// Drops this host's window and its recordings. Call from a test's
     /// `defer`: the recorded bindings retain the rendered view.
     func tearDown() {
         #if os(macOS)
@@ -72,7 +95,7 @@ final class ConnectViewHost {
             window?.rootViewController = nil
         #endif
         window = nil
-        ConnectControlProbe.reset()
+        controls.reset()
     }
 
     /// Types `text` into a field, the way a keystroke does: through the
@@ -81,7 +104,7 @@ final class ConnectViewHost {
         _ text: String, into control: ConnectControl,
         sourceLocation: SourceLocation = #_sourceLocation
     ) async {
-        guard let field = ConnectControlProbe.field(control) else {
+        guard let field = controls.field(control) else {
             Issue.record(
                 "no \(control.rawValue) field registered by ConnectView",
                 sourceLocation: sourceLocation)
@@ -91,11 +114,12 @@ final class ConnectViewHost {
         await pump()
     }
 
-    /// What a field currently shows.
+    /// What a field's binding currently holds — its `get`, which reads the
+    /// view's own `ConnectFormState`. Not what a rendered control displays.
     func text(
         of control: ConnectControl, sourceLocation: SourceLocation = #_sourceLocation
     ) -> String? {
-        guard let field = ConnectControlProbe.field(control) else {
+        guard let field = controls.field(control) else {
             Issue.record(
                 "no \(control.rawValue) field registered by ConnectView",
                 sourceLocation: sourceLocation)
@@ -108,7 +132,7 @@ final class ConnectViewHost {
     func press(
         _ control: ConnectControl, sourceLocation: SourceLocation = #_sourceLocation
     ) {
-        guard let action = ConnectControlProbe.action(control) else {
+        guard let action = controls.action(control) else {
             Issue.record(
                 "no \(control.rawValue) action registered by ConnectView",
                 sourceLocation: sourceLocation)
@@ -121,8 +145,9 @@ final class ConnectViewHost {
     /// number of turns; reports whether it held.
     ///
     /// SwiftUI publishes no "this view re-evaluated" signal, and the Connect
-    /// button's action starts a detached `Task` the caller has no handle on,
-    /// so unlike the `AppModel` harness's gates there is nothing to await.
+    /// button's action starts an unstructured `Task` the caller has no handle
+    /// on, so unlike the `AppModel` harness's gates there is nothing to await:
+    /// a test observes the work through the model it can see instead.
     @discardableResult
     func wait(for condition: () -> Bool) async -> Bool {
         for turn in 0..<400 {
@@ -136,8 +161,11 @@ final class ConnectViewHost {
         return condition()
     }
 
-    /// Lets SwiftUI take the edit just made — there is no condition to wait
-    /// on, since the assertions read the binding's own storage.
+    /// Gives SwiftUI a few turns with the edit just made. Not a completion
+    /// signal: nothing here proves a re-render finished, and no assertion
+    /// needs one — the bindings' `get`/`set` run synchronously against the
+    /// view's `ConnectFormState`. Waits that must observe something use
+    /// `wait(for:)`.
     private func pump() async {
         for _ in 0..<3 {
             layOut()
@@ -167,7 +195,8 @@ final class ConnectAttemptRecorder: @unchecked Sendable {
     var authenticators: [HermesAuthenticator] { lock.withLock { _authenticators } }
 
     /// Stops `connect()` once the endpoint and credentials are settled, before
-    /// it would build a gateway.
+    /// it would build a gateway. Validation then fails (`ScriptedProbe`'s
+    /// default), which is the attempt's terminal state: `connectError`.
     func makeProbe(_ endpoint: ServerEndpoint, _ authenticator: HermesAuthenticator)
         -> any ServerProbing
     {

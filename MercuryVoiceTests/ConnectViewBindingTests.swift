@@ -14,8 +14,12 @@ import Testing
 /// or a Connect button reading something other than what the fields wrote all
 /// reintroduce R01's cross-server credential disclosure while every
 /// `ConnectFormState` test stays green — so each of those is what fails here.
-/// Serialized: the probe the controls register with is process-wide, so two
-/// hosted views at once would read each other's fields.
+///
+/// What these tests observe is the value each binding holds and the closure
+/// each button was handed, not a rendered control: no keystroke is synthesised
+/// and no repaint is awaited. Serialized so the hosted windows take the main
+/// run loop one at a time; ownership does not depend on it, since each host
+/// has its own recorder (`hostedViewsDoNotShareControls`).
 @MainActor
 @Suite("ConnectView field and Connect-button wiring", .serialized)
 struct ConnectViewBindingTests {
@@ -35,8 +39,8 @@ struct ConnectViewBindingTests {
     }
 
     /// The server field routes into `ConnectFormState`, and the token field
-    /// reads back out of it: a pasted dashboard URL fills the token on screen.
-    @Test func pastingADashboardURLFillsTheTokenFieldOnScreen() async {
+    /// reads back out of it: a pasted dashboard URL fills the token field.
+    @Test func pastingADashboardURLFillsTheTokenField() async {
         let (defaults, suiteName) = makeTestDefaults()
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let model = makeModel(defaults: defaults, recorder: ConnectAttemptRecorder())
@@ -52,7 +56,7 @@ struct ConnectViewBindingTests {
     /// R01 at the controls: pointing the server field somewhere else empties
     /// the token field, so the token cannot be carried across servers behind
     /// a secure-entry field.
-    @Test func retargetingTheServerFieldEmptiesTheTokenFieldOnScreen() async {
+    @Test func retargetingTheServerFieldEmptiesTheTokenField() async {
         let (defaults, suiteName) = makeTestDefaults()
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let model = makeModel(defaults: defaults, recorder: ConnectAttemptRecorder())
@@ -83,7 +87,10 @@ struct ConnectViewBindingTests {
         await host.type("typed-token", into: .token)
 
         host.press(.connect)
-        #expect(await host.wait(for: { recorder.endpointKeys.count == 1 }))
+        // The scripted probe fails validation, so a `connectError` is the
+        // attempt's terminal state: waiting for it means the assertions below
+        // — and the teardown after them — do not race the Connect task.
+        #expect(await host.wait(for: { model.connectError != nil }))
 
         #expect(recorder.endpointKeys == [Self.serverA])
         let authenticator = try #require(recorder.authenticators.first)
@@ -105,7 +112,7 @@ struct ConnectViewBindingTests {
         await host.type(Self.serverB, into: .server)
 
         host.press(.connect)
-        #expect(await host.wait(for: { recorder.endpointKeys.count == 1 }))
+        #expect(await host.wait(for: { model.connectError != nil }))
 
         #expect(recorder.endpointKeys == [Self.serverB])
         let authenticator = try #require(recorder.authenticators.first)
@@ -129,10 +136,93 @@ struct ConnectViewBindingTests {
         #expect(host.text(of: .token) == "mine")
 
         host.press(.connect)
-        #expect(await host.wait(for: { recorder.endpointKeys.count == 1 }))
+        #expect(await host.wait(for: { model.connectError != nil }))
 
         #expect(recorder.endpointKeys == [Self.serverB])
         let authenticator = try #require(recorder.authenticators.first)
         #expect(await authenticator.credentials == .sessionToken("mine"))
+    }
+
+    /// Two hosted views are two separate screens: each one's controls stay its
+    /// own, and pressing Connect on one reaches only that one's model.
+    @Test func hostedViewsDoNotShareControls() async throws {
+        let (defaultsA, suiteA) = makeTestDefaults()
+        defer { defaultsA.removePersistentDomain(forName: suiteA) }
+        let (defaultsB, suiteB) = makeTestDefaults()
+        defer { defaultsB.removePersistentDomain(forName: suiteB) }
+        let attemptsA = ConnectAttemptRecorder()
+        let attemptsB = ConnectAttemptRecorder()
+        let modelA = makeModel(defaults: defaultsA, recorder: attemptsA)
+        let modelB = makeModel(defaults: defaultsB, recorder: attemptsB)
+
+        let hostA = await ConnectViewHost(model: modelA)
+        defer { hostA.tearDown() }
+        let hostB = await ConnectViewHost(model: modelB)
+
+        await hostA.type(Self.serverA, into: .server)
+        await hostA.type("token-a", into: .token)
+        await hostB.type(Self.serverB, into: .server)
+
+        #expect(hostA.text(of: .server) == Self.serverA)
+        #expect(hostA.text(of: .token) == "token-a")
+        #expect(hostB.text(of: .server) == Self.serverB)
+        #expect(hostB.text(of: .token) == "")
+
+        hostA.press(.connect)
+        #expect(await hostA.wait(for: { modelA.connectError != nil }))
+        #expect(attemptsA.endpointKeys == [Self.serverA])
+        #expect(attemptsB.endpointKeys.isEmpty)
+
+        // Tearing one host down drops that host's recordings and no others'.
+        hostB.tearDown()
+        await hostA.type(Self.serverB, into: .server)
+        #expect(hostA.text(of: .server) == Self.serverB)
+    }
+
+    /// A `ConnectView` nobody handed a recorder to — the app's own window, in
+    /// this same test process — must not take over the controls a test is
+    /// driving, nor send that test's Connect to its own model.
+    @Test func theAppsOwnConnectViewStaysOutOfATestsControls() async throws {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let (liveDefaults, liveSuiteName) = makeTestDefaults()
+        defer { liveDefaults.removePersistentDomain(forName: liveSuiteName) }
+        let attempts = ConnectAttemptRecorder()
+        let liveAttempts = ConnectAttemptRecorder()
+        let model = makeModel(defaults: defaults, recorder: attempts)
+        let liveModel = makeModel(defaults: liveDefaults, recorder: liveAttempts)
+
+        let host = await ConnectViewHost(model: model)
+        defer { host.tearDown() }
+        await host.type(Self.serverA, into: .server)
+        await host.type("typed-token", into: .token)
+
+        // Control: the same view, in the same kind of window, *with* a
+        // recorder does register — so the untouched recorders below are about
+        // ownership, not about a view that never rendered. Its teardown drops
+        // its own recordings only.
+        let reference = ConnectControlRecorder()
+        let referenceHost = await ConnectViewHost(model: liveModel, controls: reference)
+        #expect(reference.field(.server) != nil)
+        #expect(reference.action(.connect) != nil)
+        referenceHost.tearDown()
+        #expect(reference.field(.server) == nil)
+
+        // Now the app's own configuration: no recorder anywhere.
+        let live = await ConnectViewHost(ordinaryAppViewFor: liveModel)
+        defer { live.tearDown() }
+
+        #expect(reference.field(.server) == nil)
+        #expect(reference.action(.connect) == nil)
+        #expect(live.controls.field(.server) == nil)
+        #expect(live.controls.action(.connect) == nil)
+        #expect(host.text(of: .server) == Self.serverA)
+        #expect(host.text(of: .token) == "typed-token")
+
+        host.press(.connect)
+        #expect(await host.wait(for: { model.connectError != nil }))
+        #expect(attempts.endpointKeys == [Self.serverA])
+        #expect(liveAttempts.endpointKeys.isEmpty)
+        #expect(liveModel.connectError == nil)
     }
 }
