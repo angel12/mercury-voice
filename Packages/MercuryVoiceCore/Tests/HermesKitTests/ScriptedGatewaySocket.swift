@@ -10,6 +10,19 @@ import Foundation
 /// optionally left un-acknowledged, standing in for a frame handed to the
 /// transport whose completion has not fired yet), and `awaitSend(count:)` is
 /// the barrier meaning "the client has handed that many frames to the socket".
+///
+/// It models `URLSessionWebSocketTask`'s documented contract, not a friendlier
+/// one (`NSURLSession.h:647–657` in the MacOSX26.5 SDK):
+///
+/// - A successful write completion means the bytes reached the kernel — never
+///   that the server saw them.
+/// - A failed write or read is terminal for the whole task: it fails all other
+///   outstanding work, so the failure of one frame is the loss of the socket,
+///   and no later send is accepted.
+/// - `cancel(with:reason:)` ends the task the same way.
+///
+/// So `failWrite`/`failReceive` are transport losses, and a healthy socket is
+/// exercised with `flushWrite` instead.
 final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
     /// A frame the client handed us, with the completion handler it is
     /// waiting on (URLSession calls that once the write is flushed or fails).
@@ -28,12 +41,17 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
 
     private let lock = NSLock()
     private var inbound: [Result<URLSessionWebSocketTask.Message, Error>] = []
-    private var receiveWaiter: CheckedContinuation<Result<URLSessionWebSocketTask.Message, Error>, Never>?
+    private var receiveWaiter:
+        CheckedContinuation<Result<URLSessionWebSocketTask.Message, Error>, Never>?
     private var writes: [PendingWrite] = []
     private var unacknowledged: [Int: PendingWrite] = [:]
     private var sendWaiters: [(count: Int, cont: CheckedContinuation<Void, Never>)] = []
     private var _closeCode: URLSessionWebSocketTask.CloseCode = .invalid
     private var _cancelCount = 0
+    /// Set once the task has ended, which in URLSession is a property of the
+    /// whole task rather than of one message: after it, reads fail and sends
+    /// are refused.
+    private var terminalError: Error?
 
     /// When false, `sendText` keeps the completion handler so a test can
     /// decide when (and whether) the write is reported as flushed or failed.
@@ -62,6 +80,12 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
             cont in
             lock.lock()
             if inbound.isEmpty {
+                if let terminalError {
+                    // There is no reading from a task that has ended.
+                    lock.unlock()
+                    cont.resume(returning: .failure(terminalError))
+                    return
+                }
                 receiveWaiter = cont
                 lock.unlock()
             } else {
@@ -78,14 +102,21 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
         lock.lock()
         writes.append(write)
         let index = writes.count - 1
-        if !acknowledgesWrites { unacknowledged[index] = write }
+        let refusal = terminalError
+        if refusal == nil, !acknowledgesWrites { unacknowledged[index] = write }
         let ready = sendWaiters.filter { $0.count <= writes.count }
         sendWaiters.removeAll { $0.count <= writes.count }
         let ack = acknowledgesWrites
         lock.unlock()
 
         for waiter in ready { waiter.cont.resume() }
-        if ack { completion(nil) }
+        if let refusal {
+            // A dead task takes no more traffic. The frame is still recorded,
+            // so a test can assert what the client tried to hand over.
+            completion(refusal)
+        } else if ack {
+            completion(nil)
+        }
     }
 
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
@@ -93,9 +124,10 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
         _cancelCount += 1
         _closeCode = closeCode
         lock.unlock()
-        // URLSession stops the read side on cancel; unblock the receive loop
-        // so its task can finish instead of parking on a dead socket.
-        deliver(.failure(Closed()))
+        // Cancelling ends the task: the read side stops and outstanding writes
+        // fail, so unblock the receive loop and settle every held write rather
+        // than leaving completions that can never fire.
+        terminate(with: Closed())
     }
 
     // MARK: Test control — inbound
@@ -110,13 +142,15 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
     }
 
     func deliverReply(id: Int, result: String) {
-        deliverText("""
+        deliverText(
+            """
             {"jsonrpc":"2.0","id":\(id),"result":\(result)}
             """)
     }
 
     func deliverErrorReply(id: Int, code: Int, message: String) {
-        deliverText("""
+        deliverText(
+            """
             {"jsonrpc":"2.0","id":\(id),"error":{"code":\(code),"message":"\(message)"}}
             """)
     }
@@ -125,14 +159,37 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
         deliver(.success(.string(text)))
     }
 
-    /// Make the client's next read fail — the socket dropping under it.
+    /// Make the client's read fail — the socket dropping under it. That ends
+    /// the task, so held writes fail with it and no later send is accepted.
     func failReceive(
         closeCode: URLSessionWebSocketTask.CloseCode = .invalid, error: Error = Dropped()
     ) {
         lock.lock()
         _closeCode = closeCode
         lock.unlock()
-        deliver(.failure(error))
+        terminate(with: error)
+    }
+
+    /// End the task the way URLSession ends one: `NSURLSession.h:647` and
+    /// `:655` both say a failing send or receive fails *all* outstanding work.
+    /// So every held write's completion fires with `error`, the parked receive
+    /// fails with it, and `sendText` refuses from here on. `first` names the
+    /// write that caused it, so its completion is the first to fire.
+    private func terminate(with error: Error, first: Int? = nil) {
+        lock.lock()
+        if terminalError == nil { terminalError = error }
+        let failure = terminalError ?? error
+        var settling: [PendingWrite] = []
+        if let first, let target = unacknowledged.removeValue(forKey: first) {
+            settling.append(target)
+        }
+        for index in unacknowledged.keys.sorted() {
+            if let held = unacknowledged.removeValue(forKey: index) { settling.append(held) }
+        }
+        lock.unlock()
+
+        for write in settling { write.completion(failure) }
+        deliver(.failure(failure))
     }
 
     private func deliver(_ item: Result<URLSessionWebSocketTask.Message, Error>) {
@@ -191,13 +248,29 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
         }
     }
 
-    /// Report a held write as flushed (`nil`) or failed, the way URLSession's
-    /// completion handler eventually does.
-    func completeWrite(at index: Int, error: Error?) {
+    /// Report a held write as flushed, the way URLSession's completion handler
+    /// does once the bytes reach the kernel — which, per `NSURLSession.h:648`,
+    /// says nothing about the server having received them. Returns false if
+    /// `index` does not name a write we are still holding.
+    @discardableResult
+    func flushWrite(at index: Int) -> Bool {
         lock.lock()
         let write = unacknowledged.removeValue(forKey: index)
         lock.unlock()
-        write?.completion(error)
+        write?.completion(nil)
+        return write != nil
+    }
+
+    /// Fail a held write, which per `NSURLSession.h:647` is terminal for the
+    /// whole task: see `terminate(with:first:)`. There is no such thing as a
+    /// per-message write error a socket recovers from. Returns false if
+    /// `index` does not name a write we are still holding.
+    @discardableResult
+    func failWrite(at index: Int, error: Error = Dropped()) -> Bool {
+        let held = lock.withLock { unacknowledged[index] != nil }
+        guard held else { return false }
+        terminate(with: error, first: index)
+        return true
     }
 }
 
@@ -242,6 +315,13 @@ enum RPCOutcome: Sendable, Equatable {
     case failure(String)
 }
 
+/// The message of a failed outcome, so a test can accept one of several
+/// permitted errors without re-deriving the enum shape each time.
+func failureText(_ outcome: RPCOutcome?) -> String? {
+    if case .failure(let message) = outcome { return message }
+    return nil
+}
+
 func rpcOutcome(_ body: @Sendable () async throws -> JSONValue) async -> RPCOutcome {
     do {
         return .value(try await body())
@@ -267,15 +347,33 @@ func settled(
     }
 }
 
-private final class ResumeOnceBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cont: CheckedContinuation<RPCOutcome?, Never>?
+/// Barrier: true once the client has run its close sweep. `events()` finishes
+/// exactly there, so this is the client's own signal rather than a poll — and
+/// false (instead of a hang) if the sweep never happens.
+func closed(_ client: GatewayClient, within seconds: Double = 2) async -> Bool {
+    let events = await client.events()
+    return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+        let once = ResumeOnceBox(cont)
+        Task {
+            for await _ in events {}
+            once.resume(true)
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(seconds))
+            once.resume(false)
+        }
+    }
+}
 
-    init(_ cont: CheckedContinuation<RPCOutcome?, Never>) {
+private final class ResumeOnceBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<Value, Never>?
+
+    init(_ cont: CheckedContinuation<Value, Never>) {
         self.cont = cont
     }
 
-    func resume(_ value: RPCOutcome?) {
+    func resume(_ value: Value) {
         lock.lock()
         let waiting = cont
         cont = nil

@@ -15,10 +15,6 @@ import Testing
 /// interrupts the backend nor tears down the socket.
 @Suite("Gateway request cancellation")
 struct GatewayRequestCancellationTests {
-    private struct WriteFailed: LocalizedError {
-        var errorDescription: String? { "The network connection was lost." }
-    }
-
     // MARK: Cancellation is observed
 
     @Test func cancellingACallerReleasesItAndForgetsTheRequest() async throws {
@@ -82,9 +78,10 @@ struct GatewayRequestCancellationTests {
 
     // MARK: Exactly-once completion under races
 
-    @Test func cancellingAWriteThatHasNotFlushedYetCompletesExactlyOnce() async throws {
+    @Test func cancellingAWriteThatHasNotFlushedYetKeepsTheSocketHealthy() async throws {
         // The write is handed to the transport but its completion has not
-        // fired — the window where "unsend" does not exist.
+        // fired — the window where "unsend" does not exist. Here the socket is
+        // fine and only the caller walked away, so the write later *succeeds*.
         let (client, socket) = try await readyGatewayClient(acknowledgesWrites: false)
         let call = Task<RPCOutcome, Never> {
             await rpcOutcome {
@@ -99,25 +96,105 @@ struct GatewayRequestCancellationTests {
         #expect(await client.pendingRequestCount == 0)
 
         // Everything that could still complete that request arrives late and
-        // must be dropped: the failed write, then the server's reply. A
+        // must be dropped: the flushed write, then the server's reply. A
         // second resume of the same continuation traps the process.
-        socket.completeWrite(at: 0, error: WriteFailed())
+        #expect(socket.flushWrite(at: 0))
         socket.deliverReply(id: cancelledID, result: #"{"status":"streaming"}"#)
 
         // A fresh call proves the ignored frames were processed (the receive
-        // loop is ordered) and that the client is not wedged.
+        // loop is ordered) and that a purely local withdrawal cost the shared
+        // socket nothing.
         let followUp = Task<RPCOutcome, Never> {
             await rpcOutcome { try await client.request("gateway.ping") }
         }
         await socket.awaitSend(count: 2)
         let pingID = try #require(socket.sentRequestID(at: 1))
-        socket.completeWrite(at: 1, error: nil)
+        #expect(socket.flushWrite(at: 1))
         socket.deliverReply(id: pingID, result: #"{"pong":true}"#)
 
         #expect(await settled(followUp) == .value(.object(["pong": .bool(true)])))
+        #expect(socket.cancelCount == 0)
+        #expect(await client.state == .ready)
         #expect(await client.pendingRequestCount == 0)
         #expect(await client.liveRequestTimeouts == 0)
         await client.close(reason: "test over")
+    }
+
+    @Test func aTerminalWriteFailureSettlesEveryRequestOnceAndClosesTheSocket() async throws {
+        // A send error is terminal for a URLSessionWebSocketTask — "If an
+        // error occurs, any outstanding work will also fail"
+        // (`NSURLSession.h:647`). So this is the other half of the case above:
+        // one caller has already cancelled, two are still waiting, and the
+        // failing write takes the receive down with it. Nothing may be
+        // completed twice and no timer may outlive the calls.
+        let (client, socket) = try await readyGatewayClient(acknowledgesWrites: false)
+        let cancelled = Task<RPCOutcome, Never> {
+            await rpcOutcome { try await client.request("prompt.submit", timeout: 1800) }
+        }
+        await socket.awaitSend(count: 1)
+        cancelled.cancel()
+        #expect(await settled(cancelled) == .cancelled)
+
+        let failing = Task<RPCOutcome, Never> {
+            await rpcOutcome { try await client.request("session.create", timeout: 1800) }
+        }
+        await socket.awaitSend(count: 2)
+        let other = Task<RPCOutcome, Never> {
+            await rpcOutcome { try await client.request("session.close", timeout: 1800) }
+        }
+        await socket.awaitSend(count: 3)
+
+        // The whole task ends here: this write fails, so does the cancelled
+        // caller's still-held write (a late failure for an id the client has
+        // forgotten), so does the third caller's, and so does the parked
+        // receive — which is what makes the client run its close sweep.
+        #expect(socket.failWrite(at: 1))
+
+        // URLSession does not order the write completions against the receive
+        // failure, so either the send error or the close sweep may answer a
+        // given caller. Both are correct; being answered twice is not.
+        let dropped = ScriptedGatewaySocket.Dropped()
+        let permitted: Set<String> = [
+            "\(dropped)",
+            HermesError.connectionClosed(dropped.errorDescription!).errorDescription!,
+        ]
+        let failingText = try #require(failureText(await settled(failing)))
+        #expect(permitted.contains(failingText), "failed write ended as \(failingText)")
+        let otherText = try #require(failureText(await settled(other)))
+        #expect(permitted.contains(otherText), "other pending call ended as \(otherText)")
+
+        #expect(await closed(client))
+        #expect(await client.state == .closed(reason: dropped.errorDescription))
+        #expect(socket.cancelCount == 1)  // the close sweep cancelled the socket
+        #expect(await client.pendingRequestCount == 0)
+        #expect(await client.liveRequestTimeouts == 0)
+
+        // No healthy reuse after transport loss: the next call is refused
+        // locally instead of being handed to a dead task.
+        let after = Task<RPCOutcome, Never> {
+            await rpcOutcome { try await client.request("gateway.ping") }
+        }
+        #expect(await settled(after) == .failure(HermesError.notConnected.errorDescription!))
+        #expect(socket.sentFrames.count == 3)
+    }
+
+    @Test func closingWithAWriteInFlightSettlesItAndReleasesTheCallerOnce() async throws {
+        let (client, socket) = try await readyGatewayClient(acknowledgesWrites: false)
+        let call = Task<RPCOutcome, Never> {
+            await rpcOutcome { try await client.request("prompt.submit", timeout: 1800) }
+        }
+        await socket.awaitSend(count: 1)
+
+        // close() cancels the socket, and cancelling a task fails its
+        // outstanding writes too — so a write failure arrives for a request
+        // the close sweep has already released. It must find nothing to
+        // resume; the caller keeps the close error it was given.
+        await client.close(reason: "stopped")
+        let closedError = HermesError.connectionClosed("stopped").errorDescription!
+        #expect(await settled(call) == .failure(closedError))
+        #expect(socket.cancelCount == 1)
+        #expect(await client.pendingRequestCount == 0)
+        #expect(await client.liveRequestTimeouts == 0)
     }
 
     @Test func aReplyAlreadyDeliveredIsNotUndoneByALateCancel() async throws {
@@ -180,7 +257,8 @@ struct GatewayRequestCancellationTests {
         }
         await socket.awaitSend(count: 1)
 
-        #expect(await settled(call) == .failure(HermesError.timeout("gateway.ping").errorDescription!))
+        #expect(
+            await settled(call) == .failure(HermesError.timeout("gateway.ping").errorDescription!))
         #expect(await client.pendingRequestCount == 0)
         #expect(await client.liveRequestTimeouts == 0)
         await client.close(reason: "test over")
