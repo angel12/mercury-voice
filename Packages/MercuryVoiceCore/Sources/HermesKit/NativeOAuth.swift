@@ -98,6 +98,16 @@ public actor LoopbackRedirectListener {
     /// Cap on what one connection may accumulate while its request line is
     /// still unterminated. A callback request line is a few hundred bytes.
     private static let maxRequestLineBytes = 16384
+    /// Connections whose request line is still being read. Membership is what
+    /// says a completed receive may be parsed: cancelling a connection
+    /// completes its pending receive with `isComplete == true, error == nil`,
+    /// which is exactly what a peer's half-close looks like, so the receive
+    /// alone cannot tell "the browser finished writing" from "the deadline
+    /// gave up". `expire` drops the connection from this set before
+    /// cancelling it, and every terminal read path drops it too — so an
+    /// expiry that lands after the request line was handled is a no-op and
+    /// the set cannot grow.
+    private var readingConnections: Set<ObjectIdentifier> = []
     private var listener: NWListener?
     private var startWaiter: CheckedContinuation<UInt16, Error>?
     private var codeWaiter: CheckedContinuation<String, Error>?
@@ -211,15 +221,37 @@ public actor LoopbackRedirectListener {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
+        readingConnections.insert(ObjectIdentifier(connection))
         // A peer that opens the connection and then stalls — mid-request-line
         // or before writing a byte — would otherwise hold an idle receive for
-        // as long as the flow lives, so give it a deadline of its own.
-        let deadline = Task { [requestDeadline] in
+        // as long as the flow lives, so give it a deadline of its own. Expiry
+        // goes through the actor so it is ordered against `received`, and the
+        // task holds only the connection and the duration: no reference to
+        // the listener, and nothing to cancel once it has run.
+        let deadline = Task { [weak self, requestDeadline] in
             try? await Task.sleep(for: requestDeadline)
             guard !Task.isCancelled else { return }
-            connection.cancel()
+            guard let self else { return connection.cancel() }
+            await self.expire(connection)
         }
         receiveRequestLine(on: connection, accumulated: Data(), deadline: deadline)
+    }
+
+    /// The deadline fired: drop the connection with its half-written request
+    /// line unread. Never resolves the flow — the fragment is not ours to act
+    /// on, so the wait stays open for the callback that completes.
+    private func expire(_ connection: NWConnection) {
+        // Absent means the read already ended on its own; the cancel below
+        // would then be racing a response that is already on its way out.
+        guard readingConnections.remove(ObjectIdentifier(connection)) != nil else { return }
+        connection.cancel()
+    }
+
+    /// Terminal for the read side: stop the deadline and forget the
+    /// connection, so a deadline that fires afterwards finds nothing to expire.
+    private func endReading(_ connection: NWConnection, deadline: Task<Void, Never>) {
+        deadline.cancel()
+        readingConnections.remove(ObjectIdentifier(connection))
     }
 
     /// One TCP receive is not one HTTP request: the redirect's request line
@@ -248,14 +280,22 @@ public actor LoopbackRedirectListener {
         _ data: Data?, endOfStream: Bool, on connection: NWConnection,
         accumulated: Data, deadline: Task<Void, Never>
     ) {
+        guard readingConnections.contains(ObjectIdentifier(connection)) else {
+            // `expire` already gave up on this connection, and its cancel is
+            // what completed this receive. Whatever is buffered is a fragment,
+            // not an EOF-terminated request line.
+            deadline.cancel()
+            connection.cancel()
+            return
+        }
         var buffer = accumulated
         if let data { buffer += data }
 
         if let terminator = buffer.range(of: Data("\r\n".utf8)) {
-            deadline.cancel()
+            endReading(connection, deadline: deadline)
             handle(requestLine: buffer[..<terminator.lowerBound], on: connection)
         } else if endOfStream {
-            deadline.cancel()
+            endReading(connection, deadline: deadline)
             // No CRLF, but the peer is done writing: what it sent is all the
             // request line there will ever be.
             if buffer.isEmpty {
@@ -268,7 +308,7 @@ public actor LoopbackRedirectListener {
             // than act on a truncated line: a truncation splits cleanly enough
             // to parse, which is how a half-delivered callback could hand the
             // flow a truncated `code` and consume the one-shot sign-in.
-            deadline.cancel()
+            endReading(connection, deadline: deadline)
             connection.cancel()
         } else {
             receiveRequestLine(on: connection, accumulated: buffer, deadline: deadline)

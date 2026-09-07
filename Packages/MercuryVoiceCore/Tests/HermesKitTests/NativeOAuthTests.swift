@@ -673,10 +673,18 @@ struct NativeOAuthTests {
         #expect(try await waiter.value == "real")
     }
 
-    /// Same for a client that stalls part-way through the request line: the
-    /// listener has nothing it can answer, so it must wait for the rest until
-    /// the deadline and then drop the connection — not reply to the fragment.
-    @Test func stalledPartialRequestLineIsDroppedUnanswered() async throws {
+    /// A client that stalls part-way through the request line is reclaimed the
+    /// same way — and the fragment it did send must not be parsed. The stalled
+    /// bytes here carry the expected `state` and a `code` cut in half, which is
+    /// what the flow's own browser would leave behind: parsing them resolves
+    /// the one-shot sign-in with a truncated code the gateway will reject.
+    /// Cancelling the connection is indistinguishable on the wire from the peer
+    /// half-closing (Network completes the pending receive with
+    /// `isComplete == true, error == nil` either way), so the listener has to
+    /// remember that the deadline — not the peer — ended this read.
+    @Test func stalledRequestLineWithValidStateIsDroppedWithoutConsumingTheFlow()
+        async throws
+    {
         let listener = LoopbackRedirectListener(
             expectedState: "s-1", requestDeadline: .milliseconds(150))
         let port = try await listener.start()
@@ -684,7 +692,7 @@ struct NativeOAuthTests {
 
         let client = RawHTTPClient(port: port)
         try await client.connect()
-        try await client.write("GET /oauth/callback?code=stall")  // then silence
+        try await client.write("GET /oauth/callback?state=s-1&code=abc")  // then silence
 
         let response = await client.readToEnd(within: .seconds(2))
         #expect(response.closedByListener)
@@ -694,7 +702,35 @@ struct NativeOAuthTests {
         let session = boundedSession()
         defer { session.finishTasksAndInvalidate() }
         let real = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=real&state=s-1")!
-        _ = try await session.data(from: real)
+        let (_, realResponse) = try await session.data(from: real)
+        #expect((realResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(try await waiter.value == "real")  // not "abc"
+    }
+
+    /// The same stall with the `code` not yet started is the other half of it:
+    /// parsed as an EOF-terminated request line it is a valid-state callback
+    /// with nothing usable in it, which fails the wait with `.stateMismatch`.
+    /// An expired connection must not be able to reach that verdict.
+    @Test func stalledEmptyCodeWithValidStateDoesNotFailTheWait() async throws {
+        let listener = LoopbackRedirectListener(
+            expectedState: "s-1", requestDeadline: .milliseconds(150))
+        let port = try await listener.start()
+        let waiter = Task { try await listener.waitForCode(timeout: .seconds(5)) }
+
+        let client = RawHTTPClient(port: port)
+        try await client.connect()
+        try await client.write("GET /oauth/callback?state=s-1&code=")  // then silence
+
+        let response = await client.readToEnd(within: .seconds(2))
+        #expect(response.closedByListener)
+        #expect(response.bytes.isEmpty)
+        await client.close()
+
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+        let real = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=real&state=s-1")!
+        let (_, realResponse) = try await session.data(from: real)
+        #expect((realResponse as? HTTPURLResponse)?.statusCode == 200)
         #expect(try await waiter.value == "real")
     }
 
