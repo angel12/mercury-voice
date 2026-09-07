@@ -143,7 +143,15 @@ public actor GatewayClient {
         do {
             query = try await authenticator.webSocketAuthQuery()
         } catch {
-            state = .idle
+            if case HermesError.httpError(status: 403, detail: _) = error {
+                // Password-mode ticket minting (including its refresh) can
+                // refuse access before a socket exists. Carry that known
+                // refusal to the supervisor, just like an upgrade 403. The
+                // authenticator has already bounded and redacted the detail.
+                close(reason: (error as? HermesError)?.errorDescription, cause: .forbidden)
+            } else {
+                state = .idle
+            }
             throw error
         }
         let url = endpoint.webSocketURL("/api/ws", query: query)

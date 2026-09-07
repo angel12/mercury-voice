@@ -55,6 +55,89 @@ struct ConnectionRefusalTests {
 
     // MARK: Terminal refusals
 
+    @Test(arguments: [false, true])
+    func passwordDialForbiddenStopsWithoutChangingCredentials(refusalOnRefresh: Bool) async throws {
+        let ticketPath = "/api/auth/ws-ticket"
+        let refreshPath = "/auth/native/refresh"
+        let server = try await RoutedHTTPServer.start { request in
+            if refusalOnRefresh && request.path == ticketPath {
+                return .init(401, #"{"detail":"access token expired"}"#)
+            }
+            return .init(403, #"{"detail":"policy refused Bearer fake-access-secret"}"#)
+        }
+        defer { server.stop() }
+        let endpoint = ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:\(server.port)")!)
+        let credentials = ServerCredentials.password(
+            PasswordSession(
+                provider: "basic", username: "alice",
+                accessToken: "fake-access-secret", refreshToken: "fake-refresh-secret"))
+        let changes = CallCounter()
+        let authenticator = HermesAuthenticator(
+            endpoint: endpoint, credentials: credentials,
+            onCredentialsChanged: { _ in _ = changes.next() })
+        let connection = HermesConnection(endpoint: endpoint, authenticator: authenticator)
+        defer { Task { await connection.stop() } }
+
+        // Real URLSession ticket/refresh requests feed the shipping gateway
+        // and supervisor; no injected socket close cause or scripted phase.
+        let seen = await Self.phases(of: connection) {
+            Self.isRefused($0) || Self.isDisconnected($0) || $0 == .authExpired
+        }
+        let refused = HermesConnection.Phase.refused(
+            reason: "Server error 403: policy refused Bearer «redacted»")
+        #expect(seen.contains(refused))
+        #expect(!seen.contains(.authExpired))
+        #expect(!seen.contains(where: Self.isDisconnected))
+        let dials = seen.filter {
+            if case .connecting = $0 { return true }
+            return false
+        }
+        #expect(dials == [.connecting(attempt: 0)])
+
+        // A foreground/network poke cannot revive a terminal refusal. Wait
+        // longer than the first backoff cap to expose an accidental retry.
+        await connection.pokeReconnect()
+        try await Task.sleep(for: .seconds(1))
+        #expect(await connection.phase == refused)
+        #expect(server.paths == (refusalOnRefresh ? [ticketPath, refreshPath] : [ticketPath]))
+        #expect(await authenticator.credentials == credentials)
+        #expect(changes.calls == 0)
+        await connection.stop()
+    }
+
+    @Test(arguments: [401, 503])
+    func passwordDialKeepsUnauthorizedAndTransientFailuresDistinct(status: Int) async throws {
+        let server = try await RoutedHTTPServer.start { _ in .init(status) }
+        defer { server.stop() }
+        let endpoint = ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:\(server.port)")!)
+        let authenticator = HermesAuthenticator(
+            endpoint: endpoint,
+            credentials: .password(
+                PasswordSession(
+                    provider: "basic", username: "alice",
+                    accessToken: "fake-access", refreshToken: "fake-refresh")))
+        let connection = HermesConnection(endpoint: endpoint, authenticator: authenticator)
+        defer { Task { await connection.stop() } }
+
+        let seen = await Self.phases(of: connection) {
+            $0 == .authExpired || Self.isDisconnected($0) || Self.isRefused($0)
+        }
+        #expect(!seen.contains(where: Self.isRefused))
+        if status == 401 {
+            #expect(seen.contains(.authExpired))
+            await connection.pokeReconnect()
+            try await Task.sleep(for: .seconds(1))
+            #expect(await connection.phase == .authExpired)
+            #expect(server.paths == ["/api/auth/ws-ticket", "/auth/native/refresh"])
+        } else {
+            #expect(seen.contains(where: Self.isDisconnected))
+            #expect(!seen.contains(.authExpired))
+            #expect(await eventually { server.requestCount(forPath: "/api/auth/ws-ticket") >= 2 })
+            #expect(server.requestCount(forPath: "/auth/native/refresh") == 0)
+        }
+        await connection.stop()
+    }
+
     @Test func forbiddenUpgradeStopsInsteadOfRedialingForever() async throws {
         // A 403 upgrade is an access refusal that every redial will hit
         // identically. Retrying it is a storm against a server that already
