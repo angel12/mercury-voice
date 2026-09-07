@@ -85,6 +85,11 @@ struct ConnectView: View {
 
     /// `ConnectFormState` owns the token/endpoint rules (issue #54); the
     /// fields drive it rather than mutating the two strings independently.
+    ///
+    /// The `probed(_:)` / `probing(_:)` calls on the controls below are
+    /// identity: they hand each control's own binding and action to the
+    /// issue #88 tests, which is the only way a test can tell that the
+    /// shipping fields still route through these bindings.
     private var serverBinding: Binding<String> {
         Binding(get: { form.serverInput }, set: { form.setServerInput($0) })
     }
@@ -98,7 +103,7 @@ struct ConnectView: View {
             Text("Server").font(.headline)
             TextField(
                 "127.0.0.1:8080 or paste the dashboard URL",
-                text: serverBinding
+                text: serverBinding.probed(.server)
             )
             .textFieldStyle(.roundedBorder)
             .autocorrectionDisabled()
@@ -108,8 +113,11 @@ struct ConnectView: View {
             #endif
 
             Text("Session token").font(.headline)
-            SecureField("auto-filled from a pasted dashboard URL", text: tokenBinding)
-                .textFieldStyle(.roundedBorder)
+            SecureField(
+                "auto-filled from a pasted dashboard URL",
+                text: tokenBinding.probed(.token)
+            )
+            .textFieldStyle(.roundedBorder)
             Text("Gated servers with a username & password skip this — just Connect.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -126,13 +134,15 @@ struct ConnectView: View {
                     .foregroundStyle(.orange)
             }
 
-            Button {
-                connecting = true
-                Task {
-                    await model.connect(input: form.serverInput, token: form.token)
-                    connecting = false
+            Button(
+                action: ConnectControl.connect.probing {
+                    connecting = true
+                    Task {
+                        await model.connect(input: form.serverInput, token: form.token)
+                        connecting = false
+                    }
                 }
-            } label: {
+            ) {
                 if connecting {
                     ProgressView().frame(maxWidth: .infinity)
                 } else {
