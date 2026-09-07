@@ -116,9 +116,10 @@ public actor LoopbackRedirectListener {
     /// clean end-of-stream, and may take the already-buffered bytes with it —
     /// so tests inject one here instead. `nil` in production: the read loop
     /// uses what Network reported, unaltered.
-    typealias ReceiveRewrite = @Sendable (Data?, Bool, Bool) -> (
-        data: Data?, isComplete: Bool, failed: Bool
-    )
+    typealias ReceiveRewrite =
+        @Sendable (Data?, Bool, Bool) -> (
+            data: Data?, isComplete: Bool, failed: Bool
+        )
     private let receiveRewrite: ReceiveRewrite?
     private var listener: NWListener?
     private var startWaiter: CheckedContinuation<UInt16, Error>?

@@ -807,7 +807,8 @@ struct NativeOAuthTests {
 
         let client = RawHTTPClient(port: port)
         try await client.connect()
-        try await client.write("GET /oauth/callback?state=s-1&code=abc")  // no CRLF: the read fails here
+        // no CRLF: the read fails here
+        try await client.write("GET /oauth/callback?state=s-1&code=abc")
 
         let response = await client.readToEnd(within: .seconds(2))
         #expect(response.closedByListener)
@@ -836,7 +837,8 @@ struct NativeOAuthTests {
 
         let client = RawHTTPClient(port: port)
         try await client.connect()
-        try await client.write("GET /oauth/callback?state=s-1&code=")  // no CRLF: the read fails here
+        // no CRLF: the read fails here
+        try await client.write("GET /oauth/callback?state=s-1&code=")
 
         let response = await client.readToEnd(within: .seconds(2))
         #expect(response.closedByListener)
