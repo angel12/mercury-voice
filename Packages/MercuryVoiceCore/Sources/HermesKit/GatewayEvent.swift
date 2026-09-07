@@ -61,7 +61,8 @@ public struct GatewayEvent: Sendable, Equatable {
 /// the gateway answers every call with `events`, `latest_seq`, `truncated`,
 /// `count` and `epoch` (`tui_gateway/methods_session.py`), and a response that
 /// leaves any of the gap questions unanswered is reported as unusable rather
-/// than read as a reassuring default. `isLossless(under:)` is that verdict.
+/// than read as a reassuring default. `isLossless(under:forSession:after:)` is
+/// that verdict.
 public struct EventReplayBatch: Sendable, Equatable {
     public var events: [GatewayEvent]
     public var latestSeq: Int?
@@ -101,18 +102,60 @@ public struct EventReplayBatch: Sendable, Equatable {
             || (countField != nil && countField?.intValue != decoded.count)
     }
 
-    /// Whether these frames are provably every event after the watermark they
-    /// were requested with: the response decoded whole, the ring did not
-    /// overrun, and the numbering identity is the one `expected` — the epoch
-    /// the watermark was taken under.
+    /// Whether these frames are provably every event after `watermark`, for
+    /// `sessionID`, under the epoch `expected` — the identity and numbering
+    /// the watermark was taken with. False is not "an error occurred": it is
+    /// "this answer is not evidence that nothing was missed", and the caller
+    /// must refresh instead of replaying.
     ///
-    /// The epoch must be present and equal. It has been echoed here since the
-    /// same gateway commit that first advertised `replay_epoch` at
-    /// `gateway.ready`, so a caller holding an epoch is by construction
-    /// talking to a gateway that returns one; an older backend leaves the
-    /// caller with no epoch at all and never reaches this check.
-    public func isLossless(under expected: String) -> Bool {
-        !truncated && !malformed && epoch == expected
+    /// What a conforming answer from the gateway always satisfies, and what
+    /// is therefore required here (`tui_gateway/event_replay.py`,
+    /// `methods_session.py`, `server.py:write_json`):
+    ///
+    /// - The epoch is present and equal. It has been echoed here since the
+    ///   same gateway commit that first advertised `replay_epoch` at
+    ///   `gateway.ready`, so a caller holding an epoch is by construction
+    ///   talking to a gateway that returns one; an older backend leaves the
+    ///   caller with no epoch at all and never reaches this check.
+    /// - `latest_seq` is the session's current highest stamp, read straight
+    ///   after the frames, so it is never below the watermark the client
+    ///   reached — *unless* the ring was evicted, which drops the counter
+    ///   with it (`_replay_next_seq.pop`) and restarts the session at 1 while
+    ///   `truncated` reads False because the ring is simply gone. A
+    ///   `latest_seq` below the watermark (0 for an evicted session), or one
+    ///   that is absent or unreadable, is the only trace that renumbering
+    ///   leaves, so it is refused.
+    /// - Every replayed frame is stamped with an integer `seq` and carries
+    ///   the session id it was requested for (`_stamp_event` only records
+    ///   frames with a session id, and `events_since` reads that session's
+    ///   ring), the ring ascends by exactly one, and `truncated == false`
+    ///   means the first frame returned is `watermark + 1`. So the frames
+    ///   must be the contiguous run `watermark + 1 … latest_seq`: a hole, a
+    ///   repeat, a reordering, an unstamped or fractional seq, or a frame
+    ///   from another session invalidates the batch as a whole rather than
+    ///   the frame alone — the caller applies all of it or none of it.
+    ///
+    /// Residual, and a backend limitation rather than something a client can
+    /// see: a session whose ring was evicted and has since emitted more than
+    /// `watermark` new events answers exactly like a real continuation. Only
+    /// a per-session epoch (or an `is_truncated` that reported a missing
+    /// ring) could distinguish it.
+    public func isLossless(
+        under expected: String, forSession sessionID: String, after watermark: Int
+    ) -> Bool {
+        guard !truncated, !malformed, epoch == expected else { return false }
+        // Seqs start at 1, so a watermark below 0 was never stamped by this
+        // contract, and `latest` must still be at or past where we got to.
+        guard watermark >= 0, let latest = latestSeq, latest >= watermark else { return false }
+        var previous = watermark
+        for event in events {
+            guard event.sessionID == sessionID, let seq = event.seq else { return false }
+            // `previous + 1` unchecked would trap on a watermark at Int.max.
+            let (next, overflowed) = previous.addingReportingOverflow(1)
+            guard !overflowed, seq == next else { return false }
+            previous = next
+        }
+        return previous <= latest
     }
 
     /// A JSON boolean, or the loose spellings a Python backend may use for

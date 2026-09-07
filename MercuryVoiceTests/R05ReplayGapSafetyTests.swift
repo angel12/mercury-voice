@@ -19,13 +19,24 @@ import Testing
 /// the frames it lost were silently skipped forever (the watermark advanced
 /// past them, so the live socket could never redeliver them either).
 ///
+/// The frames themselves carry the rest of the proof, and it used to go
+/// unread: `latest_seq` says whether the session is still numbering where the
+/// watermark left off (an evicted ring answers 0 while renumbering from 1),
+/// and each frame's `seq`/`session_id` say whether the frames in hand really
+/// are this session's contiguous run from `watermark + 1`. A batch that fails
+/// any of it is refused whole — not frame by frame — so nothing in it is
+/// applied and the watermark never advances past what it failed to account
+/// for.
+///
 /// Every gateway that has served this method answers with
 /// `events`/`latest_seq`/`truncated`/`count`/`epoch`
-/// (`tui_gateway/methods_session.py`), and `epoch` has been echoed since the
-/// same commit that first advertised `replay_epoch` at `gateway.ready` — so
-/// requiring them costs no backend that ever worked. Anything short of that
-/// takes the fallback the contract already has: drop the watermark, reset the
-/// tracker, and let the resume snapshot be the authority.
+/// (`tui_gateway/methods_session.py`), stamps every replayed frame with an
+/// ascending per-session `seq` (`event_replay.py`), and `epoch` has been
+/// echoed since the same commit that first advertised `replay_epoch` at
+/// `gateway.ready` — so requiring them costs no backend that ever worked.
+/// Anything short of that takes the fallback the contract already has: drop
+/// the watermark, reset the tracker, and let the resume snapshot be the
+/// authority.
 @MainActor
 @Suite("R05 replay batches must prove they are lossless")
 struct R05ReplayGapSafetyTests {
@@ -165,6 +176,122 @@ struct R05ReplayGapSafetyTests {
                 Self.batchedFrames(), replacing: "count", with: .number(4)))
 
         expectFallback(controller, service: service)
+    }
+
+    // MARK: A response that cannot be shown to span the whole gap
+
+    /// The gateway's 64-session FIFO eviction drops a session's ring *and*
+    /// its counter (`event_replay.py:57–59`), so `is_truncated` reads False
+    /// (`bool(buf)` on a missing ring) and the session renumbers from 1. The
+    /// answer is then a perfectly conforming empty batch whose `latest_seq`
+    /// is *below* the watermark — the one thing in it that says the numbering
+    /// is no longer the one the watermark was taken under. Accepting it keeps
+    /// the watermark and the seq gate then swallows the whole renumbered
+    /// stream.
+    @Test("an evicted ring's empty answer is not replayed, and the renumbered stream survives")
+    func evictedRingAnswerFallsBack() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        await reconnect(
+            controller, service: service, with: Fixtures.replayBatch([], latestSeq: 0))
+
+        expectFallback(controller, service: service)
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 1, text: "renumbered")))
+        #expect(controller.devMessages.contains { $0.text == "renumbered" })
+    }
+
+    /// A batch is applied instead of a refresh, so a hole inside it is a
+    /// permanent loss: the seq gate would advance past the missing frame as
+    /// if it had never been sent. The whole batch is refused — including the
+    /// frames on either side of the hole, which is why nothing is applied and
+    /// the watermark still lets the socket redeliver frame 11.
+    @Test("a batch with a hole in its numbering is refused whole, applying none of it")
+    func holedBatchIsRefusedWhole() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch([
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched"),
+                Fixtures.messageComplete(
+                    sessionID: Self.runtimeID, seq: 13, text: "after-the-hole"),
+            ]))
+
+        expectFallback(controller, service: service)
+        #expect(!controller.devMessages.contains { $0.text == "after-the-hole" })
+        // Nothing advanced: the socket can still deliver frame 11 itself.
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched")))
+        #expect(controller.devMessages.contains { $0.text == "batched" })
+    }
+
+    /// Out of order, the earlier frame would be dropped by the seq gate the
+    /// later one just advanced — silent loss inside an "accepted" batch.
+    @Test("a batch whose frames are out of order is not replayed")
+    func outOfOrderBatchFallsBack() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch([
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 12, text: "second"),
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched"),
+            ]))
+
+        expectFallback(controller, service: service)
+        #expect(!controller.devMessages.contains { $0.text == "second" })
+    }
+
+    /// The replay path calls `apply` directly, bypassing the `ours` filter
+    /// that guards live frames — so a frame belonging to another session
+    /// would be applied to this conversation, and (having a different session
+    /// id) would not even pass the seq gate on its way in.
+    @Test("a batch carrying another session's frame is not replayed")
+    func foreignSessionFrameFallsBack() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch([
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "batched"),
+                Fixtures.messageComplete(sessionID: "rt-other", seq: 12, text: "foreign"),
+            ]))
+
+        expectFallback(controller, service: service)
+        #expect(!controller.devMessages.contains { $0.text == "foreign" })
+    }
+
+    /// A frame with no readable integer `seq` (absent, a string, fractional)
+    /// slips through the seq gate without advancing the watermark, and one
+    /// numbered backwards is not the next frame either — so neither can be
+    /// placed in the run or de-duplicated against the live stream. Every
+    /// frame this gateway replays is stamped
+    /// (`event_replay.py:50–60`), so one that is not is not its answer.
+    @Test(arguments: [JSONValue?.none, .string("12"), .number(12.5), .number(-12)])
+    func aFrameWithoutAReadableSeqFallsBack(seq: JSONValue?) async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        var frame: [String: JSONValue] = [
+            "type": .string(GatewayEvent.Kind.messageComplete),
+            "session_id": .string(Self.runtimeID),
+            "payload": .object(["text": .string("unstamped")]),
+        ]
+        frame["seq"] = seq
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch(
+                Self.batchedFrames() + [.object(frame)], latestSeq: 12))
+
+        expectFallback(controller, service: service)
+        #expect(!controller.devMessages.contains { $0.text == "unstamped" })
     }
 
     // MARK: The fallback is a recovery, not just a refusal
