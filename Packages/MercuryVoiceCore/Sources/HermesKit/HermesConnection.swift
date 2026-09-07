@@ -16,6 +16,13 @@ public actor HermesConnection {
         /// Password-mode refresh token is dead; redialing is pointless. The
         /// supervisor has stopped — the app must prompt for a fresh sign-in.
         case authExpired
+        /// The server refused this client's access (WS 4403, or 403 on the
+        /// HTTP upgrade). Terminal like `authExpired`, but *not* an auth
+        /// story: the credentials were never in question, so a re-login
+        /// fixes nothing and every redial is refused identically. The
+        /// supervisor has stopped; the app shows `reason` and leaves the
+        /// next move to the user.
+        case refused(reason: String?)
     }
 
     public enum Update: Sendable {
@@ -155,18 +162,29 @@ public actor HermesConnection {
             do {
                 try await client.connect()
             } catch {
-                // Read the cause before close() — close() is a no-op once the
-                // socket already closed itself, but the cause it recorded is
-                // what distinguishes a rejected credential from a dropped
-                // network.
-                let rejected = await client.closeCause == .unauthorized
+                // Read the cause and reason before close() — close() is a
+                // no-op once the socket already closed itself, but what it
+                // recorded is what distinguishes a rejected credential from
+                // a refused client from a dropped network.
+                let cause = await client.closeCause
+                let closeReason = await closeReason(of: client)
                 await client.close(reason: nil)
                 if Task.isCancelled { return }  // stop() already published .stopped
-                if rejected {
-                    // The handshake was refused with 4401 (a dead token can be
-                    // rejected either mid-flight or on the next dial, depending
-                    // on when the backend restarted). Terminal either way.
+                if cause == .unauthorized {
+                    // The handshake was refused with 4401, or 401 on the
+                    // upgrade itself (a dead token can be rejected either
+                    // mid-flight or on the next dial, depending on when the
+                    // backend restarted). Terminal either way.
                     publish(.phase(.authExpired))
+                    supervisor = nil
+                    return
+                }
+                if cause == .forbidden {
+                    // 4403, or 403 on the upgrade: an access refusal, not a
+                    // credential failure. Stop with the explanation instead
+                    // of redialing a "no" that will not change, and without
+                    // asking for credentials the server never objected to.
+                    publish(.phase(.refused(reason: closeReason)))
                     supervisor = nil
                     return
                 }
@@ -209,7 +227,8 @@ public actor HermesConnection {
                 break
             }
 
-            if await client.closeCause == .unauthorized {
+            let cause = await client.closeCause
+            if cause == .unauthorized {
                 // The server rejected these credentials mid-flight (WS close
                 // 4401) — in token mode that is what a backend restart looks
                 // like, since the token rotates with it. Redialing can only
@@ -217,6 +236,14 @@ public actor HermesConnection {
                 // fresh credentials instead of spinning "Reconnecting…"
                 // forever against a dead token.
                 publish(.phase(.authExpired))
+                supervisor = nil
+                return
+            }
+            if cause == .forbidden {
+                // Mid-flight 4403: the server withdrew this client's access.
+                // Terminal, and never an auth prompt — same reasoning as the
+                // dial-time branch above.
+                publish(.phase(.refused(reason: await closeReason(of: client))))
                 supervisor = nil
                 return
             }

@@ -202,6 +202,11 @@ public actor HermesAuthenticator {
         case 200..<300:
             break
         case 401, 403:
+            // Login keeps both: this route's whole purpose is judging the
+            // submitted credentials, providers answer a bad password with
+            // either status, and there is no token to refresh or retry here
+            // — so neither maps onto the 401/403 split the authenticated
+            // paths need.
             throw HermesError.invalidCredentials
         case 429:
             throw HermesError.httpError(
@@ -277,7 +282,12 @@ public actor HermesAuthenticator {
         switch http.statusCode {
         case 200..<300:
             break
-        case 401, 403:
+        case 401:
+            // Only 401 is a lapsed credential — the ws-ticket mint retries
+            // after one refresh on it, and `refresh` reads it as a dead
+            // refresh token. A 403 is an access refusal (Host/Origin guard,
+            // peer check, permission gate) that no rotation fixes, so it
+            // must not enter either of those paths.
             throw HermesError.unauthorized
         default:
             let detail =
