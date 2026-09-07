@@ -194,7 +194,7 @@ public actor HermesAuthenticator {
             ]))
 
         let session = URLSession(configuration: cookieFreeConfig())
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await HTTPErrorDetail.load(request, on: session)
         guard let http = response as? HTTPURLResponse else {
             throw HermesError.malformedResponse("not an HTTP response")
         }
@@ -207,9 +207,8 @@ public actor HermesAuthenticator {
             throw HermesError.httpError(
                 status: 429, detail: "Too many login attempts — try again shortly.")
         default:
-            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?
-                .stringValue
-            throw HermesError.httpError(status: http.statusCode, detail: detail)
+            throw HermesError.httpError(
+                status: http.statusCode, detail: HTTPErrorDetail.restJSONDetail(data))
         }
 
         guard
@@ -271,7 +270,7 @@ public actor HermesAuthenticator {
     static func perform(
         _ request: URLRequest, on session: URLSession
     ) async throws -> JSONValue {
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await HTTPErrorDetail.load(request, on: session)
         guard let http = response as? HTTPURLResponse else {
             throw HermesError.malformedResponse("not an HTTP response")
         }
@@ -281,8 +280,9 @@ public actor HermesAuthenticator {
         case 401, 403:
             throw HermesError.unauthorized
         default:
-            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?
-                .stringValue ?? String(data: data.prefix(300), encoding: .utf8)
+            let detail =
+                HTTPErrorDetail.restJSONDetail(data)
+                ?? HTTPErrorDetail.displayed(String(decoding: data, as: UTF8.self))
             throw HermesError.httpError(status: http.statusCode, detail: detail)
         }
         guard let json = try? JSONDecoder().decode(JSONValue.self, from: data) else {

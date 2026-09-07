@@ -420,7 +420,7 @@ public struct DirectVoiceClient: Sendable {
     }
 
     private func perform(_ request: URLRequest, provider: String) async throws -> Data {
-        let (data, response) = try await urlSession.data(for: request)
+        let (data, response) = try await HTTPErrorDetail.load(request, on: urlSession)
         guard let http = response as? HTTPURLResponse else {
             throw DirectVoiceError.provider(name: provider, status: -1, detail: "no HTTP response")
         }
@@ -432,16 +432,17 @@ public struct DirectVoiceClient: Sendable {
     }
 
     /// Provider error text without dumping whole bodies (mirrors the
-    /// desktop's `providerErrorText`).
+    /// desktop's `providerErrorText`). JSON strings use the same 300-byte
+    /// display cap as plain bodies (issue #74).
     static func errorDetail(_ data: Data) -> String {
         if let json = try? JSONDecoder().decode(JSONValue.self, from: data) {
             let detail =
                 json["error"]?["message"]?.stringValue
                 ?? json["detail"]?.stringValue
                 ?? json["error"]?.stringValue
-            if let detail, !detail.isEmpty { return detail }
+            if let detail, !detail.isEmpty { return HTTPErrorDetail.displayed(detail) }
         }
-        return String(decoding: data.prefix(300), as: UTF8.self)
+        return HTTPErrorDetail.displayed(String(decoding: data, as: UTF8.self))
     }
 }
 
