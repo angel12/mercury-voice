@@ -56,7 +56,10 @@ extension Data {
 /// One-shot HTTP listener on 127.0.0.1 that catches the authorize redirect.
 /// Start it, put `http://127.0.0.1:<port><path>` in the authorize URL, and
 /// await `waitForCode()`; it resolves with the authorization code, or throws
-/// on IDP denial, state mismatch, or `cancel()`.
+/// on IDP denial, an incoherent callback for this flow, or `cancel()`.
+/// Requests that don't carry the expected `state` — including denials — are
+/// answered with an HTTP rejection and leave the wait running: only the flow
+/// that knows the state can end it.
 public actor LoopbackRedirectListener {
     public enum RedirectError: Error, LocalizedError, Equatable {
         case cancelled
@@ -209,8 +212,25 @@ public actor LoopbackRedirectListener {
             respond(on: connection, status: "404 Not Found", body: "Not found.")
             return
         }
+        // Exactly-one lookup: a repeated parameter is ambiguous input, and
+        // resolving it in the sender's favour (first match wins) is how a
+        // smuggled second `state=` slips past validation.
         let query = { (name: String) -> String? in
-            components.queryItems?.first(where: { $0.name == name })?.value
+            let values = (components.queryItems ?? []).filter { $0.name == name }
+            guard values.count == 1 else { return nil }
+            return values[0].value
+        }
+
+        // State first, for denials as much as for successes: a callback that
+        // can't prove it belongs to this flow gets an HTTP rejection and the
+        // listener keeps waiting, so a stray browser request or a hostile
+        // local process can neither hijack the sign-in nor kill it (an
+        // unauthenticated `?error=access_denied` used to be enough).
+        guard let state = query("state"), state == expectedState else {
+            respond(
+                on: connection, status: "400 Bad Request",
+                body: "Sign-in response failed validation. Restart sign-in from the app.")
+            return
         }
 
         if let error = query("error") {
@@ -221,7 +241,10 @@ public actor LoopbackRedirectListener {
             finish(.failure(RedirectError.denied(detail)))
             return
         }
-        guard query("state") == expectedState, let code = query("code"), !code.isEmpty
+        // Right state, no usable code and no error: our own flow answering
+        // incoherently, so fail the wait instead of holding a flow that
+        // nothing can complete.
+        guard let code = query("code"), !code.isEmpty
         else {
             respond(
                 on: connection, status: "400 Bad Request",
@@ -235,11 +258,14 @@ public actor LoopbackRedirectListener {
         finish(.success(code))
     }
 
+    /// `body` is plain text — it can carry the server's `error_description`,
+    /// which a real browser would otherwise render as markup — so it is
+    /// escaped into the page rather than interpolated.
     private func respond(on connection: NWConnection, status: String, body: String) {
         let html =
             "<!doctype html><meta charset=\"utf-8\"><title>Mercury Voice</title>"
             + "<body style=\"font-family:-apple-system,sans-serif;padding:2em\">"
-            + "<p>\(body)</p></body>"
+            + "<p>\(Self.htmlEscaped(body))</p></body>"
         let payload = Data(html.utf8)
         let head =
             "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -247,6 +273,22 @@ public actor LoopbackRedirectListener {
         connection.send(
             content: Data(head.utf8) + payload,
             completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    private static func htmlEscaped(_ text: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(text.count)
+        for character in text {
+            switch character {
+            case "&": escaped += "&amp;"
+            case "<": escaped += "&lt;"
+            case ">": escaped += "&gt;"
+            case "\"": escaped += "&quot;"
+            case "'": escaped += "&#39;"
+            default: escaped.append(character)
+            }
+        }
+        return escaped
     }
 
     private func finish(_ result: Result<String, Error>) {
