@@ -10,41 +10,124 @@ import HermesKit
 
 // MARK: - Config fetch + cache
 
+/// Fetches `GET /api/audio/voice-config`. `HermesRESTClient` is the production
+/// conformance; tests substitute a fake so cache/invalidation can be driven
+/// without a network.
+protocol VoiceConfigFetching: Sendable {
+    func voiceConfig(profile: String?) async throws -> VoiceClientConfig
+}
+
+extension HermesRESTClient: VoiceConfigFetching {}
+
 /// Per-conversation fetch/cache of the client-direct voice config. TTL'd so a
 /// gateway config change propagates within a minute without a per-utterance
-/// fetch; any fetch failure (older backend, transient error) reads as relay.
+/// fetch. Successes and older-backend 404s are cached for that window; auth,
+/// transport, and other HTTP failures are not — those retry on the next
+/// lookup and still read as relay. `invalidate()` drops the cache and
+/// discards any in-flight result (issue #73).
 public actor VoiceConfigStore {
-    private let rest: HermesRESTClient
+    private let fetcher: any VoiceConfigFetching
     private let profile: String?
+    private let now: @Sendable () -> Duration
     private static let ttl: Duration = .seconds(60)
 
-    private var cached: (config: VoiceClientConfig, at: ContinuousClock.Instant)?
-    private var inflight: Task<VoiceClientConfig?, Never>?
+    private enum Entry {
+        case config(VoiceClientConfig)
+        case unsupported
+    }
+
+    private var cached: (entry: Entry, at: Duration)?
+    private var inflight: Task<FetchResult, Never>?
+    private var generation = 0
 
     public init(rest: HermesRESTClient, profile: String?) {
-        self.rest = rest
+        let start = ContinuousClock.now
+        self.init(
+            fetcher: rest, profile: profile,
+            now: { ContinuousClock.now - start })
+    }
+
+    /// Test seam: inject the fetch and a deterministic clock (issue #73).
+    init(
+        fetcher: any VoiceConfigFetching, profile: String?,
+        now: @escaping @Sendable () -> Duration
+    ) {
+        self.fetcher = fetcher
         self.profile = profile
+        self.now = now
     }
 
     public func stt() async -> DirectSTTConfig? { await config()?.stt }
     public func tts() async -> DirectTTSConfig? { await config()?.tts }
 
-    private func config() async -> VoiceClientConfig? {
-        if let cached, ContinuousClock.now - cached.at < Self.ttl {
-            return cached.config
-        }
-        if let inflight { return await inflight.value }
+    /// Drop cached success/unsupported entries. An in-flight lookup that
+    /// completes afterwards does not populate the cache; new lookups do not
+    /// join that request.
+    public func invalidate() {
+        cached = nil
+        generation += 1
+        inflight = nil
+    }
 
-        let rest = rest
+    private enum FetchResult {
+        case config(VoiceClientConfig)
+        case unsupported
+        case failed
+
+        var value: VoiceClientConfig? {
+            if case .config(let config) = self { return config }
+            return nil
+        }
+    }
+
+    private func config() async -> VoiceClientConfig? {
+        if let cached, now() - cached.at < Self.ttl {
+            switch cached.entry {
+            case .config(let config): return config
+            case .unsupported: return nil
+            }
+        }
+        let gen = generation
+        if let inflight {
+            let result = await inflight.value
+            if generation != gen { return await config() }
+            adopt(result)
+            return result.value
+        }
+
+        let fetcher = fetcher
         let profile = profile
-        let task = Task { () -> VoiceClientConfig? in
-            try? await rest.voiceConfig(profile: profile)
+        let task = Task { () -> FetchResult in
+            do {
+                return .config(try await fetcher.voiceConfig(profile: profile))
+            } catch {
+                return Self.isUnsupported(error) ? .unsupported : .failed
+            }
         }
         inflight = task
-        let config = await task.value
-        inflight = nil
-        if let config { cached = (config, ContinuousClock.now) }
-        return config
+        let result = await task.value
+        if generation == gen { inflight = nil }
+        guard generation == gen else { return await config() }
+        adopt(result)
+        return result.value
+    }
+
+    private func adopt(_ result: FetchResult) {
+        switch result {
+        case .config(let config):
+            cached = (.config(config), now())
+        case .unsupported:
+            cached = (.unsupported, now())
+        case .failed:
+            break
+        }
+    }
+
+    private static func isUnsupported(_ error: Error) -> Bool {
+        if case HermesError.httpError(let status, _) = error, status == 404 {
+            return true
+        }
+        return false
     }
 }
 
