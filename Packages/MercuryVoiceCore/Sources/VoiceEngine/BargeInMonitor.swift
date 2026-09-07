@@ -235,7 +235,12 @@ public actor BargeInMonitor: BargeMonitoring {
 
         // Stream ended without an endpoint (external stop): if we had tripped
         // deliver what we have, else vanish silently.
-        captureFlag.set(false)
+        // Only a live run may clear the shared flag. A cancelled run got here
+        // through the `detach()` that cancelled it, which already cleared the
+        // flag, so whatever is set now belongs to the run that replaced this
+        // one — and the actor is free to run this tail after that replacement
+        // has tripped (measured under forced priority inversion, issue #87).
+        if !Task.isCancelled { captureFlag.set(false) }
         if tripped, !captured.isEmpty, !Task.isCancelled, resampler.sampleRate > 0 {
             let utterance = RecordedUtterance(
                 audio: WAVEncoder.encode(samples: captured, sampleRate: resampler.sampleRate),
