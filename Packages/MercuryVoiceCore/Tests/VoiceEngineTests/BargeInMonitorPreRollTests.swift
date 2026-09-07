@@ -8,12 +8,17 @@ import Testing
 /// Gates the `isPlaying` probe so each emitted chunk is consumed in lock-step.
 /// Answers "playing" so the adaptive echo floor can classify sustained
 /// louder leakage as quiet (issue #70 / #12).
+///
+/// Probes are numbered 1-based in arrival order, so a single chunk's probe can
+/// be parked and released on its own. That makes the pump steppable — the
+/// ordering issue #104 describes needs one chunk held inside `isPlaying` while
+/// the next one is already queued, without sleeping.
 private final class PlayingGate: @unchecked Sendable {
     private let lock = NSLock()
     private var _entered = 0
-    private var _parked = 0
-    private var holding = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var held: Set<Int> = []
+    private var parked: Set<Int> = []
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
 
     private func locked<T>(_ body: () -> T) -> T {
         lock.lock()
@@ -23,30 +28,45 @@ private final class PlayingGate: @unchecked Sendable {
 
     var entered: Int { locked { _entered } }
 
-    func hold() { locked { holding = true } }
+    /// True while probe number `index` is suspended inside the gate.
+    func isParked(_ index: Int) -> Bool { locked { parked.contains(index) } }
 
+    /// Park probe number `index` when it arrives, instead of answering it.
+    func hold(probe index: Int) { locked { _ = held.insert(index) } }
+
+    func release(probe index: Int) {
+        let waiter: CheckedContinuation<Void, Never>? = locked {
+            held.remove(index)
+            parked.remove(index)
+            return waiters.removeValue(forKey: index)
+        }
+        waiter?.resume()
+    }
+
+    /// Release everything and stop holding — also the teardown path, so a
+    /// failed test never leaves a probe parked forever.
     func open() {
         let pending: [CheckedContinuation<Void, Never>] = locked {
-            holding = false
-            let pending = waiters
+            held.removeAll()
+            parked.removeAll()
+            let pending = Array(waiters.values)
             waiters.removeAll()
-            _parked -= pending.count
             return pending
         }
         for waiter in pending { waiter.resume() }
     }
 
     func probe() async -> Bool {
-        let park: Bool = locked {
+        let index: Int = locked {
             _entered += 1
-            return holding
+            return _entered
         }
-        guard park else { return true }
+        guard locked({ held.contains(index) }) else { return true }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let immediate: CheckedContinuation<Void, Never>? = locked {
-                guard holding else { return continuation }
-                _parked += 1
-                waiters.append(continuation)
+                guard held.contains(index) else { return continuation }
+                parked.insert(index)
+                waiters[index] = continuation
                 return nil
             }
             immediate?.resume()
@@ -264,6 +284,24 @@ private final class PreRollSnapshots: @unchecked Sendable {
     func add(_ samples: [Float]) { locked { _shots.append(samples) } }
 }
 
+/// Await the snapshot one specific chunk produces, named by its absolute
+/// position in callback order (issue #104).
+///
+/// `feed` returns once the monitor *enters* `isPlaying` for a chunk, which is
+/// strictly before that chunk's `onQuietPreRoll`. So a snapshot count read
+/// after `feed` returns can still be missing the previous chunk's snapshot,
+/// and a relative "one more than that count" barrier is then satisfied by the
+/// previous chunk — leaving the caller inspecting the wrong pre-roll. Every
+/// quiet chunk emits exactly one snapshot, so the intended chunk has a fixed
+/// index and the wait can be tied to it instead.
+private func preRollSnapshot(
+    at index: Int, _ snapshots: PreRollSnapshots
+) async throws -> [Float] {
+    #expect(await eventually { snapshots.shots.count > index })
+    let shots = snapshots.shots
+    return try #require(index < shots.count ? shots[index] : nil)
+}
+
 private func captureAfterSustainedEcho(
     sampleRate: Double,
     hopSeconds: Double,
@@ -462,12 +500,15 @@ struct BargeInMonitorPreRollTests {
                             amplitude: echoAmplitude, seconds: binaryHopSeconds, rate: sampleRate),
                         capture, gate))
             }
-            let shotsBeforeOversized = snapshots.shots.count
+            // One snapshot per quiet hop, so the warm-up owns snapshots 0 ..<
+            // `bargeEchoMinSamples` and the oversized append is the one after
+            // them. Draining the warm-up first keeps that index honest.
+            let oversizedSnapshot = VoiceConstants.bargeEchoMinSamples
+            #expect(await eventually { snapshots.shots.count == oversizedSnapshot })
             let oversized = mixedOversizedChunk(rate: sampleRate)
             #expect(Double(oversized.samples.count) / sampleRate > preRollCapSeconds())
             #expect(await feed(oversized, capture, gate))
-            #expect(await eventually { snapshots.shots.count == shotsBeforeOversized + 1 })
-            let preRoll = try #require(snapshots.shots.last)
+            let preRoll = try await preRollSnapshot(at: oversizedSnapshot, snapshots)
             let capSamples = Int(preRollCapSeconds() * sampleRate)
             #expect(preRoll.count == capSamples)
             #expect(preRoll.filter { matchesFloat($0, echoAmplitude) }.count == 0)
@@ -481,6 +522,87 @@ struct BargeInMonitorPreRollTests {
                 gate: gate,
                 calls: calls)
             expectExactRetainedWindow(utterance, window)
+        }
+    }
+
+    /// Issue #104: the pre-roll test above reads the oversized append through
+    /// `feed`, which returns at `isPlaying` entry — before that chunk's
+    /// snapshot. Parking the last warm-up hop and the oversized hop separately
+    /// forces the interleaving observed on iOS, with no sleeping: the warm-up
+    /// snapshot lands while the oversized chunk is still unprocessed. The old
+    /// relative barrier ("one more snapshot than the count read after the
+    /// warm-up feeds") is satisfied in that state by the warm-up hop — 3 hops,
+    /// 18,000 samples at 48 kHz, all old prefix — while the absolute index the
+    /// test now waits on is still pending and only the oversized append
+    /// resolves it.
+    @Test(arguments: [8_000.0, 16_000.0, 48_000.0])
+    func oversizedPreRollWaitsForItsOwnChunkNotAPendingWarmUpHop(
+        sampleRate: Double
+    ) async throws {
+        try await withMonitorScope { scope in
+            let snapshots = PreRollSnapshots()
+            let capture = FakeAudioCapture()
+            let gate = scope.gate()
+            let calls = BargeCallbacks()
+            let monitor = scope.monitor(
+                capture: capture,
+                utteranceSilence: VoiceConstants.endOfTurnSilence,
+                onQuietPreRoll: { snapshots.add($0) })
+            try await monitor.start(
+                isPlaying: { await gate.probe() },
+                onSpeech: { calls.speech() },
+                onUtterance: { calls.utterance($0) })
+
+            let warmUpHops = VoiceConstants.bargeEchoMinSamples
+            // Park the last warm-up hop and the oversized hop independently,
+            // so each chunk can be let through on its own.
+            gate.hold(probe: warmUpHops)
+            gate.hold(probe: warmUpHops + 1)
+
+            for _ in 0..<warmUpHops {
+                #expect(
+                    await feed(
+                        chunk(
+                            amplitude: echoAmplitude, seconds: binaryHopSeconds, rate: sampleRate),
+                        capture, gate))
+            }
+            // Every warm-up `feed` has returned, yet the last hop is still
+            // inside `isPlaying`: its snapshot does not exist. This is the
+            // state in which the old test read its baseline.
+            #expect(await eventually { gate.isParked(warmUpHops) })
+            let staleBaseline = snapshots.shots.count
+            #expect(staleBaseline == warmUpHops - 1)
+
+            // Queue the oversized chunk behind the parked hop, then let only
+            // the warm-up hop through. Its snapshot lands and the oversized
+            // chunk parks at `isPlaying`, before any append — exactly where
+            // the old `feed(oversized, ...)` returned.
+            let oversized = mixedOversizedChunk(rate: sampleRate)
+            #expect(Double(oversized.samples.count) / sampleRate > preRollCapSeconds())
+            capture.emit(oversized)
+            gate.release(probe: warmUpHops)
+            #expect(await eventually { gate.isParked(warmUpHops + 1) })
+
+            // The old relative barrier is already satisfied here, by the
+            // warm-up hop: all old prefix, nothing of the oversized chunk.
+            let capSamples = Int(preRollCapSeconds() * sampleRate)
+            let warmUpSamples = sampleCount(
+                seconds: Double(warmUpHops) * binaryHopSeconds, rate: sampleRate)
+            #expect(snapshots.shots.count == staleBaseline + 1)
+            let pending = try #require(snapshots.shots.last)
+            #expect(pending.count == warmUpSamples)
+            #expect(pending.count != capSamples)
+            #expect(pending.filter { matchesFloat($0, echoAmplitude) }.count == warmUpSamples)
+            #expect(pending.filter { matchesFloat($0, -echoAmplitude) }.count == 0)
+            // The absolute index the test waits on is the oversized chunk's,
+            // and nothing has been appended at it yet.
+            #expect(snapshots.shots.count == warmUpHops)
+
+            gate.release(probe: warmUpHops + 1)
+            let preRoll = try await preRollSnapshot(at: warmUpHops, snapshots)
+            #expect(preRoll.count == capSamples)
+            #expect(preRoll.filter { matchesFloat($0, echoAmplitude) }.count == 0)
+            #expect(preRoll.filter { matchesFloat($0, -echoAmplitude) }.count == capSamples)
         }
     }
 }
