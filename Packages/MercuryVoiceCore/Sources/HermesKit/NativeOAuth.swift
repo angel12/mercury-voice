@@ -108,6 +108,18 @@ public actor LoopbackRedirectListener {
     /// expiry that lands after the request line was handled is a no-op and
     /// the set cannot grow.
     private var readingConnections: Set<ObjectIdentifier> = []
+    /// Test seam over a single receive completion, reduced to the three
+    /// things the read loop acts on: the bytes, the peer's clean
+    /// end-of-stream, and whether the receive itself failed. A transport
+    /// failure landing on a half-delivered request line cannot be provoked
+    /// from a loopback client with any determinism — a reset may surface as a
+    /// clean end-of-stream, and may take the already-buffered bytes with it —
+    /// so tests inject one here instead. `nil` in production: the read loop
+    /// uses what Network reported, unaltered.
+    typealias ReceiveRewrite = @Sendable (Data?, Bool, Bool) -> (
+        data: Data?, isComplete: Bool, failed: Bool
+    )
+    private let receiveRewrite: ReceiveRewrite?
     private var listener: NWListener?
     private var startWaiter: CheckedContinuation<UInt16, Error>?
     private var codeWaiter: CheckedContinuation<String, Error>?
@@ -119,14 +131,19 @@ public actor LoopbackRedirectListener {
         self.expectedState = expectedState
         self.path = path
         self.requestDeadline = .seconds(10)
+        self.receiveRewrite = nil
     }
 
-    /// Test seam for the accept deadline; the public initializer keeps the
-    /// production value.
-    init(expectedState: String, path: String = "/oauth/callback", requestDeadline: Duration) {
+    /// Test seams for the accept deadline and the receive results; the public
+    /// initializer keeps the production value and no rewrite.
+    init(
+        expectedState: String, path: String = "/oauth/callback", requestDeadline: Duration,
+        receiveRewrite: ReceiveRewrite? = nil
+    ) {
         self.expectedState = expectedState
         self.path = path
         self.requestDeadline = requestDeadline
+        self.receiveRewrite = receiveRewrite
     }
 
     /// Bind to an ephemeral 127.0.0.1 port and return it.
@@ -256,28 +273,32 @@ public actor LoopbackRedirectListener {
 
     /// One TCP receive is not one HTTP request: the redirect's request line
     /// may arrive split across segments, so accumulate until it is terminated,
-    /// the peer stops writing, or the byte bound is reached.
+    /// the peer stops writing, the read fails, or the byte bound is reached.
     private func receiveRequestLine(
         on connection: NWConnection, accumulated: Data, deadline: Task<Void, Never>
     ) {
+        let rewrite = receiveRewrite
         connection.receive(
             minimumIncompleteLength: 1,
             maximumLength: Self.maxRequestLineBytes - accumulated.count
         ) { [weak self] data, _, isComplete, error in
+            let result =
+                rewrite?(data, isComplete, error != nil)
+                ?? (data: data, isComplete: isComplete, failed: error != nil)
             guard let self else {
                 deadline.cancel()
                 return connection.cancel()
             }
             Task {
                 await self.received(
-                    data, endOfStream: isComplete || error != nil,
+                    result.data, endOfStream: result.isComplete, failed: result.failed,
                     on: connection, accumulated: accumulated, deadline: deadline)
             }
         }
     }
 
     private func received(
-        _ data: Data?, endOfStream: Bool, on connection: NWConnection,
+        _ data: Data?, endOfStream: Bool, failed: Bool, on connection: NWConnection,
         accumulated: Data, deadline: Task<Void, Never>
     ) {
         guard readingConnections.contains(ObjectIdentifier(connection)) else {
@@ -292,8 +313,19 @@ public actor LoopbackRedirectListener {
         if let data { buffer += data }
 
         if let terminator = buffer.range(of: Data("\r\n".utf8)) {
+            // A terminated request line is a whole request, whatever became of
+            // the read that carried the last of it: the CRLF is the proof.
             endReading(connection, deadline: deadline)
             handle(requestLine: buffer[..<terminator.lowerBound], on: connection)
+        } else if failed {
+            // A read that failed is not a peer that stopped writing. The
+            // buffered fragment is not a request line — it merely parses like
+            // one, and doing so would resolve the one-shot flow from a
+            // half-delivered callback (a truncated `code`, or a `code=` not yet
+            // written, which fails the wait outright). Drop it and keep
+            // waiting: the callback that arrives whole is the one that counts.
+            endReading(connection, deadline: deadline)
+            connection.cancel()
         } else if endOfStream {
             endReading(connection, deadline: deadline)
             // No CRLF, but the peer is done writing: what it sent is all the

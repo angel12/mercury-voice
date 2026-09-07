@@ -592,6 +592,44 @@ struct NativeOAuthTests {
         }
     }
 
+    /// Fails the listener's read exactly once, at the moment it has been
+    /// handed the first `after.count` bytes of the stream — whatever the
+    /// segmentation on the wire turned out to be. The receive that completes
+    /// the prefix delivers precisely those bytes *and* reports the failure, so
+    /// the listener's buffer at the failure is the prefix and nothing else.
+    ///
+    /// A real reset cannot pin this down: it may be reported as a clean
+    /// end-of-stream, it may discard the bytes still in the socket buffer, and
+    /// it races the listener's own receives. Injection is what makes "the
+    /// transport failed on a half-delivered request line" a fixed input.
+    ///
+    /// After it fires it is a pass-through, so the connections that follow on
+    /// the same listener — the genuine callback each of these tests ends with
+    /// — read normally.
+    private final class ReceiveFailureInjector: @unchecked Sendable {
+        private let target: Data
+        private let lock = NSLock()
+        private var handedOver = 0
+        private var fired = false
+
+        init(after prefix: String) { target = Data(prefix.utf8) }
+
+        var rewrite: LoopbackRedirectListener.ReceiveRewrite {
+            { [self] data, isComplete, failed in
+                lock.lock()
+                defer { lock.unlock() }
+                guard !fired else { return (data, isComplete, failed) }
+                let arrived = handedOver + (data?.count ?? 0)
+                guard arrived >= target.count else {
+                    handedOver = arrived
+                    return (data, isComplete, failed)
+                }
+                fired = true
+                return (target[handedOver...], false, true)
+            }
+        }
+    }
+
     /// TCP is a byte stream: the callback's request line is free to arrive in
     /// several segments, and the listener used to treat whatever the first
     /// receive returned as the whole request line — answering 404 to a
@@ -751,6 +789,89 @@ struct NativeOAuthTests {
         let page = try #require(String(data: response.bytes, encoding: .utf8))
         #expect(page.hasPrefix("HTTP/1.1 200 OK"))
         #expect(try await waiter.value == "eof-7")
+        await client.close()
+    }
+
+    /// A receive that fails is not a peer that finished writing. The buffer at
+    /// that point holds the flow's own `state` and a `code` cut in half, which
+    /// parses cleanly as a request line — so treating the failure as EOF
+    /// resolves the one-shot sign-in with a truncated code the gateway will
+    /// reject, and the genuine callback that follows can no longer land.
+    @Test func transportErrorAfterAPartialCodeDoesNotConsumeTheFlow() async throws {
+        let injector = ReceiveFailureInjector(after: "GET /oauth/callback?state=s-1&code=abc")
+        let listener = LoopbackRedirectListener(
+            expectedState: "s-1", requestDeadline: .milliseconds(150),
+            receiveRewrite: injector.rewrite)
+        let port = try await listener.start()
+        let waiter = Task { try await listener.waitForCode(timeout: .seconds(5)) }
+
+        let client = RawHTTPClient(port: port)
+        try await client.connect()
+        try await client.write("GET /oauth/callback?state=s-1&code=abc")  // no CRLF: the read fails here
+
+        let response = await client.readToEnd(within: .seconds(2))
+        #expect(response.closedByListener)
+        #expect(response.bytes.isEmpty)  // a failed read is never answered
+        await client.close()
+
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+        let real = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=real&state=s-1")!
+        let (_, realResponse) = try await session.data(from: real)
+        #expect((realResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(try await waiter.value == "real")  // not "abc"
+    }
+
+    /// The other half of it: the failure lands before the `code` value starts.
+    /// Parsed as an EOF-terminated request line that is a valid-state callback
+    /// carrying nothing usable, which fails the wait with `.stateMismatch` —
+    /// consuming the sign-in just as finally as a success would.
+    @Test func transportErrorAfterAnEmptyCodeDoesNotFailTheWait() async throws {
+        let injector = ReceiveFailureInjector(after: "GET /oauth/callback?state=s-1&code=")
+        let listener = LoopbackRedirectListener(
+            expectedState: "s-1", requestDeadline: .milliseconds(150),
+            receiveRewrite: injector.rewrite)
+        let port = try await listener.start()
+        let waiter = Task { try await listener.waitForCode(timeout: .seconds(5)) }
+
+        let client = RawHTTPClient(port: port)
+        try await client.connect()
+        try await client.write("GET /oauth/callback?state=s-1&code=")  // no CRLF: the read fails here
+
+        let response = await client.readToEnd(within: .seconds(2))
+        #expect(response.closedByListener)
+        #expect(response.bytes.isEmpty)
+        await client.close()
+
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+        let real = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=real&state=s-1")!
+        let (_, realResponse) = try await session.data(from: real)
+        #expect((realResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(try await waiter.value == "real")
+    }
+
+    /// The distinction is unterminated versus complete, not failed versus
+    /// clean: a request line whose CRLF did arrive is a whole request, and a
+    /// read that fails afterwards takes nothing away from it. Guards the fix
+    /// above against over-reaching into "any error discards the connection".
+    @Test func completeRequestLineIsHonouredEvenWhenTheReadFails() async throws {
+        let injector = ReceiveFailureInjector(
+            after: "GET /oauth/callback?code=err-3&state=s-1 HTTP/1.1\r\n")
+        let listener = LoopbackRedirectListener(
+            expectedState: "s-1", requestDeadline: .milliseconds(150),
+            receiveRewrite: injector.rewrite)
+        let port = try await listener.start()
+        let waiter = Task { try await listener.waitForCode(timeout: .seconds(5)) }
+
+        let client = RawHTTPClient(port: port)
+        try await client.connect()
+        try await client.write("GET /oauth/callback?code=err-3&state=s-1 HTTP/1.1\r\n")
+
+        let response = await client.readToEnd(within: .seconds(2))
+        let page = try #require(String(data: response.bytes, encoding: .utf8))
+        #expect(page.hasPrefix("HTTP/1.1 200 OK"))
+        #expect(try await waiter.value == "err-3")
         await client.close()
     }
 }
