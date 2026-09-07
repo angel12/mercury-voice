@@ -128,6 +128,23 @@ struct R05ReplayGapSafetyTests {
         expectFallback(controller, service: service)
     }
 
+    @Test(arguments: [
+        JSONValue.number(0), .number(1), .string("false"), .string("0"), .string("true"),
+        .string("1"),
+    ])
+    func nonBooleanGapRefusesPrefixAndAllowsRedelivery(flag: JSONValue) async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch(Self.batchedFrames(), replacing: "truncated", with: flag))
+        expectFallback(controller, service: service)
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "redelivered")))
+        #expect(controller.devMessages.contains { $0.text == "redelivered" })
+    }
+
     // MARK: A response that cannot be shown to be about our numbering
 
     @Test("a batch with no epoch is not replayed against a known epoch")
@@ -140,6 +157,29 @@ struct R05ReplayGapSafetyTests {
             with: Fixtures.replayBatch(Self.batchedFrames(), replacing: "epoch", with: nil))
 
         expectFallback(controller, service: service)
+    }
+
+    @Test(arguments: [
+        JSONValue?.none, .null, .array([]), .bool(false), .number(7), .string("text"),
+    ])
+    func malformedPayloadRefusesPrefixAndAllowsRedelivery(payload: JSONValue?) async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        var frame =
+            Fixtures.messageComplete(
+                sessionID: Self.runtimeID, seq: 12, text: "invalid"
+            ).objectValue ?? [:]
+        frame["payload"] = payload
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch(Self.batchedFrames() + [.object(frame)]))
+        expectFallback(controller, service: service)
+        for (seq, text) in [(11, "batched"), (12, "corrected")] {
+            controller.handle(
+                event: Fixtures.event(
+                    Fixtures.messageComplete(sessionID: Self.runtimeID, seq: seq, text: text)))
+            #expect(controller.devMessages.contains { $0.text == text })
+        }
     }
 
     // MARK: A response that lost frames on the way in
@@ -292,6 +332,35 @@ struct R05ReplayGapSafetyTests {
 
         expectFallback(controller, service: service)
         #expect(!controller.devMessages.contains { $0.text == "unstamped" })
+    }
+
+    @Test(arguments: [false, true])
+    func incompleteTailRefusesPrefixAndAllowsRedelivery(empty: Bool) async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch(empty ? [] : Self.batchedFrames(), latestSeq: 12))
+        expectFallback(controller, service: service)
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.messageComplete(sessionID: Self.runtimeID, seq: 11, text: "redelivered")))
+        #expect(controller.devMessages.contains { $0.text == "redelivered" })
+    }
+
+    @Test func emptyCompleteBatchStillUsesReplay() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        await reconnect(
+            controller, service: service,
+            with: Fixtures.replayBatch([], latestSeq: Self.watermark))
+        #expect(service.activatedIDs == [Self.runtimeID])
+        #expect(controller.approval == nil)
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.messageComplete(
+                    sessionID: Self.runtimeID, seq: Self.watermark, text: "duplicate")))
+        #expect(!controller.devMessages.contains { $0.text == "duplicate" })
     }
 
     // MARK: The fallback is a recovery, not just a refusal
