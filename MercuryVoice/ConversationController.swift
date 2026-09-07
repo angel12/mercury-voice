@@ -50,8 +50,15 @@ final class ConversationController {
     /// the authoritative `message.complete` usage. nil until the first turn
     /// reports, or when the backend doesn't report usage at all.
     private(set) var usage: SessionUsage?
-    var approval: ApprovalRequest?
-    var clarify: ClarifyRequest?
+    // Every sheet write retires its previous notice, including UI dismissal,
+    // confirmed responses and authoritative reconnect reads. Cancellation is
+    // synchronous and scoped to that notice, not the shared speech output.
+    var approval: ApprovalRequest? {
+        willSet { approvalAnnouncement?.cancel() }
+    }
+    var clarify: ClarifyRequest? {
+        willSet { clarifyAnnouncement?.cancel() }
+    }
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -62,6 +69,11 @@ final class ConversationController {
         var text: String
     }
     private(set) var devMessages: [DevMessage] = []
+    var textDraft = ""
+    private(set) var pendingText: String?
+    private(set) var failedText: String?
+    private(set) var textSubmissionError: String?
+    private(set) var textSubmissionTask: Task<Void, Never>?
 
     // MARK: Wiring
 
@@ -199,7 +211,8 @@ final class ConversationController {
         capture: AudioCaptureService? = nil,
         beforeTrackerEvent: (@Sendable (GatewayEvent) async -> Void)? = nil,
         trackerResetRequested: (@MainActor @Sendable () -> Void)? = nil,
-        trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil
+        trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil,
+        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
@@ -222,8 +235,12 @@ final class ConversationController {
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
                 guard let sid = box.runtimeID else { throw HermesError.notConnected }
-                try await connection.submitPrompt(
-                    sessionID: sid, text: text, interrupted: interrupted)
+                if let submitPrompt {
+                    try await submitPrompt(sid, text, interrupted)
+                } else {
+                    try await connection.submitPrompt(
+                        sessionID: sid, text: text, interrupted: interrupted)
+                }
             },
             interrupt: {
                 guard let sid = box.runtimeID else { return }
@@ -322,6 +339,10 @@ final class ConversationController {
         trackerResets.retire()
         trackerEventContinuation?.finish()
         trackerEventPump?.cancel()
+        pendingText = nil
+        textSubmissionTask?.cancel()
+        approvalAnnouncement?.cancel()
+        clarifyAnnouncement?.cancel()
     }
 
     func begin(mode: Mode) async {
@@ -935,9 +956,9 @@ final class ConversationController {
     /// ended or superseded (issues #38, #77), the prompt can expire, be
     /// answered, be replaced, or be retired by the post-reconnect prompt read,
     /// and playback can be stopped. Cancelling the task is not enough on its
-    /// own: one already suspended past its last cancellation check resumes and
-    /// runs to completion regardless. So each fact is captured before the
-    /// first suspension and re-checked after it.
+    /// own: the output must consume it after synthesis and stop that notice's
+    /// single-use player during delivery. Before handing off, each controller
+    /// fact is captured before suspension and re-checked after it.
     ///
     /// The speech generation is one of those facts, which is why this passes
     /// its own snapshot rather than calling the `playFallback(text:)`
@@ -956,7 +977,7 @@ final class ConversationController {
         guard isCurrent(notice) else { return }
         await engine?.setPaused(true)
         guard isCurrent(notice) else { return }
-        _ = await speech.playFallback(text: notice.text, expectedSequence: sequence)
+        _ = await speech.playAnnouncement(text: notice.text, expectedSequence: sequence)
     }
 
     /// True while `notice` still describes a prompt on screen, in a
@@ -1350,12 +1371,58 @@ final class ConversationController {
 
     // MARK: Dev text path
 
+    func dismissFailedText() {
+        guard !isTornDown, pendingText == nil else { return }
+        failedText = nil
+        textSubmissionError = nil
+    }
+
     func submitTextPrompt(_ text: String) {
+        guard !isTornDown, pendingText == nil else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        appendDevMessage(role: "user", text: trimmed)
-        Task {
-            try? await tracker.submit(text: trimmed, interrupted: false)
+        guard !trimmed.isEmpty, failedText == nil || failedText == trimmed else { return }
+        guard connectionHealthy else {
+            failedText = trimmed
+            textSubmissionError =
+                textSubmissionError
+                ?? "Not connected to the Hermes server. Reconnect, then retry."
+            return
+        }
+        let draftAtSubmission = textDraft
+        pendingText = trimmed
+        textSubmissionError = nil
+        textSubmissionTask = Task {
+            guard !isTornDown else { return }
+            do {
+                try await tracker.submit(text: trimmed, interrupted: false)
+                guard !isTornDown else { return }
+                appendDevMessage(role: "user", text: trimmed)
+                failedText = nil
+                if textDraft == draftAtSubmission,
+                    draftAtSubmission.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
+                {
+                    textDraft = ""
+                }
+            } catch {
+                guard !isTornDown else { return }
+                failedText = trimmed
+                // Transport failures may follow server acceptance. Never echo
+                // raw error text (which can contain tokens, paths or IDs).
+                textSubmissionError =
+                    "Delivery is uncertain. Check the conversation before retrying; "
+                    + "retrying may send this message twice."
+                if let hermesError = error as? HermesError,
+                    let reason = hermesError.rpcReason,
+                    [
+                        HermesError.RefusalReason.sessionNotOwned,
+                        HermesError.RefusalReason.maxConcurrentSessions,
+                        HermesError.RefusalReason.coordinationUnavailable,
+                    ].contains(reason)
+                {
+                    textSubmissionError = hermesError.errorDescription
+                }
+            }
+            pendingText = nil
         }
     }
 

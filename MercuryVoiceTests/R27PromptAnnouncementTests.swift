@@ -1,9 +1,9 @@
 import Foundation
 import HermesKit
 import Testing
-import VoiceEngine
 
 @testable import MercuryVoice
+@testable import VoiceEngine
 
 /// Audit finding R27 / issue #79 — the lifetime of a spoken prompt notice.
 ///
@@ -44,7 +44,7 @@ struct R27PromptAnnouncementTests {
     /// genuine actor hop and `teardown()` is the real End.
     private func liveConversation(
         service: ScriptedSessionService,
-        speech: SequencedSpeech,
+        speech: any SpeechPlaying,
         recorder: PausableRecorder,
         pendingApproval: JSONValue? = nil,
         pendingClarify: JSONValue? = nil
@@ -328,9 +328,8 @@ struct R27PromptAnnouncementTests {
     /// keeps that contract reachable — it hands `playFallback` a generation to
     /// check rather than one it just read for it.
     ///
-    /// Stated limit: a prompt that is answered or expires *during* synthesis
-    /// is not caught here. There is no check point inside the synthesis
-    /// suspension, and the notice plays. See the report for issue #79.
+    /// The real-output regression below additionally covers prompt retirement
+    /// during synthesis and delivery, rather than only the sequence contract.
     @Test("an End during synthesis refuses the clip")
     func anEndDuringSynthesisRefusesTheClip() async {
         let service = ScriptedSessionService()
@@ -516,5 +515,148 @@ final class SequencedSpeech: SpeechPlaying, @unchecked Sendable {
     }
     var isSpeaking: Bool {
         get async { false }
+    }
+}
+
+// Regression: actual controller + actual HermesSpeechOutput; no audio hardware.
+extension R27PromptAnnouncementTests {
+    @Test(
+        "stale prompt at real synthesis/delivery boundary",
+        arguments: ["expiry", "supersede", "replacement", "end", "current"],
+        ["synthesis", "delivery"])
+    func realBoundary(transition: String, phase: String) async {
+        let gate = CallGate()
+        let ledger = AnnouncementLedger()
+        let speech = HermesSpeechOutput(
+            rest: makeUndialedConnection().rest, profile: nil, voiceConfig: nil,
+            synthesize: { _ in
+                if phase == "synthesis" { await gate.arrive() }
+                return Data([1])
+            },
+            makeFallbackPlayer: {
+                AnnouncementPlayer(gate: phase == "delivery" ? gate : nil, ledger: ledger)
+            })
+        let service = ScriptedSessionService()
+        let controller = await liveConversation(
+            service: service, speech: speech, recorder: PausableRecorder())
+        controller.handle(event: clarifyEvent(seq: 11, requestID: "q1"))
+        await gate.waitUntilEntered()
+        switch transition {
+        case "expiry":
+            controller.handle(
+                event: Fixtures.event(
+                    Fixtures.clarifyExpire(
+                        sessionID: Self.runtimeID, seq: 12, requestID: "q1")))
+            #expect(controller.clarify == nil)
+        case "supersede": controller.supersede()
+        case "replacement": controller.handle(event: clarifyEvent(seq: 12, requestID: "q2"))
+        case "end": await controller.teardown()
+        default: break
+        }
+        await gate.release()
+        await controller.awaitPromptAnnouncements()
+        #expect(ledger.starts == (["replacement", "current"].contains(transition) ? 1 : 0))
+        await controller.teardown()
+    }
+}
+
+final class AnnouncementLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var starts: Int { lock.withLock { count } }
+    func start() { lock.withLock { count += 1 } }
+}
+
+final class AnnouncementPlayer: FallbackClipPlaying, @unchecked Sendable {
+    let gate: CallGate?
+    let ledger: AnnouncementLedger
+    private let lock = NSLock()
+    private var stopped = false
+    init(gate: CallGate?, ledger: AnnouncementLedger) {
+        self.gate = gate
+        self.ledger = ledger
+    }
+    var isPlaying: Bool { false }
+    func stop() { lock.withLock { stopped = true } }
+    func play(data: Data) async -> ClipPlayback {
+        await gate?.arrive()
+        return lock.withLock {
+            if stopped { return .neverStarted }
+            ledger.start()
+            return .completed
+        }
+    }
+}
+
+extension R27PromptAnnouncementTests {
+    @Test(
+        "retiring one notice preserves newer unrelated delivery",
+        arguments: ["synthesis", "delivery"])
+    func retirementPreservesNewerSpeech(phase: String) async {
+        let oldGate = CallGate()
+        let newerGate = CallGate()
+        let clarifyNotice = Self.clarifyNotice
+        let ledger = AnnouncementLedger()
+        let speech = HermesSpeechOutput(
+            rest: makeUndialedConnection().rest, profile: nil, voiceConfig: nil,
+            synthesize: { text in
+                if text == clarifyNotice, phase == "synthesis" { await oldGate.arrive() }
+                return Data(text.utf8)
+            },
+            makeFallbackPlayer: {
+                RoutedAnnouncementPlayer(
+                    oldGate: phase == "delivery" ? oldGate : nil,
+                    newerGate: newerGate, ledger: ledger)
+            })
+        let controller = await liveConversation(
+            service: ScriptedSessionService(), speech: speech, recorder: PausableRecorder())
+        controller.handle(event: clarifyEvent(seq: 11, requestID: "q1"))
+        await oldGate.waitUntilEntered()
+        let sequence = await speech.sequence
+        let newer = Task {
+            await speech.playFallback(text: "Unrelated reply", expectedSequence: sequence)
+        }
+        await newerGate.waitUntilEntered()
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.clarifyExpire(
+                    sessionID: Self.runtimeID, seq: 12, requestID: "q1")))
+        await oldGate.release()
+        await controller.awaitPromptAnnouncements()
+        #expect(ledger.starts == 0)
+        #expect(await speech.sequence == sequence)
+        await newerGate.release()
+        #expect(await newer.value)
+        #expect(ledger.starts == 1)
+        await controller.teardown()
+    }
+}
+
+final class RoutedAnnouncementPlayer: FallbackClipPlaying, @unchecked Sendable {
+    let oldGate: CallGate?
+    let newerGate: CallGate
+    let ledger: AnnouncementLedger
+    private let lock = NSLock()
+    private var stopped = false
+
+    init(oldGate: CallGate?, newerGate: CallGate, ledger: AnnouncementLedger) {
+        self.oldGate = oldGate
+        self.newerGate = newerGate
+        self.ledger = ledger
+    }
+
+    var isPlaying: Bool { false }
+    func stop() { lock.withLock { stopped = true } }
+    func play(data: Data) async -> ClipPlayback {
+        if String(decoding: data, as: UTF8.self) == "Unrelated reply" {
+            await newerGate.arrive()
+        } else {
+            await oldGate?.arrive()
+        }
+        return lock.withLock {
+            if stopped { return .neverStarted }
+            ledger.start()
+            return .completed
+        }
     }
 }
