@@ -64,6 +64,11 @@ public actor LoopbackRedirectListener {
     public enum RedirectError: Error, LocalizedError, Equatable {
         case cancelled
         case denied(String)
+        /// A callback that proved the expected `state` but carried nothing
+        /// this flow can act on — no usable `code` and no `error`. Callbacks
+        /// that fail the state check never reach here: they are rejected
+        /// over HTTP and the wait keeps running. (Case name kept for API
+        /// compatibility; it no longer implies a mismatched state.)
         case stateMismatch
         case listenerFailed(String)
         case timedOut
@@ -75,7 +80,7 @@ public actor LoopbackRedirectListener {
             switch self {
             case .cancelled: return "Sign-in was cancelled."
             case .denied(let detail): return "Sign-in was denied: \(detail)"
-            case .stateMismatch: return "Sign-in response failed validation (state mismatch)."
+            case .stateMismatch: return "Sign-in response failed validation. Try again."
             case .timedOut: return "Sign-in timed out. Try again."
             case .presentationFailed: return "Couldn't open the sign-in browser. Try again."
             case .listenerFailed(let detail): return "Couldn't listen for the sign-in redirect: \(detail)"
@@ -275,17 +280,24 @@ public actor LoopbackRedirectListener {
             completion: .contentProcessed { _ in connection.cancel() })
     }
 
+    /// Escapes per Unicode scalar, which is what an HTML tokenizer reads.
+    /// Iterating `Character` would leave a bypass: a grapheme cluster can
+    /// swallow a delimiter, because a Prepend code point (U+0600, U+0D4E,
+    /// U+110BD…) does not break before the next code point (UAX #29 GB9b),
+    /// so `U+0600 <` is one Character that matches none of these cases and
+    /// used to be appended verbatim — enough to open a tag, with the `>` of
+    /// the surrounding `</p>` closing it.
     private static func htmlEscaped(_ text: String) -> String {
         var escaped = ""
-        escaped.reserveCapacity(text.count)
-        for character in text {
-            switch character {
+        escaped.unicodeScalars.reserveCapacity(text.unicodeScalars.count)
+        for scalar in text.unicodeScalars {
+            switch scalar {
             case "&": escaped += "&amp;"
             case "<": escaped += "&lt;"
             case ">": escaped += "&gt;"
             case "\"": escaped += "&quot;"
             case "'": escaped += "&#39;"
-            default: escaped.append(character)
+            default: escaped.unicodeScalars.append(scalar)
             }
         }
         return escaped

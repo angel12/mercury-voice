@@ -101,6 +101,48 @@ struct NativeOAuthTests {
         return URLSession(configuration: config)
     }
 
+    /// Percent-encode every byte outside RFC 3986 unreserved so the value
+    /// reaches the listener exactly as written. `URLComponents.queryItems`
+    /// is no good here: it leaves `&` raw in values, which would split the
+    /// query and silently defang the payload under test.
+    private func queryEncoded(_ value: String) -> String {
+        let unreserved = Set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8)
+        var encoded = ""
+        for byte in Array(value.utf8) {
+            if unreserved.contains(byte) {
+                encoded.unicodeScalars.append(Unicode.Scalar(byte))
+            } else {
+                encoded += String(format: "%%%02X", byte)
+            }
+        }
+        return encoded
+    }
+
+    /// The response bytes between `<p>` and `</p>` — the only span of the
+    /// page carrying server-controlled text.
+    ///
+    /// Assertions on this span are byte-level on purpose: `String.contains`
+    /// compares extended grapheme clusters, so a raw `<` fused into a
+    /// cluster by a preceding Unicode Prepend code point (U+0600 and
+    /// friends, UAX #29 GB9b) would slip past `!page.contains("<img")`
+    /// while an HTML tokenizer — which works on code points — still opens a
+    /// tag. Only the wire bytes can prove the text is inert.
+    private func paragraphBytes(of body: Data) throws -> Data {
+        let open = try #require(body.range(of: Data("<p>".utf8)))
+        let close = try #require(body.range(of: Data("</p>".utf8)))
+        return body[open.upperBound..<close.lowerBound]
+    }
+
+    /// No byte that an HTML tokenizer reads as a tag or attribute delimiter
+    /// may appear raw in the server-controlled span. `&` is excluded: it is
+    /// the first byte of every entity the escaper emits.
+    private func expectNoRawDelimiters(in paragraph: Data) {
+        for delimiter in "<>\"'".unicodeScalars {
+            #expect(!paragraph.contains(UInt8(ascii: delimiter)))
+        }
+    }
+
     @Test func listenerCatchesTheRedirect() async throws {
         let listener = LoopbackRedirectListener(expectedState: "s-1")
         let port = try await listener.start()
@@ -179,6 +221,30 @@ struct NativeOAuthTests {
         #expect(try await waiter.value == "real")
     }
 
+    /// The original vulnerability verbatim: a bare `?error=access_denied`
+    /// with no `state` parameter at all ended the wait with `.denied`, so
+    /// anything that could reach the port could fail the sign-in. It must
+    /// now be rejected without consuming the flow, and the genuine callback
+    /// must still win afterwards.
+    @Test func denialWithoutAnyStateIsRejectedWithoutConsumingTheFlow() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "expected")
+        let port = try await listener.start()
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+
+        let waiter = Task { try await listener.waitForCode() }
+        let statelessDenial = URL(
+            string: "http://127.0.0.1:\(port)/oauth/callback?error=access_denied")!
+        let (_, denialResponse) = try await session.data(from: statelessDenial)
+        #expect((denialResponse as? HTTPURLResponse)?.statusCode == 400)
+
+        let real = URL(
+            string: "http://127.0.0.1:\(port)/oauth/callback?code=real&state=expected")!
+        let (_, realResponse) = try await session.data(from: real)
+        #expect((realResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(try await waiter.value == "real")
+    }
+
     /// A genuine denial (state proves it is our flow) still surfaces as
     /// `.denied` with the server's detail.
     @Test func listenerSurfacesIDPDenialWithValidState() async throws {
@@ -225,10 +291,89 @@ struct NativeOAuthTests {
         #expect(!page.contains(hostile))
         #expect(page.contains("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"))
         #expect(page.contains("&lt;img src=x onerror=alert(1)&gt;"))
+        expectNoRawDelimiters(in: try paragraphBytes(of: body))
         // The error value itself is unchanged for the app-side enum.
         await #expect(throws: LoopbackRedirectListener.RedirectError.denied(hostile)) {
             try await waiter.value
         }
+    }
+
+    /// Escaping has to work on Unicode scalars, not `Character`: a Prepend
+    /// code point (U+0600 ARABIC NUMBER SIGN, UAX #29 GB9b) does not break
+    /// before the next code point, so `U+0600 <` is a single grapheme
+    /// cluster that matches none of the escaper's cases. A `Character`-based
+    /// escaper therefore emits the `<` verbatim, and the browser's
+    /// tokenizer — which reads code points — opens the injected tag, closed
+    /// by the `>` of the `</p>` that follows. No raw `>` needed in the
+    /// payload at all.
+    @Test func prependCodePointCannotSmuggleRawMarkupBytes() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "s")
+        let port = try await listener.start()
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+
+        let waiter = Task { try await listener.waitForCode() }
+        let hostile = "\u{0600}<img src=x onerror=alert(document.location) "
+        let url = URL(
+            string: "http://127.0.0.1:\(port)/oauth/callback?error=access_denied"
+                + "&error_description=\(queryEncoded(hostile))&state=s")!
+        let (body, response) = try await session.data(from: url)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+
+        let paragraph = try paragraphBytes(of: body)
+        expectNoRawDelimiters(in: paragraph)
+        #expect(paragraph.range(of: Data("<img".utf8)) == nil)
+        // The Prepend code point itself is inert text and survives (D8 80).
+        #expect(
+            paragraph
+                == Data(
+                    """
+                    Sign-in failed: \u{0600}&lt;img src=x \
+                    onerror=alert(document.location) . You can close this tab.
+                    """.utf8))
+        await #expect(throws: LoopbackRedirectListener.RedirectError.denied(hostile)) {
+            try await waiter.value
+        }
+    }
+
+    /// Wire-level check of the whole escape set, bare and behind a Prepend
+    /// code point, in one round trip.
+    @Test func everySpecialCharacterIsEscapedOnTheWire() async throws {
+        let listener = LoopbackRedirectListener(expectedState: "s")
+        let port = try await listener.start()
+        let session = boundedSession()
+        defer { session.finishTasksAndInvalidate() }
+
+        let waiter = Task { try await listener.waitForCode() }
+        let hostile = "&<>\"'\u{0600}&\u{0600}<\u{0600}>\u{0600}\"\u{0600}'"
+        let url = URL(
+            string: "http://127.0.0.1:\(port)/oauth/callback?error=access_denied"
+                + "&error_description=\(queryEncoded(hostile))&state=s")!
+        let (body, response) = try await session.data(from: url)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+
+        let paragraph = try paragraphBytes(of: body)
+        expectNoRawDelimiters(in: paragraph)
+        #expect(
+            paragraph
+                == Data(
+                    """
+                    Sign-in failed: &amp;&lt;&gt;&quot;&#39;\
+                    \u{0600}&amp;\u{0600}&lt;\u{0600}&gt;\u{0600}&quot;\u{0600}&#39;\
+                    . You can close this tab.
+                    """.utf8))
+        await #expect(throws: LoopbackRedirectListener.RedirectError.denied(hostile)) {
+            try await waiter.value
+        }
+    }
+
+    /// `.stateMismatch` is now reachable only when the state *matched* but
+    /// the callback carried no usable code and no error, so its user-facing
+    /// text must not claim a mismatched state. The case itself stays: the
+    /// public error enum is part of the frozen API.
+    @Test func validationFailureWordingDoesNotClaimAStateMismatch() {
+        let message = LoopbackRedirectListener.RedirectError.stateMismatch.errorDescription
+        #expect(message == "Sign-in response failed validation. Try again.")
     }
 
     /// Duplicate `state` is ambiguous — a smuggled second copy must not be
