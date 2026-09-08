@@ -49,6 +49,45 @@ struct EngineLifetimeTests {
         await engine.end()
     }
 
+    @Test(arguments: [false, true])
+    func releasingThinkingEngineWithoutEndCancelsChime(afterTick: Bool) async throws {
+        let clock = TestClock()
+        let recorder = FakeRecorder()
+        recorder.nextResult = makeUtterance()
+        let transcriber = FakeTranscriber()
+        transcriber.queue("hello there")
+        let ticks = ConversationEngineTests.Harness.CountBox()
+        var engine: ConversationEngine<TestClock>? = ConversationEngine(
+            recorder: recorder, bargeMonitor: FakeBargeMonitor(),
+            transcriber: transcriber, speech: FakeSpeech(), agent: FakeAgent(),
+            callbacks: ConversationCallbacks(onThinkingTick: { ticks.bump() }),
+            clock: clock)
+        await engine?.start()
+        // Await the entire close/drive path, not merely the .thinking status
+        // publication: no caller-owned task may still retain the engine.
+        await engine?.stopTurnNow()
+        #expect(await engine?.status == .thinking)
+        try #require(await eventually { clock.sleeperCount == 1 })
+        if afterTick {
+            clock.advance(by: VoiceConstants.thinkingChimeInterval)
+            try #require(await eventually { ticks.count == 1 })
+            try #require(await eventually { clock.sleeperCount == 1 })
+        }
+
+        weak var releasedEngine = engine
+        engine = nil
+        // Do not advance time or call end() to make these assertions pass.
+        #expect(await eventually { releasedEngine == nil })
+        #expect(clock.sleeperCount == 0)
+        let countAtRelease = ticks.count
+        clock.advance(by: VoiceConstants.thinkingChimeInterval)
+        #expect(ticks.count == countAtRelease)
+
+        // Clean up the deliberately leaking baseline after recording RED.
+        await releasedEngine?.end()
+        releasedEngine = nil
+    }
+
     @Test func lateAgentReplyAfterEndCannotRestartSpeech() async {
         let h = ConversationEngineTests.Harness()
         await h.enterThinking()
