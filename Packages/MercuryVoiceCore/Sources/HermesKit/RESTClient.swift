@@ -20,13 +20,7 @@ public struct HermesRESTClient: Sendable {
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         self.endpoint = endpoint
         self.authenticator = authenticator
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 30
-        // Auth is headers/tickets only; never let a login Set-Cookie sneak
-        // into cookie storage and shadow the Bearer header.
-        config.httpShouldSetCookies = false
-        config.httpCookieAcceptPolicy = .never
-        self.urlSession = URLSession(configuration: config)
+        self.urlSession = URLSession(configuration: HermesHTTP.cookieFreeConfig())
     }
 
     public init(endpoint: ServerEndpoint, token: String?) {
@@ -210,30 +204,6 @@ public struct HermesRESTClient: Sendable {
     }
 
     private func perform(_ request: URLRequest) async throws -> JSONValue {
-        let (data, response) = try await HTTPErrorDetail.load(request, on: urlSession)
-        guard let http = response as? HTTPURLResponse else {
-            throw HermesError.malformedResponse("not an HTTP response")
-        }
-        switch http.statusCode {
-        case 200..<300:
-            break
-        case 401:
-            // Only 401 means "this credential lapsed" — the one case
-            // `performAuthenticated` can fix by refreshing. A 403 is an
-            // access refusal (Host/Origin guard, peer check, permission
-            // gate): no rotation makes it succeed, so it surfaces as a plain
-            // HTTP error with the server's own detail rather than spending
-            // the refresh token and telling the user their session expired.
-            throw HermesError.unauthorized
-        default:
-            let detail =
-                HTTPErrorDetail.restJSONDetail(data)
-                ?? HTTPErrorDetail.displayed(String(decoding: data, as: UTF8.self))
-            throw HermesError.httpError(status: http.statusCode, detail: detail)
-        }
-        guard let json = try? JSONDecoder().decode(JSONValue.self, from: data) else {
-            throw HermesError.malformedResponse("invalid JSON body")
-        }
-        return json
+        try await HermesHTTP.performJSON(request, on: urlSession)
     }
 }
