@@ -50,8 +50,15 @@ final class ConversationController {
     /// the authoritative `message.complete` usage. nil until the first turn
     /// reports, or when the backend doesn't report usage at all.
     private(set) var usage: SessionUsage?
-    var approval: ApprovalRequest?
-    var clarify: ClarifyRequest?
+    // Every sheet write retires its previous notice, including UI dismissal,
+    // confirmed responses and authoritative reconnect reads. Cancellation is
+    // synchronous and scoped to that notice, not the shared speech output.
+    var approval: ApprovalRequest? {
+        willSet { approvalAnnouncement?.cancel() }
+    }
+    var clarify: ClarifyRequest? {
+        willSet { clarifyAnnouncement?.cancel() }
+    }
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -209,7 +216,11 @@ final class ConversationController {
     /// await, which a `Task { await teardown() }` cannot promise. Every
     /// caller still follows with `teardown()` to end the engine and close the
     /// session (issue #77).
-    func supersede() { isTornDown = true }
+    func supersede() {
+        isTornDown = true
+        approvalAnnouncement?.cancel()
+        clarifyAnnouncement?.cancel()
+    }
 
     func begin(mode: Mode) async {
         self.mode = mode
@@ -409,6 +420,8 @@ final class ConversationController {
         trackerEventPump?.cancel()
         stateTask?.cancel()
         captionTask?.cancel()
+        approvalAnnouncement?.cancel()
+        clarifyAnnouncement?.cancel()
         releaseLevelMeterIfOwned()
         #if os(iOS)
             stopAudioKeepalive()
@@ -745,11 +758,7 @@ final class ConversationController {
         approvalEpoch += 1
         approval = request
         promptSendError = nil
-        Task {
-            await engine?.setPaused(true)
-            _ = await speech.playFallback(
-                text: "Hermes is asking for approval to run a command.")
-        }
+        announce(.approval(epoch: approvalEpoch))
     }
 
     private func present(clarify request: ClarifyRequest) {
@@ -758,10 +767,110 @@ final class ConversationController {
         if clarify?.requestID == request.requestID { return }
         clarify = request
         promptSendError = nil
-        Task {
-            await engine?.setPaused(true)
-            _ = await speech.playFallback(text: "Hermes has a question for you.")
+        announce(.clarify(requestID: request.requestID))
+    }
+
+    // MARK: Spoken prompt notices
+
+    /// A queued prompt notice, identified by whatever makes its sheet the one
+    /// on screen: an approval by the epoch that presented it (approvals are
+    /// session-keyed and a backend need not stamp a request id — issue #39), a
+    /// clarify by its request id.
+    private enum PromptNotice {
+        case approval(epoch: Int)
+        case clarify(requestID: String)
+
+        var text: String {
+            switch self {
+            case .approval: "Hermes is asking for approval to run a command."
+            case .clarify: "Hermes has a question for you."
+            }
         }
+    }
+
+    /// The newest notice for each sheet. Every notice one of these replaced
+    /// was cancelled and is then awaited by its successor, so these two
+    /// handles are the whole of the outstanding notice work: cancelling them
+    /// at teardown reaches all of it, and so does awaiting them.
+    private var approvalAnnouncement: Task<Void, Never>?
+    private var clarifyAnnouncement: Task<Void, Never>?
+
+    /// A notice is only ever replaced by the next notice for the *same*
+    /// sheet. The two sheets are independent state — a payload can carry both
+    /// — and neither retires the other.
+    private func announce(_ notice: PromptNotice) {
+        switch notice {
+        case .approval:
+            approvalAnnouncement = queue(notice, replacing: approvalAnnouncement)
+        case .clarify:
+            clarifyAnnouncement = queue(notice, replacing: clarifyAnnouncement)
+        }
+    }
+
+    private func queue(_ notice: PromptNotice, replacing replaced: Task<Void, Never>?)
+        -> Task<Void, Never>
+    {
+        // The notice this one replaces can no longer be worth hearing, and
+        // cancelling it here is synchronous — it lands before the replacement
+        // reaches its own first suspension. Keeping it rather than dropping it
+        // is what makes the new handle stand for the older one as well.
+        replaced?.cancel()
+        return Task { [weak self] in
+            await self?.speak(notice)
+            await replaced?.value
+        }
+    }
+
+    /// Speak a prompt notice — unless, by the time it could be heard, it is
+    /// no longer the prompt the user is looking at.
+    ///
+    /// Every hop below outlives the fact that justified the notice. The pause
+    /// reaches the engine actor and the synthesis inside `playFallback`
+    /// reaches the network, and across that window the conversation can be
+    /// ended or superseded (issues #38, #77), the prompt can expire, be
+    /// answered, be replaced, or be retired by the post-reconnect prompt read,
+    /// and playback can be stopped. Cancelling the task is not enough on its
+    /// own: the output must consume it after synthesis and stop that notice's
+    /// single-use player during delivery. Before handing off, each controller
+    /// fact is captured before suspension and re-checked after it.
+    ///
+    /// The speech generation is one of those facts, which is why this passes
+    /// its own snapshot rather than calling the `playFallback(text:)`
+    /// convenience: that overload reads `sequence` at entry — after the pause
+    /// — so it would adopt the bump `end()`'s own `stopPlayback()` had just
+    /// made and play the notice into a conversation that is over.
+    ///
+    /// Deliberate consequence: any stop landing in that window suppresses the
+    /// notice, including one from a reply that started streaming into it. The
+    /// sheet is on screen either way, and re-reading the generation is the bug.
+    private func speak(_ notice: PromptNotice) async {
+        guard isCurrent(notice) else { return }
+        let sequence = await speech.sequence
+        // Pausing for a prompt that has already gone would strand the loop:
+        // the `resumeIfUnprompted()` that retired it has already run.
+        guard isCurrent(notice) else { return }
+        await engine?.setPaused(true)
+        guard isCurrent(notice) else { return }
+        _ = await speech.playAnnouncement(text: notice.text, expectedSequence: sequence)
+    }
+
+    /// True while `notice` still describes a prompt on screen, in a
+    /// conversation this controller still owns, for a task nobody cancelled.
+    private func isCurrent(_ notice: PromptNotice) -> Bool {
+        guard !isTornDown, !Task.isCancelled else { return false }
+        switch notice {
+        case .approval(let epoch): return approval != nil && approvalEpoch == epoch
+        case .clarify(let requestID): return clarify?.requestID == requestID
+        }
+    }
+
+    /// Test seam: await every prompt notice still in flight. These tasks are
+    /// the only unstructured work `present()` starts, and a test asserting
+    /// that a stale notice stayed *silent* has no other signal to wait on
+    /// (issue #79).
+    func awaitPromptAnnouncements() async {
+        await approvalAnnouncement?.value
+        await clarifyAnnouncement?.value
     }
 
     /// Adopt the `pending_approval` / `pending_clarify` fields of a

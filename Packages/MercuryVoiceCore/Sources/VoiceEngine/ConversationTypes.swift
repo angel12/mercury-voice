@@ -133,6 +133,10 @@ public protocol SpeechPlaying: Sendable {
     /// snapshot but before this method begins, and capturing `sequence`
     /// again here would adopt the Stop as this clip's generation.
     func playFallback(text: String, expectedSequence: Int) async -> Bool
+    /// Prompt notice with the caller task as its lifetime. Implementations that
+    /// support scoped cancellation must refuse cancelled synthesis and stop only
+    /// this notice's clip, including cancellation before clip start.
+    func playAnnouncement(text: String, expectedSequence: Int) async -> Bool
     /// Stop all playback immediately. Bumps `sequence`.
     func stopPlayback() async
     /// Monotonic count of stopPlayback calls — the stop-detection protocol.
@@ -142,6 +146,13 @@ public protocol SpeechPlaying: Sendable {
 }
 
 extension SpeechPlaying {
+    /// Compatibility for existing conformers. Override to enforce cancellation
+    /// through synthesis and delivery; HermesSpeechOutput does so without a
+    /// global Stop or changing ordinary fallback semantics.
+    public func playAnnouncement(text: String, expectedSequence: Int) async -> Bool {
+        await playFallback(text: text, expectedSequence: expectedSequence)
+    }
+
     /// Callers that have not already snapshot the generation (prompt-notice
     /// speech) capture `sequence` at entry — the engine must pass its own
     /// snapshot instead, or a Stop between the two hops is absorbed.
