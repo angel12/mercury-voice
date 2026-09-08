@@ -37,12 +37,29 @@ public actor HermesConnection {
     public private(set) var phase: Phase = .stopped
     private var gateway: GatewayClient?
     private var supervisor: Task<Void, Never>?
+    private var supervisorLifetime: UUID?
     private var everConnected = false
     private var reconnectPoke: CheckedContinuation<Void, Never>?
     private var backoffTimer: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<Update>.Continuation] = [:]
 
+    /// Internal scheduling seam. Nil in shipping initializers; tests delay
+    /// existing suspension boundaries without replacing gateway behavior.
+    enum SupervisorCheckpoint: Sendable {
+        case connected, connectFailed, eventsSubscribed, eventReceived, eventsEnded
+        case closeCauseRead, closeReasonRead, finished
+    }
+    private let supervisorCheckpoint: (@Sendable (SupervisorCheckpoint) async -> Void)?
+
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
+        self.init(endpoint: endpoint, authenticator: authenticator, supervisorCheckpoint: nil)
+    }
+
+    init(
+        endpoint: ServerEndpoint, authenticator: HermesAuthenticator,
+        supervisorCheckpoint: (@Sendable (SupervisorCheckpoint) async -> Void)?
+    ) {
+        self.supervisorCheckpoint = supervisorCheckpoint
         self.endpoint = endpoint
         self.authenticator = authenticator
         self.rest = HermesRESTClient(endpoint: endpoint, authenticator: authenticator)
@@ -82,10 +99,16 @@ public actor HermesConnection {
 
     public func start() {
         guard supervisor == nil else { return }
-        supervisor = Task { await runSupervisor() }
+        let lifetime = UUID()
+        supervisorLifetime = lifetime
+        supervisor = Task {
+            await runSupervisor(lifetime: lifetime)
+            if let supervisorCheckpoint { await supervisorCheckpoint(.finished) }
+        }
     }
 
     public func stop() {
+        supervisorLifetime = nil
         supervisor?.cancel()
         supervisor = nil
         backoffTimer?.cancel()
@@ -153,14 +176,19 @@ public actor HermesConnection {
 
     // MARK: Supervisor
 
-    private func runSupervisor() async {
+    private func ownsSupervisor(_ lifetime: UUID) -> Bool {
+        supervisorLifetime == lifetime && !Task.isCancelled
+    }
+
+    private func runSupervisor(lifetime: UUID) async {
         var attempt = 0
-        while !Task.isCancelled {
+        while ownsSupervisor(lifetime) {
             publish(.phase(.connecting(attempt: attempt)))
 
             let client = GatewayClient(endpoint: endpoint, authenticator: authenticator)
             do {
                 try await client.connect()
+                if let supervisorCheckpoint { await supervisorCheckpoint(.connected) }
             } catch {
                 // Read the cause and reason before close() — close() is a
                 // no-op once the socket already closed itself, but what it
@@ -169,7 +197,8 @@ public actor HermesConnection {
                 let cause = await client.closeCause
                 let closeReason = await closeReason(of: client)
                 await client.close(reason: nil)
-                if Task.isCancelled { return }  // stop() already published .stopped
+                if let supervisorCheckpoint { await supervisorCheckpoint(.connectFailed) }
+                guard ownsSupervisor(lifetime) else { return }  // stop() published .stopped
                 if cause == .unauthorized {
                     // The handshake was refused with 4401, or 401 on the
                     // upgrade itself (a dead token can be rejected either
@@ -198,14 +227,14 @@ public actor HermesConnection {
                 let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
                 publish(.phase(.disconnected(reason: reason)))
                 attempt += 1
-                await backoff(attempt: attempt)
+                await backoff(attempt: attempt, lifetime: lifetime)
                 continue
             }
 
             // stop() during the handshake only sees the published `gateway`
             // (still nil here) — the local client must be closed explicitly
             // or its socket and receive loop outlive the connection.
-            if Task.isCancelled {
+            if !ownsSupervisor(lifetime) {
                 await client.close(reason: "stopped")
                 return
             }
@@ -217,17 +246,26 @@ public actor HermesConnection {
 
             // Pump this socket generation's events into the stable stream;
             // the event stream finishing is the disconnect signal.
-            for await event in await client.events() {
-                if Task.isCancelled { break }
+            let events = await client.events()
+            if let supervisorCheckpoint { await supervisorCheckpoint(.eventsSubscribed) }
+            for await event in events {
+                if let supervisorCheckpoint { await supervisorCheckpoint(.eventReceived) }
+                if !ownsSupervisor(lifetime) { break }
                 publish(.event(event))
             }
-            gateway = nil
-            if Task.isCancelled {
+            if let supervisorCheckpoint { await supervisorCheckpoint(.eventsEnded) }
+            // stop() makes a new lifetime possible before this task exits.
+            // Retired cleanup owns only its local client, never the shared
+            // gateway or the replacement supervisor's phase/task handle.
+            guard ownsSupervisor(lifetime) else {
                 await client.close(reason: "stopped")
-                break
+                return
             }
+            gateway = nil
 
             let cause = await client.closeCause
+            if let supervisorCheckpoint { await supervisorCheckpoint(.closeCauseRead) }
+            guard ownsSupervisor(lifetime) else { return }
             if cause == .unauthorized {
                 // The server rejected these credentials mid-flight (WS close
                 // 4401) — in token mode that is what a backend restart looks
@@ -243,25 +281,32 @@ public actor HermesConnection {
                 // Mid-flight 4403: the server withdrew this client's access.
                 // Terminal, and never an auth prompt — same reasoning as the
                 // dial-time branch above.
-                publish(.phase(.refused(reason: await closeReason(of: client))))
+                let reason = await closeReason(of: client)
+                guard ownsSupervisor(lifetime) else { return }
+                publish(.phase(.refused(reason: reason)))
                 supervisor = nil
                 return
             }
-            publish(.phase(.disconnected(reason: await closeReason(of: client))))
+            let reason = await closeReason(of: client)
+            guard ownsSupervisor(lifetime) else { return }
+            publish(.phase(.disconnected(reason: reason)))
             attempt += 1
-            await backoff(attempt: attempt)
+            await backoff(attempt: attempt, lifetime: lifetime)
         }
     }
 
     private func closeReason(of client: GatewayClient) async -> String? {
-        if case .closed(let reason) = await client.state { return reason }
+        let state = await client.state
+        if let supervisorCheckpoint { await supervisorCheckpoint(.closeReasonRead) }
+        if case .closed(let reason) = state { return reason }
         return nil
     }
 
     /// Full-jitter exponential backoff:
     /// `delay = random() * min(15s, 300ms * 2^attempt)`, skippable via
     /// `pokeReconnect()`.
-    private func backoff(attempt: Int) async {
+    private func backoff(attempt: Int, lifetime: UUID) async {
+        guard ownsSupervisor(lifetime) else { return }
         let cap = min(15.0, 0.3 * pow(2.0, Double(attempt)))
         let delay = Double.random(in: 0...cap)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
