@@ -6,6 +6,11 @@ import Foundation
 /// exactly instead of hoped for.
 protocol GatewaySocket: AnyObject, Sendable {
     var closeCode: URLSessionWebSocketTask.CloseCode { get }
+    /// The HTTP response to the upgrade handshake, when there was one. A
+    /// server that refuses the upgrade answers 401/403 here and no WebSocket
+    /// close code is ever produced, so this is the only signal that
+    /// distinguishes a refusal from a dropped dial (see `closeOutcome`).
+    var upgradeResponse: HTTPURLResponse? { get }
     func resume()
     func receiveFrame() async throws -> URLSessionWebSocketTask.Message
     func sendText(_ text: String, completion: @escaping @Sendable (Error?) -> Void)
@@ -14,6 +19,8 @@ protocol GatewaySocket: AnyObject, Sendable {
 
 extension URLSessionWebSocketTask: GatewaySocket {
     func receiveFrame() async throws -> Message { try await receive() }
+
+    var upgradeResponse: HTTPURLResponse? { response as? HTTPURLResponse }
 
     func sendText(_ text: String, completion: @escaping @Sendable (Error?) -> Void) {
         send(.string(text), completionHandler: completion)
@@ -36,11 +43,19 @@ public actor GatewayClient {
         case closed(reason: String?)
     }
 
-    /// Why the socket closed, for callers that must react differently.
-    /// `unauthorized` is terminal: the server rejected these credentials, so
-    /// redialing with them can only fail the same way.
+    /// Why the socket closed, for callers that must react differently. Two
+    /// of the three are terminal, for different reasons:
+    ///
+    /// - `unauthorized` (WS 4401 / HTTP 401 on the upgrade): the server
+    ///   rejected these credentials, so redialing with them can only fail
+    ///   the same way — fresh credentials are the fix.
+    /// - `forbidden` (WS 4403 / HTTP 403 on the upgrade): the server refused
+    ///   this client's access. The credentials are not the problem, so a
+    ///   re-login fixes nothing; every redial is refused identically.
+    /// - `other`: transport failure or an ordinary close — retryable.
     public enum CloseCause: Sendable, Equatable {
         case unauthorized
+        case forbidden
         case other
     }
 
@@ -128,7 +143,15 @@ public actor GatewayClient {
         do {
             query = try await authenticator.webSocketAuthQuery()
         } catch {
-            state = .idle
+            if case HermesError.httpError(status: 403, detail: _) = error {
+                // Password-mode ticket minting (including its refresh) can
+                // refuse access before a socket exists. Carry that known
+                // refusal to the supervisor, just like an upgrade 403. The
+                // authenticator has already bounded and redacted the detail.
+                close(reason: (error as? HermesError)?.errorDescription, cause: .forbidden)
+            } else {
+                state = .idle
+            }
             throw error
         }
         let url = endpoint.webSocketURL("/api/ws", query: query)
@@ -327,24 +350,46 @@ public actor GatewayClient {
                     break
                 }
             } catch {
-                let outcome = Self.closeOutcome(closeCode: task.closeCode, error: error)
+                let outcome = Self.closeOutcome(
+                    closeCode: task.closeCode,
+                    upgradeStatus: task.upgradeResponse?.statusCode,
+                    error: error)
                 close(reason: outcome.reason, cause: outcome.cause)
                 return
             }
         }
     }
 
-    /// Socket-close code → user-facing reason + the cause the supervisor
-    /// branches on. Pure so it can be tested without standing up a server.
+    /// Close code + upgrade status → user-facing reason and the cause the
+    /// supervisor branches on. Pure so it can be tested without standing up
+    /// a server; `GatewayRefusalTests` pins the inputs to what Apple's
+    /// transport actually reports.
+    ///
+    /// A refused upgrade never reaches WebSocket close codes: the server
+    /// answers the HTTP handshake with 401 (credentials) or 403 (access) and
+    /// URLSession surfaces `.invalid` plus a generic "bad response", so the
+    /// handshake response's status is the only signal. A dial that died
+    /// before any response carries neither, and stays retryable — guessing
+    /// would strand the app on a transient failure.
     static func closeOutcome(
-        closeCode: URLSessionWebSocketTask.CloseCode, error: Error
+        closeCode: URLSessionWebSocketTask.CloseCode,
+        upgradeStatus: Int?,
+        error: Error
     ) -> (reason: String, cause: CloseCause) {
-        if closeCode == .invalid {
-            // No close frame — a transport error (unreachable, reset, TLS).
-            return (error.localizedDescription, .other)
-        }
-        if closeCode.rawValue == 4401 {
+        let refusedUpgrade = closeCode == .invalid ? upgradeStatus : nil
+        if closeCode.rawValue == 4401 || refusedUpgrade == 401 {
             return ("unauthorized (4401) — the server rejected the credentials", .unauthorized)
+        }
+        if closeCode.rawValue == 4403 || refusedUpgrade == 403 {
+            return (
+                "refused (4403) — the server refused this connection; dial it by exactly the address it bound to, or check its access rules",
+                .forbidden
+            )
+        }
+        if closeCode == .invalid {
+            // No close frame and no refusal — a transport error (unreachable,
+            // reset, TLS, a handshake that died before any response).
+            return (error.localizedDescription, .other)
         }
         return ("socket closed (code \(closeCode.rawValue))", .other)
     }

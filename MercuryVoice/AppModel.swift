@@ -511,6 +511,19 @@ final class AppModel {
                         self.disconnect()
                         return
                     }
+                    if case .refused(let reason) = phase {
+                        // The server refused this client's access (WS 4403,
+                        // or 403 on the upgrade). Nothing is wrong with the
+                        // credentials, so this must NOT present sign-in or
+                        // the "paste a fresh dashboard URL" story — and the
+                        // supervisor has already stopped, so the reconnect
+                        // indicator would lie. Back to the connect screen
+                        // with the server's explanation.
+                        self.disconnect()
+                        self.connectError =
+                            reason ?? "The server refused this connection."
+                        return
+                    }
                 case .event(let event):
                     self.conversation?.handle(event: event)
                 }

@@ -4,7 +4,8 @@ import Foundation
 ///
 /// Auth comes from the shared `HermesAuthenticator`: `X-Hermes-Session-Token`
 /// in loopback token mode, `Authorization: Bearer` in gated password mode
-/// (where a 401 triggers one token refresh + retry). The public `/api/health`
+/// (where a 401 — and only a 401 — triggers one token refresh + retry; a 403
+/// is an access refusal no credential can fix). The public `/api/health`
 /// + `/api/status` skip auth. Endpoints that resolve provider config take
 /// `?profile=<name>` — the audio endpoints must always get the conversation's
 /// profile.
@@ -216,7 +217,13 @@ public struct HermesRESTClient: Sendable {
         switch http.statusCode {
         case 200..<300:
             break
-        case 401, 403:
+        case 401:
+            // Only 401 means "this credential lapsed" — the one case
+            // `performAuthenticated` can fix by refreshing. A 403 is an
+            // access refusal (Host/Origin guard, peer check, permission
+            // gate): no rotation makes it succeed, so it surfaces as a plain
+            // HTTP error with the server's own detail rather than spending
+            // the refresh token and telling the user their session expired.
             throw HermesError.unauthorized
         default:
             let detail =

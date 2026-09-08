@@ -67,6 +67,12 @@ final class ScriptedGatewaySocket: GatewaySocket, @unchecked Sendable {
         lock.withLock { _closeCode }
     }
 
+    /// Always nil: a scripted socket cannot fabricate URLSession's upgrade
+    /// response, and pretending otherwise would "prove" a transport mapping
+    /// this type never exercises. The 401/403 upgrade classification is
+    /// tested against the real transport in `GatewayRefusalTests`.
+    var upgradeResponse: HTTPURLResponse? { nil }
+
     func resume() {}
 
     func receiveFrame() async throws -> URLSessionWebSocketTask.Message {
