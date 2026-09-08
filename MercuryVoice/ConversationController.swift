@@ -85,8 +85,6 @@ final class ConversationController {
     /// nil in production: `startVoiceLoop` builds the live stack.
     private let audio: AudioStack?
     private let profile: String?
-    private var handle: SessionHandle?
-    private var mode: Mode?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
@@ -95,7 +93,6 @@ final class ConversationController {
     private let capture: AudioCaptureService
     private let cues = ConversationCuePlayer()
     private var stateTask: Task<Void, Never>?
-    private var captionTask: Task<Void, Never>?
 
     #if os(iOS)
         // Background-audio lifecycle (issue #31). The keepalive stream pins
@@ -113,9 +110,6 @@ final class ConversationController {
         private var callObserverDelegate: CallEndWatcher?
         /// True between an interruption's begin and end notifications.
         private(set) var audioInterrupted = false
-        /// True when the engine parked after a refused mic start; cleared by
-        /// the foreground/interruption-ended resume.
-        private var parkedForBackground = false
     #endif
 
     /// Runtime session id lives in a box the tracker's submit closure reads,
@@ -346,7 +340,6 @@ final class ConversationController {
     }
 
     func begin(mode: Mode) async {
-        self.mode = mode
         do {
             try await openSession(mode: mode)
         } catch {
@@ -372,7 +365,6 @@ final class ConversationController {
         case .resume(let storedID):
             handle = try await sessionService.resumeSession(storedID: storedID, profile: profile)
         }
-        self.handle = handle
         sessionBox.runtimeID = handle.runtimeID
         sessionBox.storedID = handle.storedID
         sessionTitle = handle.title?.isEmpty == false ? handle.title : nil
@@ -492,13 +484,6 @@ final class ConversationController {
                         if UIApplication.shared.applicationState != .active { return false }
                     #endif
                     return true
-                },
-                onMicParked: { [weak self] in
-                    Task { @MainActor in
-                        #if os(iOS)
-                            self?.parkedForBackground = true
-                        #endif
-                    }
                 }),
             clock: ContinuousClock())
         self.engine = engine
@@ -543,7 +528,6 @@ final class ConversationController {
     func teardown() async {
         supersede()
         stateTask?.cancel()
-        captionTask?.cancel()
         approvalAnnouncement?.cancel()
         clarifyAnnouncement?.cancel()
         releaseLevelMeterIfOwned()
@@ -1126,7 +1110,6 @@ final class ConversationController {
                 }
                 return
             }
-            self.handle = handle
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
             let currentEpoch = await sessionService.replayEpoch
@@ -1269,7 +1252,6 @@ final class ConversationController {
     func listenNow() {
         #if os(iOS)
             audioInterrupted = false
-            parkedForBackground = false
             capture.ensureRunning()
         #endif
         Task {
@@ -1343,7 +1325,6 @@ final class ConversationController {
         guard approval == nil, clarify == nil else { return }
         #if os(iOS)
             guard !audioInterrupted else { return }
-            parkedForBackground = false
         #endif
         Task { await engine?.setPaused(false) }
     }

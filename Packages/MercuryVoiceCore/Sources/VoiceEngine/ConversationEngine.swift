@@ -6,6 +6,9 @@ import Foundation
 /// `use-voice-conversation.ts`; deviations are commented at the site.
 ///
 /// Generic over the clock so tests can drive time manually.
+/// Owners must still call `end()` for deterministic audio teardown. Dropping
+/// an engine while thinking releases the actor and cancels its chime, but is
+/// not a substitute for stopping independently running audio dependencies.
 public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private let recorder: any VoiceRecording
     private let barge: any BargeMonitoring
@@ -88,6 +91,12 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         self.detachBargeCaptureWhileMuted =
             detachBargeCaptureWhileMuted
             ?? shouldDetachBargeCaptureWhileMuted(isIOS: bargeMuteRunsOnIOS)
+    }
+
+    deinit {
+        // The chime does not retain the engine while parked. Cancel its sleep
+        // when the last owner disappears, even if that owner missed end().
+        thinkingChimeTask?.cancel()
     }
 
     // MARK: Observation
@@ -345,17 +354,25 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         stopThinkingChime()
         thinkingChimeGeneration += 1
         let generation = thinkingChimeGeneration
-        // Strong on purpose (see turnTimeoutTask): this loop is the #7
-        // retain cycle — it pins the engine while status stays .thinking, so
-        // an engine released without end() mid-thinking leaks. Every owner
-        // path calls end(); breaking the cycle with [weak self] costs the
-        // actor-FIFO ordering the engine's determinism depends on.
-        thinkingChimeTask = Task { [clock] in
+        // Only the chime waits off-actor: unlike speech setup and the hard
+        // cap, it has no ordering dependency on subsequent engine jobs. Pin
+        // its first deadline here so executor delay cannot postpone the cue.
+        // Promote self only for the synchronous, actor-isolated tick, never
+        // across the next sleep. Generation/status checks reject stale hops.
+        let firstDeadline = clock.now.advanced(by: VoiceConstants.thinkingChimeInterval)
+        thinkingChimeTask = Task { [weak self, clock] in
+            var deadline = firstDeadline
             while !Task.isCancelled {
-                try? await clock.sleep(
-                    for: VoiceConstants.thinkingChimeInterval, tolerance: nil)
+                do {
+                    try await clock.sleep(until: deadline, tolerance: nil)
+                } catch {
+                    return
+                }
                 guard !Task.isCancelled else { return }
-                guard self.thinkingChimeTicked(generation: generation) else { return }
+                guard await self?.thinkingChimeTicked(generation: generation) == true else {
+                    return
+                }
+                deadline = clock.now.advanced(by: VoiceConstants.thinkingChimeInterval)
             }
         }
     }
