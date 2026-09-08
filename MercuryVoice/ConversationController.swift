@@ -69,6 +69,11 @@ final class ConversationController {
         var text: String
     }
     private(set) var devMessages: [DevMessage] = []
+    var textDraft = ""
+    private(set) var pendingText: String?
+    private(set) var failedText: String?
+    private(set) var textSubmissionError: String?
+    private(set) var textSubmissionTask: Task<Void, Never>?
 
     // MARK: Wiring
 
@@ -159,7 +164,8 @@ final class ConversationController {
         profile: String?,
         sessionService: (any SessionServicing)? = nil,
         speech: (any SpeechPlaying)? = nil,
-        audio: AudioStack? = nil
+        audio: AudioStack? = nil,
+        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
@@ -179,8 +185,12 @@ final class ConversationController {
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
                 guard let sid = box.runtimeID else { throw HermesError.notConnected }
-                try await connection.submitPrompt(
-                    sessionID: sid, text: text, interrupted: interrupted)
+                if let submitPrompt {
+                    try await submitPrompt(sid, text, interrupted)
+                } else {
+                    try await connection.submitPrompt(
+                        sessionID: sid, text: text, interrupted: interrupted)
+                }
             },
             interrupt: {
                 guard let sid = box.runtimeID else { return }
@@ -218,6 +228,8 @@ final class ConversationController {
     /// session (issue #77).
     func supersede() {
         isTornDown = true
+        pendingText = nil
+        textSubmissionTask?.cancel()
         approvalAnnouncement?.cancel()
         clarifyAnnouncement?.cancel()
     }
@@ -1244,18 +1256,71 @@ final class ConversationController {
 
     // MARK: Dev text path
 
+    func dismissFailedText() {
+        guard !isTornDown, pendingText == nil else { return }
+        failedText = nil
+        textSubmissionError = nil
+    }
+
     func submitTextPrompt(_ text: String) {
+        guard !isTornDown, pendingText == nil else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        appendDevMessage(role: "user", text: trimmed)
-        Task {
-            try? await tracker.submit(text: trimmed, interrupted: false)
+        guard !trimmed.isEmpty, failedText == nil || failedText == trimmed else { return }
+        guard connectionHealthy else {
+            failedText = trimmed
+            textSubmissionError =
+                textSubmissionError
+                ?? "Not connected to the Hermes server. Reconnect, then retry."
+            return
+        }
+        let draftAtSubmission = textDraft
+        // Completion events may arrive before the submit ACK. Reserve the
+        // ordering boundary, not a sent bubble; failed delivery stays uncertain.
+        let precedingMessageID = devMessages.last?.id
+        pendingText = trimmed
+        textSubmissionError = nil
+        textSubmissionTask = Task {
+            guard !isTornDown else { return }
+            do {
+                try await tracker.submit(text: trimmed, interrupted: false)
+                guard !isTornDown else { return }
+                let insertionIndex =
+                    precedingMessageID.flatMap { id in
+                        devMessages.firstIndex { $0.id == id }.map { $0 + 1 }
+                    } ?? 0
+                appendDevMessage(role: "user", text: trimmed, at: insertionIndex)
+                failedText = nil
+                if textDraft == draftAtSubmission,
+                    draftAtSubmission.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
+                {
+                    textDraft = ""
+                }
+            } catch {
+                guard !isTornDown else { return }
+                failedText = trimmed
+                // Transport failures may follow server acceptance. Never echo
+                // raw error text (which can contain tokens, paths or IDs).
+                textSubmissionError =
+                    "Delivery is uncertain. Check the conversation before retrying; "
+                    + "retrying may send this message twice."
+                if let hermesError = error as? HermesError,
+                    let reason = hermesError.rpcReason,
+                    [
+                        HermesError.RefusalReason.sessionNotOwned,
+                        HermesError.RefusalReason.maxConcurrentSessions,
+                        HermesError.RefusalReason.coordinationUnavailable,
+                    ].contains(reason)
+                {
+                    textSubmissionError = hermesError.errorDescription
+                }
+            }
+            pendingText = nil
         }
     }
 
-    private func appendDevMessage(role: String, text: String) {
+    private func appendDevMessage(role: String, text: String, at index: Int? = nil) {
         guard !text.isEmpty else { return }
-        devMessages.append(DevMessage(role: role, text: text))
+        devMessages.insert(DevMessage(role: role, text: text), at: index ?? devMessages.endIndex)
         if devMessages.count > 100 { devMessages.removeFirst(devMessages.count - 100) }
     }
 }
