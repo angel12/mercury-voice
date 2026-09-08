@@ -39,11 +39,7 @@ public actor HermesAuthenticator {
     /// cookies — a stale cookie silently overriding the Bearer header would
     /// be undebuggable.
     static func cookieFreeConfig() -> URLSessionConfiguration {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 30
-        config.httpShouldSetCookies = false
-        config.httpCookieAcceptPolicy = .never
-        return config
+        HermesHTTP.cookieFreeConfig()
     }
 
     // MARK: REST auth
@@ -275,29 +271,6 @@ public actor HermesAuthenticator {
     static func perform(
         _ request: URLRequest, on session: URLSession
     ) async throws -> JSONValue {
-        let (data, response) = try await HTTPErrorDetail.load(request, on: session)
-        guard let http = response as? HTTPURLResponse else {
-            throw HermesError.malformedResponse("not an HTTP response")
-        }
-        switch http.statusCode {
-        case 200..<300:
-            break
-        case 401:
-            // Only 401 is a lapsed credential — the ws-ticket mint retries
-            // after one refresh on it, and `refresh` reads it as a dead
-            // refresh token. A 403 is an access refusal (Host/Origin guard,
-            // peer check, permission gate) that no rotation fixes, so it
-            // must not enter either of those paths.
-            throw HermesError.unauthorized
-        default:
-            let detail =
-                HTTPErrorDetail.restJSONDetail(data)
-                ?? HTTPErrorDetail.displayed(String(decoding: data, as: UTF8.self))
-            throw HermesError.httpError(status: http.statusCode, detail: detail)
-        }
-        guard let json = try? JSONDecoder().decode(JSONValue.self, from: data) else {
-            throw HermesError.malformedResponse("invalid JSON body")
-        }
-        return json
+        try await HermesHTTP.performJSON(request, on: session)
     }
 }

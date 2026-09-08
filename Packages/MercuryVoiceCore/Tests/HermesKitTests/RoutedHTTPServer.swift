@@ -11,15 +11,18 @@ final class RoutedHTTPServer: @unchecked Sendable {
         var method: String
         var path: String
         var body: Data
+        var headers: [String: String]
     }
 
     struct Response: Sendable {
         var status: Int
         var body: String
+        var headers: [String: String]
 
-        init(_ status: Int, _ body: String = "{}") {
+        init(_ status: Int, _ body: String = "{}", headers: [String: String] = [:]) {
             self.status = status
             self.body = body
+            self.headers = headers
         }
     }
 
@@ -130,7 +133,7 @@ final class RoutedHTTPServer: @unchecked Sendable {
 
         return Request(
             method: requestLine[0], path: requestLine[1],
-            body: Data(body.prefix(contentLength)))
+            body: Data(body.prefix(contentLength)), headers: headers)
     }
 
     private func respond(_ connection: NWConnection, with response: Response) {
@@ -138,6 +141,7 @@ final class RoutedHTTPServer: @unchecked Sendable {
             "HTTP/1.1 \(response.status) \(response.status == 200 ? "OK" : "Error")\r\n"
             + "Content-Type: application/json\r\n"
             + "Content-Length: \(response.body.utf8.count)\r\n"
+            + response.headers.map { "\($0.key): \($0.value)\r\n" }.joined()
             + "Connection: close\r\n\r\n\(response.body)"
         // Flush before cancelling, or URLSession sees a lost connection
         // instead of the status code (verified against this transport).
