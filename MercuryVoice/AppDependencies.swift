@@ -109,6 +109,10 @@ struct AppDependencies {
     /// `refreshProjects` / "show more" run on the real `AppModel` path.
     var makeBrowse: (HermesConnection) -> any BrowseServicing
 
+    var makePathMonitor: () -> any NetworkPathMonitoring = { NetworkPathMonitor() }
+    var verifyGateway: @Sendable (HermesConnection) async -> Void = { await $0.verifyConnection() }
+    var pokeGateway: @Sendable (HermesConnection) async -> Void = { await $0.pokeReconnect() }
+
     static var live: AppDependencies {
         AppDependencies(
             credentialStore: KeychainTokenStore(),

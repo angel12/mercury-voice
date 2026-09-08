@@ -13,6 +13,8 @@ public actor HermesConnection {
         case connecting(attempt: Int)
         case ready(isReconnect: Bool)
         case stopped
+        /// Ten consecutive failed handshakes. Only an explicit start retries.
+        case unreachable(reason: String)
         /// Password-mode refresh token is dead; redialing is pointless. The
         /// supervisor has stopped — the app must prompt for a fresh sign-in.
         case authExpired
@@ -50,6 +52,8 @@ public actor HermesConnection {
         case closeCauseRead, closeReasonRead, finished
     }
     private let supervisorCheckpoint: (@Sendable (SupervisorCheckpoint) async -> Void)?
+    /// Tests hold retries until an explicit poke; shipping keeps full jitter.
+    private let backoffDelay: TimeInterval?
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         self.init(endpoint: endpoint, authenticator: authenticator, supervisorCheckpoint: nil)
@@ -57,9 +61,11 @@ public actor HermesConnection {
 
     init(
         endpoint: ServerEndpoint, authenticator: HermesAuthenticator,
-        supervisorCheckpoint: (@Sendable (SupervisorCheckpoint) async -> Void)?
+        supervisorCheckpoint: (@Sendable (SupervisorCheckpoint) async -> Void)?,
+        backoffDelay: TimeInterval? = nil
     ) {
         self.supervisorCheckpoint = supervisorCheckpoint
+        self.backoffDelay = backoffDelay
         self.endpoint = endpoint
         self.authenticator = authenticator
         self.rest = HermesRESTClient(endpoint: endpoint, authenticator: authenticator)
@@ -182,6 +188,7 @@ public actor HermesConnection {
 
     private func runSupervisor(lifetime: UUID) async {
         var attempt = 0
+        var failedDials = 0
         while ownsSupervisor(lifetime) {
             publish(.phase(.connecting(attempt: attempt)))
 
@@ -225,6 +232,16 @@ public actor HermesConnection {
                     return
                 }
                 let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
+                failedDials += 1
+                if failedDials == 10 {
+                    publish(
+                        .phase(
+                            .unreachable(
+                                reason: "Server unreachable after 10 failed connection attempts. "
+                                    + "Check your network and server, then retry. " + reason)))
+                    supervisor = nil
+                    return
+                }
                 publish(.phase(.disconnected(reason: reason)))
                 attempt += 1
                 await backoff(attempt: attempt, lifetime: lifetime)
@@ -240,6 +257,7 @@ public actor HermesConnection {
             }
 
             gateway = client
+            failedDials = 0
             attempt = 0
             publish(.phase(.ready(isReconnect: everConnected)))
             everConnected = true
@@ -308,7 +326,7 @@ public actor HermesConnection {
     private func backoff(attempt: Int, lifetime: UUID) async {
         guard ownsSupervisor(lifetime) else { return }
         let cap = min(15.0, 0.3 * pow(2.0, Double(attempt)))
-        let delay = Double.random(in: 0...cap)
+        let delay = backoffDelay ?? Double.random(in: 0...cap)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             reconnectPoke = cont
             // The timer must die with the wait it belongs to: a stale timer

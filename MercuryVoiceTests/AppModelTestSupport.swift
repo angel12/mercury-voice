@@ -398,6 +398,7 @@ extension AppDependencies {
             stopGateway: { gateway.stop($0) },
             gatewayUpdates: { gateway.updates($0) },
             makeConversation: { conversations.make(connection: $0, profile: $1) },
-            makeBrowse: { connection in browse ?? connection })
+            makeBrowse: { connection in browse ?? connection },
+            makePathMonitor: { ScriptedPathMonitor() })
     }
 }
