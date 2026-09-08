@@ -32,6 +32,7 @@ struct AuthExpiryReachabilityTests {
         #expect(model.connection != nil)
 
         // The gateway reports its credentials dead, through the real pump.
+        let pump = model.updatePump
         gateway.send(.phase(.authExpired), toConnection: 0)
 
         // Recovery is now suspended inside AppModel, mid-`authProviders`.
@@ -40,5 +41,10 @@ struct AuthExpiryReachabilityTests {
         #expect(gateway.stoppedCount == 0)
 
         await providersGate.release()
+        // Releasing recovery only makes the producer runnable. Join it before
+        // reading the one teardown it schedules for this model's connection.
+        await pump?.value
+        await model.pendingTeardown?.value
+        #expect(gateway.stoppedCount == 1)
     }
 }

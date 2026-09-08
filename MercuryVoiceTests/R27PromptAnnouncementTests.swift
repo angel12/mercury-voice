@@ -23,14 +23,9 @@ import Testing
 /// inside the engine pause, inside synthesis, and immediately before the clip
 /// plays.
 ///
-/// Serialized, for the same reason `R25ConversationOwnershipTests` is: these
-/// tests drive the real `startVoiceLoop`, which takes
-/// `ConversationController.levelMeterOwner` and installs a handler on the
-/// process-global `AudioCaptureService.shared`. Each test tears its
-/// controllers down, which gives both back.
-@MainActor
-@Suite("R27 prompt-announcement lifetime", .serialized)
-struct R27PromptAnnouncementTests {
+/// Shares a serialized parent with R25 because both drive the real global
+/// meter. Every test awaits its controllers' teardown before yielding ownership.
+extension SharedMeterTests.R27PromptAnnouncementTests {
 
     static let runtimeID = "rt1"
     static let storedID = "st1"
@@ -42,7 +37,7 @@ struct R27PromptAnnouncementTests {
     /// A conversation with a real engine behind it: `begin()` runs the actual
     /// `openSession` and `startVoiceLoop`, so `engine.setPaused(true)` is a
     /// genuine actor hop and `teardown()` is the real End.
-    private func liveConversation(
+    func liveConversation(
         service: ScriptedSessionService,
         speech: any SpeechPlaying,
         recorder: PausableRecorder,
@@ -519,7 +514,7 @@ final class SequencedSpeech: SpeechPlaying, @unchecked Sendable {
 }
 
 // Regression: actual controller + actual HermesSpeechOutput; no audio hardware.
-extension R27PromptAnnouncementTests {
+extension SharedMeterTests.R27PromptAnnouncementTests {
     @Test(
         "stale prompt at real synthesis/delivery boundary",
         arguments: ["expiry", "supersede", "replacement", "end", "current"],
@@ -588,7 +583,7 @@ final class AnnouncementPlayer: FallbackClipPlaying, @unchecked Sendable {
     }
 }
 
-extension R27PromptAnnouncementTests {
+extension SharedMeterTests.R27PromptAnnouncementTests {
     @Test(
         "retiring one notice preserves newer unrelated delivery",
         arguments: ["synthesis", "delivery"])
