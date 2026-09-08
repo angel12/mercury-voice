@@ -97,7 +97,7 @@ struct EventReplayDecodingTests {
                  "latest_seq": 8, "truncated": false, "count": 2, "epoch": "abc123"}
                 """))
 
-        #expect(batch.events.count == 2)  // the typeless frame is dropped
+        #expect(batch.events.count == 2)  // the typeless frame does not decode
         #expect(batch.events[0].type == "message.delta")
         #expect(batch.events[0].seq == 7)
         #expect(batch.events[0].sessionID == "s1")
@@ -105,6 +105,339 @@ struct EventReplayDecodingTests {
         #expect(batch.latestSeq == 8)
         #expect(batch.truncated == false)
         #expect(batch.epoch == "abc123")
+        // …and the frames that did decode are not the whole answer, so this
+        // response cannot be replayed as one.
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "abc123", forSession: "s1", after: 6))
+    }
+
+    /// The shape the gateway actually answers with — `methods_session.py`
+    /// writes events/latest_seq/truncated/count/epoch on every reply.
+    @Test func aConformingAnswerReplaysLosslessly() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11,
+                     "payload": {"text": "hello"}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": 1, "epoch": "abc123"}
+                """))
+        #expect(batch.events.count == 1)
+        #expect(batch.isLossless(under: "abc123", forSession: "s1", after: 10))
+    }
+
+    /// Nothing missed is a perfectly good lossless answer.
+    @Test func anEmptyConformingAnswerIsStillLossless() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                #"{"events": [], "latest_seq": 10, "truncated": false, "count": 0, "epoch": "e1"}"#)
+        )
+        #expect(batch.events.isEmpty)
+        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    @Test(arguments: ["", "null", "[]", "true", "7", "\"text\""])
+    func malformedReplayPayloadRejectsWholeBatch(literal: String) throws {
+        let payload = literal.isEmpty ? "" : " , \"payload\": \(literal)"
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type":"message.complete","session_id":"s1","seq":11,"payload":{}},
+                    {"type":"message.delta","session_id":"s1","seq":12\(payload)}
+                ],"latest_seq":12,"truncated":false,"count":2,"epoch":"e1"}
+                """))
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    @Test(arguments: ["", " ", "\t\n", "future.event"])
+    func replayRequiresUsableTypeButLiveDecodingStaysPermissive(type: String) {
+        let frame: JSONValue = [
+            "type": .string(type), "session_id": "s1", "seq": 11, "payload": [:],
+        ]
+        let batch = EventReplayBatch(result: [
+            "events": .array([frame]), "latest_seq": 11, "truncated": false, "epoch": "e1",
+        ])
+        #expect(GatewayEvent(eventParams: frame)?.type == type)
+        #expect(
+            batch.isLossless(under: "e1", forSession: "s1", after: 10) == (type == "future.event"))
+    }
+
+    // MARK: Fail-closed decoding (issue #58, finding R05)
+
+    /// `truncated` is the gateway's answer to "did the ring drop frames you
+    /// asked for", and every gateway that serves the method writes it. A
+    /// response that does not answer it has not said "no gap" — reading the
+    /// absence as `false` is what let an unreadable reply pass as a lossless
+    /// replay.
+    @Test func aMissingTruncatedFlagReadsAsAGap() throws {
+        let batch = EventReplayBatch(
+            result: try json(#"{"events": [], "latest_seq": 4, "count": 0, "epoch": "e1"}"#))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    @Test(arguments: ["\"maybe\"", "null", "{}", "[]", "2"])
+    func anUnreadableTruncatedFlagReadsAsAGap(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    @Test(arguments: ["0", "1", "\"false\"", "\"0\"", "\"true\"", "\"1\""])
+    func nonBooleanTruncatedFlagsAreMalformed(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(batch.malformed)
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    @Test(arguments: ["true"])
+    func trueTruncatedFlagStillDecodes(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "count": 0, "epoch": "e1",
+                 "truncated": \(literal)}
+                """))
+        #expect(batch.truncated)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    /// No `events` array at all is an unread response, not an empty replay.
+    @Test(arguments: [
+        #"{"latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+        #"{"events": {}, "latest_seq": 4, "truncated": false, "epoch": "e1"}"#,
+    ])
+    func absentOrNonArrayEventsIsUnusable(document: String) throws {
+        let batch = EventReplayBatch(result: try json(document))
+        #expect(batch.events.isEmpty)
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    /// `count` is the gateway's own tally of the frames it put in `events`,
+    /// so a disagreement means the batch in hand is not the batch sent.
+    @Test(arguments: ["5", "\"1\"", "null"])
+    func aCountDisagreeingWithTheFramesIsUnusable(literal: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11, "payload": {}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": \(literal), "epoch": "e1"}
+                """))
+        #expect(batch.events.count == 1)
+        #expect(batch.malformed)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// `epoch` is the identity of the numbering the watermark was taken
+    /// under, and it has been echoed by this method since the same commit
+    /// that first advertised `replay_epoch` at `gateway.ready` — so a caller
+    /// that knows an epoch is talking to a gateway that sends one back, and
+    /// an answer without it cannot be shown to be about the same numbering.
+    @Test(arguments: ["", #""epoch": null,"#, #""epoch": 7,"#, #""epoch": "e2","#])
+    func anEpochThatIsNotTheWatermarksIsNotAContinuation(fragment: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 4, "truncated": false, "count": 0, \(fragment)
+                 "session_id": "s1"}
+                """))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 4))
+    }
+
+    // MARK: The numbering must be the one the watermark was taken in
+
+    /// Session-ring eviction (`event_replay.py:57–59`) drops the ring *and*
+    /// the counter, so the session restarts at seq 1 with `truncated` False
+    /// (there is no ring to be truncated against). `latest_seq` below the
+    /// watermark — 0 for a session that has emitted nothing since — is the
+    /// only trace of it, and a conforming-looking empty batch that carries it
+    /// is not a "nothing was missed".
+    @Test(arguments: [0, 3, 9])
+    func aLatestSeqBelowTheWatermarkIsARenumberedRing(latest: Int) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": \(latest), "truncated": false, "count": 0,
+                 "epoch": "e1"}
+                """))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// The gateway writes `latest_seq` on every answer; without a readable
+    /// one there is no evidence about the numbering at all.
+    @Test(arguments: [
+        "", #""latest_seq": null,"#, #""latest_seq": "12","#,
+        #""latest_seq": 11.5,"#, #""latest_seq": 1e19,"#,
+    ])
+    func anAbsentOrUnreadableLatestSeqIsUnusable(fragment: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], \(fragment) "truncated": false, "count": 0, "epoch": "e1"}
+                """))
+        #expect(batch.latestSeq == nil)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// Latest behind the frames contradicts coverage, just as latest ahead
+    /// leaves an unproven tail. Neither is accepted as lossless.
+    @Test func aLatestSeqBehindTheLastFrameIsUnusable() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11, "payload": {}},
+                    {"type": "message.complete", "session_id": "s1", "seq": 12, "payload": {}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": 2, "epoch": "e1"}
+                """))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    // MARK: The frames must be the whole contiguous run after the watermark
+
+    /// The ring ascends by exactly one per session and `truncated == false`
+    /// means the first frame returned is `watermark + 1`, so anything else —
+    /// a hole, a repeat, a reordering, a late start, a frame at or below the
+    /// watermark — is not this gateway's answer, and the batch is refused
+    /// whole rather than partially applied.
+    @Test(arguments: [[12, 11], [11, 13], [11, 11], [15], [10, 11], [11, 12, 14]])
+    func framesMustAscendByOneFromTheWatermark(seqs: [Int]) throws {
+        let frames =
+            seqs
+            .map {
+                #"{"type": "message.complete", "session_id": "s1", "seq": \#($0), "payload": {}}"#
+            }
+            .joined(separator: ",\n")
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [\(frames)], "latest_seq": 20, "truncated": false,
+                 "count": \(seqs.count), "epoch": "e1"}
+                """))
+        #expect(batch.events.count == seqs.count)
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// A contiguous prefix alone does not prove coverage of an absent tail.
+    @Test(arguments: [12, 13, 99])
+    func aContiguousRunStillReplays(latest: Int) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11, "payload": {}},
+                    {"type": "message.delta", "session_id": "s1", "seq": 12, "payload": {}}
+                 ],
+                 "latest_seq": \(latest), "truncated": false, "count": 2, "epoch": "e1"}
+                """))
+        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10) == (latest == 12))
+    }
+
+    @Test func emptyBatchCannotOmitANewerTail() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                #"{"events":[],"latest_seq":12,"truncated":false,"count":0,"epoch":"e1"}"#))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// Every replayed frame is stamped (`_stamp_event`), so one whose `seq`
+    /// is missing, a string, fractional, negative or out of `Int` range
+    /// cannot be placed in the run — and must not be applied, since the seq
+    /// gate would let it through without advancing the watermark. Reading it
+    /// must not trap either: the number is server-controlled. (A magnitude
+    /// beyond `Double` — `1e400` — never reaches here at all: `JSONValue`
+    /// itself refuses to decode it. The transport drops that response and
+    /// the RPC eventually fails by timeout/disconnect, reaching fallback.)
+    @Test(arguments: [
+        "", #""seq": null,"#, #""seq": "12","#, #""seq": 11.5,"#,
+        #""seq": -12,"#, #""seq": 1e19,"#,
+    ])
+    func aFrameWithoutAnIntegerSeqIsUnusable(fragment: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11, "payload": {}},
+                    {"type": "message.complete", "session_id": "s1", \(fragment)
+                     "payload": {}}
+                 ],
+                 "latest_seq": 12, "truncated": false, "count": 2, "epoch": "e1"}
+                """))
+        #expect(batch.events.count == 2)  // it decodes as a live frame would
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// A Python backend may render a whole number as a float; that is still
+    /// an integer seq and still replays.
+    @Test func anIntegralFloatSeqStillReplays() throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", "session_id": "s1", "seq": 11.0, "payload": {}}
+                 ],
+                 "latest_seq": 11.0, "truncated": false, "count": 1, "epoch": "e1"}
+                """))
+        #expect(batch.events[0].seq == 11)
+        #expect(batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// The replay path applies its frames directly, without the `ours` filter
+    /// the live socket applies, so a frame belonging to another session (or
+    /// to none) would land on this conversation. `events_since` reads one
+    /// session's ring and `_stamp_event` records only frames that name a
+    /// session, so such a frame is not this answer.
+    @Test(arguments: [
+        "", #""session_id": null,"#, #""session_id": "s2","#,
+        #""session_id": 1,"#,
+    ])
+    func aFrameFromAnotherSessionIsUnusable(fragment: String) throws {
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [
+                    {"type": "message.complete", \(fragment) "seq": 11, "payload": {}}
+                 ],
+                 "latest_seq": 11, "truncated": false, "count": 1, "epoch": "e1"}
+                """))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: 10))
+    }
+
+    /// Bounds arithmetic on server-controlled numbers must not trap. A
+    /// watermark beyond anything `latest_seq` can express is refused (not
+    /// incremented into an overflow), and the largest watermark a JSON answer
+    /// can actually carry is still evaluated normally.
+    @Test func extremeWatermarksAreRefusedRatherThanOverflowed() throws {
+        // 2^63 − 1024: the largest `Int` a JSON double expresses exactly.
+        let edge = 9_223_372_036_854_774_784
+        let batch = EventReplayBatch(
+            result: try json(
+                """
+                {"events": [], "latest_seq": 9223372036854774784, "truncated": false,
+                 "count": 0, "epoch": "e1"}
+                """))
+        #expect(batch.latestSeq == edge)
+        #expect(batch.isLossless(under: "e1", forSession: "s1", after: edge))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: Int.max))
+        #expect(!batch.isLossless(under: "e1", forSession: "s1", after: -1))
     }
 
     @Test func truncatedBatchSurvivesMissingFields() throws {

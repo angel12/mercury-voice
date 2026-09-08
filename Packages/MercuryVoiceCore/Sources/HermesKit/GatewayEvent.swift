@@ -55,23 +55,121 @@ public struct GatewayEvent: Sendable, Equatable {
 
 /// Result of `session.events.since` — the missed-event replay a reconnecting
 /// client requests with its last observed seq.
+///
+/// A batch is applied *instead of* a full refresh, so everything it does not
+/// carry is taken to have never happened. Decoding is therefore fail-closed:
+/// the gateway answers every call with `events`, `latest_seq`, `truncated`,
+/// `count` and `epoch` (`tui_gateway/methods_session.py`), and a response that
+/// leaves any of the gap questions unanswered is reported as unusable rather
+/// than read as a reassuring default. `isLossless(under:forSession:after:)` is
+/// that verdict.
 public struct EventReplayBatch: Sendable, Equatable {
     public var events: [GatewayEvent]
     public var latestSeq: Int?
     /// The requested watermark predates the ring buffer — a gap exists, so
     /// the caller must fall back to a full state refresh instead of replaying.
+    /// Also true when the response never answered the question: an absent or
+    /// unreadable field is not a "no gap".
     public var truncated: Bool
     /// Process identity of the seq numbering; compare against the
     /// `replay_epoch` learned at `gateway.ready` — a mismatch means the
     /// backend restarted and every watermark is stale.
     public var epoch: String?
+    /// The response could not be read as a whole batch: `events` absent or
+    /// not an array, an entry that is not a decodable event frame, an
+    /// unreadable `truncated`, or a `count` disagreeing with the entries
+    /// decoded. The frames in hand are then a subset of what was sent — a
+    /// gap, not a replay.
+    public var malformed: Bool
 
     public init(result: JSONValue) {
-        self.events =
-            result["events"]?.arrayValue?.compactMap(GatewayEvent.init(eventParams:)) ?? []
+        let entries = result["events"]?.arrayValue
+        // Replay needs structural evidence; the ordinary live decoder remains permissive.
+        let decoded =
+            entries?.compactMap { entry -> GatewayEvent? in
+                guard let type = entry["type"]?.stringValue,
+                    !type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    entry["payload"]?.objectValue != nil
+                else { return nil }
+                return GatewayEvent(eventParams: entry)
+            } ?? []
+        self.events = decoded
         self.latestSeq = result["latest_seq"]?.intValue
-        self.truncated = result["truncated"]?.truthy ?? false
+        let gap = result["truncated"]?.boolValue
+        self.truncated = gap ?? true
         self.epoch = result["epoch"]?.stringValue
+        // `count` is the gateway's own tally of what it put in `events`
+        // (`len(frames)`), so it is the one field that can contradict an
+        // entry dropped on the way in. A backend that omits it says nothing,
+        // and the per-entry check already covers the drop.
+        let countField = result["count"]
+        self.malformed =
+            gap == nil
+            || entries == nil
+            || entries?.count != decoded.count
+            || (countField != nil && countField?.intValue != decoded.count)
+    }
+
+    /// Whether these frames are provably every event after `watermark`, for
+    /// `sessionID`, under the epoch `expected` — the identity and numbering
+    /// the watermark was taken with. False is not "an error occurred": it is
+    /// "this answer is not evidence that nothing was missed", and the caller
+    /// must refresh instead of replaying.
+    ///
+    /// Required evidence, based on `tui_gateway/event_replay.py` and
+    /// `methods_session.py`. The backend reads frames and metadata separately;
+    /// requiring complete coverage may conservatively reject a racing answer:
+    ///
+    /// - The epoch is present and equal. It has been echoed here since the
+    ///   same gateway commit that first advertised `replay_epoch` at
+    ///   `gateway.ready`, so a caller holding an epoch is by construction
+    ///   talking to a gateway that returns one; an older backend leaves the
+    ///   caller with no epoch at all and never reaches this check.
+    /// - `latest_seq` is the session's current highest stamp, read straight
+    ///   after the frames, so it is never below the watermark the client
+    ///   reached — *unless* the ring was evicted, which drops the counter
+    ///   with it (`_replay_next_seq.pop`) and restarts the session at 1 while
+    ///   `truncated` reads False because the ring is simply gone. A
+    ///   `latest_seq` below the watermark (0 for an evicted session), or one
+    ///   that is absent or unreadable, is the only trace that renumbering
+    ///   leaves, so it is refused.
+    /// - Every replayed frame is stamped with an integer `seq` and carries
+    ///   the session id it was requested for (`_stamp_event` only records
+    ///   frames with a session id, and `events_since` reads that session's
+    ///   ring), the ring ascends by exactly one, and `truncated == false`
+    ///   means the first frame returned is `watermark + 1`. So the frames
+    ///   must be the contiguous run `watermark + 1 … latest_seq`: a hole, a
+    ///   repeat, a reordering, an unstamped or fractional seq, or a frame
+    ///   from another session invalidates the batch as a whole rather than
+    ///   the frame alone — the caller applies all of it or none of it.
+    ///
+    /// Numeric validation operates on JSONValue's Double representation, not
+    /// lexical JSON numbers: rounded fractions and large counters cannot be
+    /// recovered here. Int(exactly:) checks the represented value only.
+    ///
+    /// Residual, and a backend limitation rather than something a client can
+    /// see: an evicted session whose new counter catches up to `watermark`
+    /// can answer exactly like a real continuation. Only
+    /// a per-session epoch (or an `is_truncated` that reported a missing
+    /// ring) could distinguish it.
+    public func isLossless(
+        under expected: String, forSession sessionID: String, after watermark: Int
+    ) -> Bool {
+        guard !truncated, !malformed, epoch == expected else { return false }
+        // Seqs start at 1, so a watermark below 0 was never stamped by this
+        // contract, and `latest` must still be at or past where we got to.
+        guard watermark >= 0, let latest = latestSeq, latest >= watermark else { return false }
+        var previous = watermark
+        for event in events {
+            guard event.sessionID == sessionID, let seq = event.seq else { return false }
+            // `previous + 1` unchecked would trap on a watermark at Int.max.
+            let (next, overflowed) = previous.addingReportingOverflow(1)
+            guard !overflowed, seq == next else { return false }
+            previous = next
+        }
+        // Separate backend reads can race with stamping. An absent tail is
+        // still unproven coverage, even if it might arrive on the live socket.
+        return previous == latest
     }
 }
 

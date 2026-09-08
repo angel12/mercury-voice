@@ -432,14 +432,45 @@ enum Fixtures {
         return event
     }
 
-    static func replayBatch(
-        _ events: [JSONValue], epoch: String? = "epoch-1", truncated: Bool = false
-    ) -> EventReplayBatch {
+    /// The result object `session.events.since` answers with — every field
+    /// the gateway writes (`events`, `latest_seq`, `truncated`, `count`,
+    /// `epoch`), so a test can drop or corrupt exactly one of them with the
+    /// rest left conforming.
+    ///
+    /// `latestSeq` defaults to the highest seq in `events` (the gateway reads
+    /// it right after the frames, so it is never below them); pass it
+    /// explicitly for an empty batch, whose conforming value is the caller's
+    /// watermark, or to model a ring that renumbered.
+    static func replayResult(
+        _ events: [JSONValue], epoch: String? = "epoch-1", truncated: Bool = false,
+        latestSeq: Int? = nil
+    ) -> JSONValue {
+        let highest = latestSeq ?? events.compactMap { $0["seq"]?.intValue }.max() ?? 0
         var object: [String: JSONValue] = [
             "events": .array(events),
             "truncated": .bool(truncated),
+            "count": .number(Double(events.count)),
+            "latest_seq": .number(Double(highest)),
         ]
         if let epoch { object["epoch"] = .string(epoch) }
+        return .object(object)
+    }
+
+    static func replayBatch(
+        _ events: [JSONValue], epoch: String? = "epoch-1", truncated: Bool = false,
+        latestSeq: Int? = nil
+    ) -> EventReplayBatch {
+        EventReplayBatch(
+            result: replayResult(
+                events, epoch: epoch, truncated: truncated, latestSeq: latestSeq))
+    }
+
+    /// The conforming batch with one field replaced — `nil` removes the key.
+    static func replayBatch(
+        _ events: [JSONValue], replacing field: String, with value: JSONValue?
+    ) -> EventReplayBatch {
+        var object = replayResult(events).objectValue ?? [:]
+        object[field] = value
         return EventReplayBatch(result: .object(object))
     }
 }
