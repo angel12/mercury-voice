@@ -21,13 +21,10 @@ import Testing
 /// microphone and held a backend session open.
 ///
 /// Every wait here is a `CallGate` or a task value — no sleeping, no polling.
-/// Serialized: `startVoiceLoop` installs a handler on the process-global
-/// `AudioCaptureService.shared`, and the meter-ownership assertions below read
-/// it back, so these tests must not interleave with each other. No other suite
-/// reaches that state — the controller tests elsewhere stop at `openSession`.
-@MainActor
-@Suite("Conversation ownership (R25)", .serialized)
-struct R25ConversationOwnershipTests {
+/// Shares a serialized parent with R27: both install the process-global meter.
+/// The parent excludes other test cases, not the competing controllers inside
+/// each ownership regression.
+extension SharedMeterTests.R25ConversationOwnershipTests {
 
     // MARK: Harness
 
@@ -68,6 +65,20 @@ struct R25ConversationOwnershipTests {
             }
         }
         return conversations
+    }
+
+    /// Finish every launch before the shared parent admits the next test.
+    /// `pendingTeardown` is only the latest task: join it before scheduling the
+    /// final disconnect, then explicitly join all controllers this fixture made.
+    private func finish(model: AppModel, conversations: ConversationRecorder) async {
+        await model.pendingTeardown?.value
+        model.disconnect()
+        await model.pendingTeardown?.value
+        for launch in conversations.launches {
+            await launch.controller.teardown()
+        }
+        #expect(ConversationController.levelMeterOwner == nil)
+        #expect(!AudioCaptureService.shared.hasLevelHandler)
     }
 
     // MARK: create → create
@@ -123,6 +134,8 @@ struct R25ConversationOwnershipTests {
         // its session is still open.
         #expect(conversations.launches[1].recorder.startCalls == 1)
         #expect(conversations.launches[1].service.closedIDs.isEmpty)
+
+        await finish(model: model, conversations: conversations)
     }
 
     // MARK: create → resume
@@ -165,6 +178,8 @@ struct R25ConversationOwnershipTests {
         #expect(conversations.launches[0].service.closedIDs == ["rt-0"])
         #expect(model.conversation === conversations.launches[1].controller)
         #expect(conversations.launches[1].recorder.startCalls == 1)
+
+        await finish(model: model, conversations: conversations)
     }
 
     // MARK: Superseding a settled conversation
@@ -192,6 +207,8 @@ struct R25ConversationOwnershipTests {
         #expect(conversations.launches[0].service.closedIDs == ["rt-0"])
         #expect(conversations.launches[1].service.closedIDs.isEmpty)
         #expect(conversations.launches[1].recorder.startCalls == 1)
+
+        await finish(model: model, conversations: conversations)
     }
 
     // MARK: Ending / disconnecting mid-launch
@@ -228,10 +245,13 @@ struct R25ConversationOwnershipTests {
 
         await open.release()
         await launch.value
+        await model.pendingTeardown?.value
 
         #expect(model.conversation == nil)
         #expect(conversations.launches[0].recorder.startCalls == 0)
         #expect(conversations.launches[0].service.closedIDs == ["rt-0"])
+
+        await finish(model: model, conversations: conversations)
     }
 
     /// Disconnecting mid-launch is the same guarantee, and it must not leave
@@ -262,6 +282,8 @@ struct R25ConversationOwnershipTests {
         #expect(conversations.launches[0].recorder.startCalls == 0)
         #expect(conversations.launches[0].service.closedIDs == ["rt-0"])
         #expect(gateway.stoppedCount == 1)
+
+        await finish(model: model, conversations: conversations)
     }
 
     // MARK: Normal launch and teardown
@@ -293,6 +315,49 @@ struct R25ConversationOwnershipTests {
         #expect(model.conversation == nil)
         #expect(launch.service.closedIDs == ["rt-0"])
         #expect(launch.recorder.cancelCalls >= 1)
+
+        await finish(model: model, conversations: conversations)
+    }
+
+    /// Forced interleaving of the actual R25 and R27 fixtures, not a fake
+    /// meter: another suite can begin between R25's last owner assertion and
+    /// its final teardown assertion. Suite-local `.serialized` cannot prevent it.
+    @Test func anotherFixtureCanOwnTheMeterWhenR25CleanupReturns() async {
+        let (defaults, suiteName) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let gateway = GatewayRecorder()
+        defer { gateway.finishAll() }
+        let conversations = recorder(gates: [:])
+        let model = await connectedModel(
+            conversations: conversations, gateway: gateway, defaults: defaults)
+        await model.startConversation(cwd: "/one")
+        let superseded = conversations.launches[0].controller
+        await model.startConversation(cwd: "/two")
+        await model.pendingTeardown?.value
+        let replacement = conversations.launches[1].controller
+        await superseded.teardown()
+        #expect(ConversationController.levelMeterOwner === replacement)
+        #expect(AudioCaptureService.shared.hasLevelHandler)
+
+        // Execute the other suite's real fixture at this exact suspension
+        // boundary, retaining its controller so weak-owner lifetime is not luck.
+        let other = await SharedMeterTests.R27PromptAnnouncementTests().liveConversation(
+            service: ScriptedSessionService(), speech: SequencedSpeech(),
+            recorder: PausableRecorder())
+        #expect(ConversationController.levelMeterOwner === other)
+        await replacement.teardown()
+        // This is correct shipping behavior, but violates R25's old assumption
+        // that no *other test* can own the global meter at this point.
+        #expect(ConversationController.levelMeterOwner === other)
+        #expect(AudioCaptureService.shared.hasLevelHandler)
+
+        await other.teardown()
+        model.disconnect()
+        await model.pendingTeardown?.value
+        #expect(ConversationController.levelMeterOwner == nil)
+        #expect(!AudioCaptureService.shared.hasLevelHandler)
+
+        await finish(model: model, conversations: conversations)
     }
 
     // MARK: Shared capture state under reversed cleanup ordering
@@ -339,6 +404,8 @@ struct R25ConversationOwnershipTests {
         await replacement.teardown()
         #expect(ConversationController.levelMeterOwner == nil)
         #expect(!AudioCaptureService.shared.hasLevelHandler)
+
+        await finish(model: model, conversations: conversations)
     }
 
     #if os(iOS)
@@ -381,6 +448,8 @@ struct R25ConversationOwnershipTests {
             await drainMainQueue()
 
             #expect(live.audioInterrupted)
+
+            await finish(model: model, conversations: conversations)
         }
 
         /// An interruption delivered after the replacement has taken over must
@@ -430,6 +499,8 @@ struct R25ConversationOwnershipTests {
             await second.value
             #expect(ConversationController.levelMeterOwner === replacement)
             #expect(AudioCaptureService.shared.hasLevelHandler)
+
+            await finish(model: model, conversations: conversations)
         }
 
         /// `isTornDown` is set synchronously by `supersede()`, but `teardown()`
@@ -464,6 +535,8 @@ struct R25ConversationOwnershipTests {
             await drainMainQueue()
 
             #expect(!superseded.audioInterrupted)
+
+            await finish(model: model, conversations: conversations)
         }
 
         /// The other half, in the same window. `CXCall` cannot be constructed,
@@ -501,6 +574,8 @@ struct R25ConversationOwnershipTests {
 
             #expect(superseded.audioInterrupted)
             #expect(conversations.launches[0].recorder.startCalls == recorderStartsBefore)
+
+            await finish(model: model, conversations: conversations)
         }
 
     #endif

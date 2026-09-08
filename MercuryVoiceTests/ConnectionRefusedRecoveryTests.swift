@@ -22,22 +22,36 @@ struct ConnectionRefusedRecoveryTests {
         let auth = ScriptedAuthenticator()
         let gateway = GatewayRecorder()
         defer { gateway.finishAll() }
-        let model = AppModel(
-            dependencies: .scripted(
-                authenticator: auth,
-                probes: ProbeRecorder { _ in .accepting },
-                gateway: gateway,
-                defaults: defaults))
+        let stop = HarnessGate()
+        defer { stop.release() }
+        var dependencies = AppDependencies.scripted(
+            authenticator: auth,
+            probes: ProbeRecorder { _ in .accepting },
+            gateway: gateway,
+            defaults: defaults)
+        dependencies.stopGateway = { connection in
+            await stop.arrive()
+            gateway.stop(connection)
+        }
+        let model = AppModel(dependencies: dependencies)
 
         await model.connect(input: "http://127.0.0.1:8080", token: nil)
         #expect(model.connection != nil)
 
+        let pump = model.updatePump
         gateway.send(.phase(.refused(reason: Self.reason)), toConnection: 0)
 
-        // The refusal is on screen…
-        #expect(await eventuallyOnMain { model.connectError == Self.reason })
-        // …the connection is released rather than left "Reconnecting…"…
+        #expect(await stop.waitUntilEntered())
+        await pump?.value
+        // The refusal is on screen, but the owned stop is still held.
+        #expect(model.connectError == Self.reason)
         #expect(model.connection == nil)
+        // Error publication is deliberately earlier than gateway completion.
+        #expect(gateway.stoppedCount == 0)
+        let teardown = model.pendingTeardown
+        #expect(teardown != nil)
+        stop.release()
+        await teardown?.value
         #expect(gateway.stoppedCount == 1)
         #expect(!model.isConnected)
         // …and nothing asked the user to re-authenticate: no sign-in form,
@@ -61,9 +75,16 @@ struct ConnectionRefusedRecoveryTests {
                 defaults: defaults))
 
         await model.connect(input: "http://127.0.0.1:8080", token: nil)
+        let pump = model.updatePump
         gateway.send(.phase(.refused(reason: nil)), toConnection: 0)
 
-        #expect(await eventuallyOnMain { model.connectError != nil })
+        // Join the producer before reading the teardown it schedules. This
+        // model has just one connection and no earlier conversation teardown.
+        await pump?.value
+        let teardown = model.pendingTeardown
+        #expect(teardown != nil)
+        await teardown?.value
+        #expect(gateway.stoppedCount == 1)
         #expect(model.connectError == "The server refused this connection.")
         #expect(model.pendingLogin == nil)
     }
