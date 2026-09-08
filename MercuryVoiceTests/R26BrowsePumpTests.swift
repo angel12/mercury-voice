@@ -250,4 +250,211 @@ struct R26BrowsePumpTests {
         await pump?.value
         await model.pendingTeardown?.value
     }
+
+    @Test(arguments: ["tree", "recents"])
+    func reviewerCancellationAfterProfiles(stage: String) async {
+        let (defaults, suite) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let browse = ScriptedBrowseService()
+        let gate = CallGate()
+        if stage == "tree" { browse.treeGate = gate } else { browse.profileSessionsGate = gate }
+        script(browse)
+        let gateway = GatewayRecorder()
+        let model = await model(browse, gateway, defaults: defaults)
+        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
+        #expect(
+            await eventuallyOnMain {
+                stage == "tree" ? browse.treeCalls.count == 1 : browse.recentsCalls.count == 1
+            })
+        let owner = model.browseTask
+        model.browseError = "reviewer sentinel"
+        owner?.cancel()
+        await gate.release()
+        await owner?.value
+        if stage == "tree" {
+            #expect(model.projectTree == nil)
+            #expect(browse.recentsCalls.isEmpty)
+        } else {
+            // Successful completion writes browseError=nil. Cancellation must not.
+            #expect(model.browseError == "reviewer sentinel")
+        }
+        let pump = model.updatePump
+        model.disconnect()
+        gateway.finishAll()
+        await pump?.value
+        await model.pendingTeardown?.value
+    }
+
+    // Exercise typed/untyped catches and both routes into the flat fallback.
+    // Gate snapshots are taken before call entry; drain the exact owner before
+    // checking absence of publication or a further dependent request.
+    @Test(
+        arguments: ["tree", "recents", "fallback-tree", "fallback-recents"],
+        ["success", "hermes", "cancellation", "unsupported"])
+    func cancelledDependentCompletion(stage: String, outcome: String) async {
+        let (defaults, suite) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let browse = ScriptedBrowseService()
+        let gate = CallGate()
+        let unsupported = HermesError.rpcError(
+            code: HermesError.RPCCode.methodNotFound, message: "unsupported", data: nil)
+        let failure: (any Error)? =
+            switch outcome {
+            case "hermes": HermesError.connectionClosed("late failure")
+            case "cancellation": CancellationError()
+            case "unsupported": unsupported
+            default: nil
+            }
+        browse.enqueueProfiles([profile()])
+        if stage == "tree" {
+            browse.treeGate = gate
+            if let failure {
+                browse.enqueueTreeFailure(failure)
+            } else {
+                browse.enqueueTree(ProjectTree(json: .object([:])))
+            }
+        } else {
+            browse.profileSessionsGate = gate
+            if stage == "fallback-tree" {
+                browse.enqueueTreeFailure(unsupported)
+            } else {
+                browse.enqueueTree(ProjectTree(json: .object([:])))
+            }
+            if stage == "fallback-recents" { browse.enqueueRecentsFailure(unsupported) }
+            if let failure {
+                browse.enqueueRecentsFailure(failure)
+            } else {
+                browse.enqueueRecents([])
+            }
+        }
+        let gateway = GatewayRecorder()
+        let model = await model(browse, gateway, defaults: defaults)
+        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
+        #expect(
+            await eventuallyOnMain {
+                stage == "tree" ? browse.treeCalls.count == 1 : browse.recentsCalls.count == 1
+            })
+        let completionGate: CallGate
+        if stage == "fallback-recents" {
+            completionGate = CallGate()
+            browse.profileSessionsGate = completionGate
+            await gate.release()
+            #expect(await eventuallyOnMain { browse.recentsCalls.count == 2 })
+        } else {
+            completionGate = gate
+        }
+        let owner = model.browseTask
+        model.browseError = "preserve error"
+        owner?.cancel()
+        await completionGate.release()
+        await owner?.value
+        #expect(model.browseError == "preserve error")
+        #expect(!model.usesFlatFallback)
+        #expect(!model.browseLoading)
+        #expect(model.recentSessions.isEmpty)
+        if stage == "tree" || stage == "fallback-tree" {
+            #expect(model.projectTree == nil)
+        }
+        let expectedCalls = stage == "tree" ? 0 : (stage == "fallback-recents" ? 2 : 1)
+        #expect(browse.recentsCalls.count == expectedCalls)
+        let pump = model.updatePump
+        model.disconnect()
+        gateway.finishAll()
+        await pump?.value
+        await model.pendingTeardown?.value
+    }
+
+    @Test(arguments: ["tree", "recents", "fallback"], [false, true])
+    func cancelledDependentCannotClearNewerLoading(stage: String, failure: Bool) async {
+        let (defaults, suite) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let browse = ScriptedBrowseService()
+        let oldGate = CallGate()
+        browse.enqueueProfiles([profile()])
+        let error = HermesError.connectionClosed("old failure")
+        if stage == "tree" {
+            browse.treeGate = oldGate
+            if failure {
+                browse.enqueueTreeFailure(error)
+            } else {
+                browse.enqueueTree(ProjectTree(json: .object([:])))
+            }
+        } else {
+            browse.profileSessionsGate = oldGate
+            if stage == "fallback" {
+                browse.enqueueTreeFailure(
+                    HermesError.rpcError(
+                        code: HermesError.RPCCode.methodNotFound, message: "unsupported", data: nil)
+                )
+            } else {
+                browse.enqueueTree(ProjectTree(json: .object([:])))
+            }
+            if failure { browse.enqueueRecentsFailure(error) } else { browse.enqueueRecents([]) }
+        }
+        let gateway = GatewayRecorder()
+        let model = await model(browse, gateway, defaults: defaults)
+        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
+        #expect(
+            await eventuallyOnMain {
+                stage == "tree" ? browse.treeCalls.count == 1 : browse.recentsCalls.count == 1
+            })
+        let owner = model.browseTask
+        owner?.cancel()
+        let newGate = CallGate()
+        browse.treeGate = newGate
+        browse.profileSessionsGate = nil
+        browse.enqueueTree(ProjectTree(json: .object([:])))
+        browse.enqueueRecents([])
+        let replacement = Task { await model.selectProfile("replacement") }
+        #expect(await eventuallyOnMain { browse.treeCalls.count == 2 })
+        model.browseError = "new generation"
+        await oldGate.release()
+        await owner?.value
+        #expect(model.browseLoading)
+        #expect(model.browseError == "new generation")
+        #expect(model.selectedProfile == "replacement")
+        #expect(!model.usesFlatFallback)
+        await newGate.release()
+        await replacement.value
+        #expect(!model.browseLoading)
+        #expect(model.browseError == nil)
+        #expect(browse.treeCalls.last?.profile == "replacement")
+        let pump = model.updatePump
+        model.disconnect()
+        gateway.finishAll()
+        await pump?.value
+        await model.pendingTeardown?.value
+    }
+
+    @Test func reviewerOldOwnerCannotCancelNewProfiles() async {
+        let (defaults, suite) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let browse = ScriptedBrowseService()
+        let first = CallGate()
+        let second = CallGate()
+        browse.profilesGate = first
+        script(browse, name: "old")
+        script(browse, name: "new")
+        let gateway = GatewayRecorder()
+        let model = await model(browse, gateway, defaults: defaults)
+        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
+        #expect(await eventuallyOnMain { browse.profileCallCount == 1 })
+        let initial = model.browseTask
+        browse.profilesGate = second
+        let retry = Task { await model.refreshBrowseData() }
+        #expect(await eventuallyOnMain { browse.profileCallCount == 2 })
+        initial?.cancel()
+        await first.release()
+        await initial?.value
+        #expect(model.profilesLoading)
+        await second.release()
+        await retry.value
+        #expect(model.profiles.map(\.name) == ["new"])
+        #expect(browse.treeCalls.count == 1)
+        let pump = model.updatePump
+        model.disconnect()
+        gateway.finishAll()
+        await pump?.value
+        await model.pendingTeardown?.value
+    }
 }

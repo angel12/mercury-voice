@@ -620,7 +620,7 @@ final class AppModel {
             // preview filter in BrowseView still applies).
             let tree = try await browse.projectsTree(
                 previewLimit: Self.workspacePreviewLimit, profile: selectedProfile)
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             projectTree = tree
             usesFlatFallback = false
             let profile = selectedProfile ?? "all"
@@ -628,13 +628,13 @@ final class AppModel {
             // grouping (previews, then `project_sessions` on older-session search).
             let sessions = try await browse.profileSessions(
                 profile: profile, limit: Self.recentsPageSize, offset: 0)
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             recentsOffset = sessions.count
             recentSessions = Self.uniqueSessions(sessions)
             recentsHasMore = sessions.count >= Self.recentsPageSize
             browseError = nil
         } catch let error as HermesError {
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             if case .rpcError(HermesError.RPCCode.methodNotFound, _, _) = error {
                 // Older backend without projects.* — degrade to grouping the
                 // flat list by repo root / cwd.
@@ -643,7 +643,7 @@ final class AppModel {
                 browseError = error.errorDescription
             }
         } catch {
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             browseError = error.localizedDescription
         }
     }
@@ -655,17 +655,17 @@ final class AppModel {
                 profile: selectedProfile ?? "all",
                 limit: Self.recentsPageSize,
                 offset: 0)
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             recentsOffset = sessions.count
             applyFlatSessions(
                 Self.uniqueSessions(sessions),
                 hasMore: sessions.count >= Self.recentsPageSize)
             browseError = nil
         } catch let error as HermesError {
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             browseError = error.errorDescription
         } catch {
-            guard generation == browseGeneration else { return }
+            guard generation == browseGeneration, !Task.isCancelled else { return }
             browseError = error.localizedDescription
         }
     }
