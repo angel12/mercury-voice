@@ -18,4 +18,8 @@ struct SharedMeterTests {
     @MainActor
     @Suite("R27 prompt-announcement lifetime")
     struct R27PromptAnnouncementTests {}
+
+    @MainActor
+    @Suite("Nonblocking browse refresh with voice (R26)")
+    struct R26VoiceStartBrowsePumpTests {}
 }
