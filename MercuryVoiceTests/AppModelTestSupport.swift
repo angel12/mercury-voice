@@ -174,19 +174,23 @@ final class GatewayRecorder: @unchecked Sendable {
     /// the current phase on subscription; this does not, so a pump under test
     /// never sees an initial `.stopped`.
     ///
-    /// `.phase(.ready)` is refused. `HermesConnection.rest` is a real
-    /// `HermesRESTClient` built in the actor's initialiser, `nonisolated`, and
-    /// *not* behind this seam — a `.ready(false)` would send `loadBrowseData`
-    /// at a live network. This harness does not cover ready/browse behaviour;
-    /// that needs a REST seam (#81 review).
+    /// `.phase(.ready)` is refused unless `allowsReady` is set. Ready runs
+    /// `loadBrowseData`, which needs a scripted `BrowseServicing` so profiles
+    /// and the tree do not hit the network.
+    private var _allowsReady = false
+    var allowsReady: Bool {
+        get { lock.withLock { _allowsReady } }
+        set { lock.withLock { _allowsReady = newValue } }
+    }
+
     func send(
         _ update: HermesConnection.Update,
         toConnection index: Int,
         sourceLocation: SourceLocation = #_sourceLocation
     ) {
-        if case .phase(let phase) = update, case .ready = phase {
+        if case .phase(let phase) = update, case .ready = phase, !allowsReady {
             Issue.record(
-                "GatewayRecorder cannot deliver .ready: HermesConnection.rest is not seamed, so loadBrowseData would hit the network.",
+                "GatewayRecorder cannot deliver .ready without a scripted browse seam (set allowsReady).",
                 sourceLocation: sourceLocation)
             return
         }
@@ -303,13 +307,32 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
     private var trees: [Result<ProjectTree, any Error>] = []
     private var projectPages: [Result<[SessionSummary], any Error>] = []
     private var recentsPages: [Result<[SessionSummary], any Error>] = []
+    private var profileLists: [Result<[ProfileInfo], any Error>] = []
     private var _treeCalls: [(previewLimit: Int, profile: String?)] = []
     private var _projectCalls: [(projectID: String, profile: String?, sessionLimit: Int?)] = []
     private var _recentsCalls: [(profile: String, limit: Int, offset: Int)] = []
+    private var _profileCalls = 0
 
-    var treeGate: CallGate?
-    var projectSessionsGate: CallGate?
-    var profileSessionsGate: CallGate?
+    private var _treeGate: CallGate?
+    var treeGate: CallGate? {
+        get { lock.withLock { _treeGate } }
+        set { lock.withLock { _treeGate = newValue } }
+    }
+    private var _projectSessionsGate: CallGate?
+    var projectSessionsGate: CallGate? {
+        get { lock.withLock { _projectSessionsGate } }
+        set { lock.withLock { _projectSessionsGate = newValue } }
+    }
+    private var _profileSessionsGate: CallGate?
+    var profileSessionsGate: CallGate? {
+        get { lock.withLock { _profileSessionsGate } }
+        set { lock.withLock { _profileSessionsGate = newValue } }
+    }
+    private var _profilesGate: CallGate?
+    var profilesGate: CallGate? {
+        get { lock.withLock { _profilesGate } }
+        set { lock.withLock { _profilesGate = newValue } }
+    }
 
     func enqueueTree(_ tree: ProjectTree) { lock.withLock { trees.append(.success(tree)) } }
     func enqueueTreeFailure(_ error: any Error) { lock.withLock { trees.append(.failure(error)) } }
@@ -325,8 +348,15 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
     func enqueueRecentsFailure(_ error: any Error) {
         lock.withLock { recentsPages.append(.failure(error)) }
     }
+    func enqueueProfiles(_ rows: [ProfileInfo]) {
+        lock.withLock { profileLists.append(.success(rows)) }
+    }
+    func enqueueProfilesFailure(_ error: any Error) {
+        lock.withLock { profileLists.append(.failure(error)) }
+    }
 
     var treeCalls: [(previewLimit: Int, profile: String?)] { lock.withLock { _treeCalls } }
+    var profileCallCount: Int { lock.withLock { _profileCalls } }
     var projectCalls: [(projectID: String, profile: String?, sessionLimit: Int?)] {
         lock.withLock { _projectCalls }
     }
@@ -334,7 +364,20 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
         lock.withLock { _recentsCalls }
     }
 
+    func profiles() async throws -> [ProfileInfo] {
+        let (next, gate): (Result<[ProfileInfo], any Error>?, CallGate?) = lock.withLock {
+            _profileCalls += 1
+            return (profileLists.isEmpty ? nil : profileLists.removeFirst(), _profilesGate)
+        }
+        if let gate { await gate.arrive() }
+        guard let next else {
+            throw HermesError.malformedResponse("no scripted profiles answer")
+        }
+        return try next.get()
+    }
+
     func projectsTree(previewLimit: Int, profile: String?) async throws -> ProjectTree {
+        let treeGate = treeGate
         lock.withLock { _treeCalls.append((previewLimit, profile)) }
         let next: Result<ProjectTree, any Error>? = lock.withLock {
             trees.isEmpty ? nil : trees.removeFirst()
@@ -362,6 +405,7 @@ final class ScriptedBrowseService: BrowseServicing, @unchecked Sendable {
 
     func profileSessions(profile: String, limit: Int, offset: Int) async throws -> [SessionSummary]
     {
+        let profileSessionsGate = profileSessionsGate
         lock.withLock { _recentsCalls.append((profile, limit, offset)) }
         let next: Result<[SessionSummary], any Error>? = lock.withLock {
             recentsPages.isEmpty ? nil : recentsPages.removeFirst()
