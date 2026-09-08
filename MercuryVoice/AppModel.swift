@@ -112,6 +112,9 @@ final class AppModel {
     /// Internal rather than private so app tests can await the pump task and
     /// assert on what it did, instead of racing it (issue #55).
     private(set) var updatePump: Task<Void, Never>?
+    /// Initial browse refresh has its own lifetime: the update consumer must
+    /// remain free to deliver prompts and terminal connection phases.
+    private(set) var browseTask: Task<Void, Never>?
 
     /// The most recent `disconnect()` teardown, retained rather than
     /// fire-and-forget so a test can await it before asserting that a
@@ -429,6 +432,8 @@ final class AppModel {
         conversationGeneration += 1  // …and any in-flight conversation launch
         updatePump?.cancel()
         updatePump = nil
+        browseTask?.cancel()
+        browseTask = nil
         profilesTask?.cancel()
         profilesTask = nil
         profilesLoading = false
@@ -488,7 +493,8 @@ final class AppModel {
                     }
                     if case .ready(let isReconnect) = phase {
                         if !isReconnect {
-                            await self.loadBrowseData()
+                            self.browseTask?.cancel()
+                            self.browseTask = Task { await self.loadBrowseData() }
                         }
                         await self.conversation?.connectionBecameReady(
                             isReconnect: isReconnect)
@@ -534,18 +540,24 @@ final class AppModel {
     // MARK: Browse data
 
     func loadBrowseData() async {
-        guard connection != nil else { return }
+        guard connection != nil, !Task.isCancelled else { return }
         browseError = nil
+        let browseGeneration = browseGeneration
 
         // Wait for the first profiles list so the default selection exists
         // before the unscoped (profile: nil / "all") browse load (issue #37).
         if profiles.isEmpty {
             if let task = startProfilesLoad() {
                 let generation = connectGeneration
-                await task.value
-                guard generation == connectGeneration else { return }
+                await withTaskCancellationHandler {
+                    await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+                guard generation == connectGeneration, !task.isCancelled else { return }
             }
         }
+        guard !Task.isCancelled, browseGeneration == self.browseGeneration else { return }
         await refreshProjects()
     }
 
@@ -561,7 +573,7 @@ final class AppModel {
 
     @discardableResult
     private func startProfilesLoad() -> Task<Void, Never>? {
-        guard let connection else { return nil }
+        guard let browse else { return nil }
         profilesTask?.cancel()
         profilesLoading = true
         profilesError = nil
@@ -573,7 +585,7 @@ final class AppModel {
                 }
             }
             do {
-                let loaded = try await connection.rest.profiles()
+                let loaded = try await browse.profiles()
                 // REST responses can outlive disconnect or a newer retry.
                 guard generation == connectGeneration, !Task.isCancelled else { return }
                 profiles = loaded
