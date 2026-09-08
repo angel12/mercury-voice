@@ -14,6 +14,25 @@ func shouldDetachBargeCaptureWhileMuted(isIOS: Bool) -> Bool {
     let bargeMuteRunsOnIOS = false
 #endif
 
+/// Sync-readable capture state, so `isCapturing` can be answered without
+/// hopping onto the monitor's actor (issue #87).
+final class BargeCaptureFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var capturing = false
+
+    var isCapturing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturing
+    }
+
+    func set(_ newValue: Bool) {
+        lock.lock()
+        capturing = newValue
+        lock.unlock()
+    }
+}
+
 /// Full-duplex interrupt monitor: watches the mic during thinking/speaking,
 /// trips on sustained speech, and captures the interrupting utterance with
 /// pre-roll so the first syllable survives.
@@ -33,6 +52,12 @@ public actor BargeInMonitor: BargeMonitoring {
     private var streamID: UUID?
     private var pump: Task<Void, Never>?
     private var suspended = false
+    private let captureFlag = BargeCaptureFlag()
+
+    /// See `BargeMonitoring.isCapturing`. Set before `onSpeech` fires and
+    /// cleared before any delivery or teardown, so the engine never sees a
+    /// capture that is not really in flight.
+    public nonisolated var isCapturing: Bool { captureFlag.isCapturing }
 
     public init(capture: AudioCaptureService = .shared) {
         self.capture = capture
@@ -77,6 +102,10 @@ public actor BargeInMonitor: BargeMonitoring {
 
     public func setSuspended(_ newValue: Bool) {
         suspended = newValue
+        // Deaf means anything half-captured is void — the pump discards it on
+        // its next chunk, and the engine must not be told a capture is still
+        // in flight in the meantime.
+        if newValue { captureFlag.set(false) }
         if newValue, detachCaptureOnSuspend {
             // iOS: release the consumer so the capture engine can stop.
             // macOS keeps the stream and only discards samples below.
@@ -91,6 +120,7 @@ public actor BargeInMonitor: BargeMonitoring {
     }
 
     private func detach() {
+        captureFlag.set(false)
         if let id = streamID {
             streamID = nil
             capture.closeStream(id)
@@ -125,6 +155,7 @@ public actor BargeInMonitor: BargeMonitoring {
             preRoll.removeAll()
             captured.removeAll()
             tripped = false
+            captureFlag.set(false)
         }
 
         for await chunk in stream {
@@ -176,6 +207,9 @@ public actor BargeInMonitor: BargeMonitoring {
 
             case .tripped:
                 tripped = true
+                // Before the callback: `onSpeech` only reaches the engine
+                // after an actor hop, and the capture below starts now.
+                captureFlag.set(true)
                 onSpeech()
                 captured = preRoll + samples
                 preRoll.removeAll()
@@ -185,7 +219,10 @@ public actor BargeInMonitor: BargeMonitoring {
 
             case .captureEnded:
                 captured.append(contentsOf: samples)
-                detach()  // clean up before delivering, like the reference
+                // Clean up before delivering, like the reference — and that
+                // clears the capture flag, so the mic reads as the engine's
+                // again from the moment this utterance is handed over.
+                detach()
                 let utterance = RecordedUtterance(
                     audio: WAVEncoder.encode(samples: captured, sampleRate: sampleRate),
                     mimeType: WAVEncoder.mimeType,
@@ -198,6 +235,12 @@ public actor BargeInMonitor: BargeMonitoring {
 
         // Stream ended without an endpoint (external stop): if we had tripped
         // deliver what we have, else vanish silently.
+        // Only a live run may clear the shared flag. A cancelled run got here
+        // through the `detach()` that cancelled it, which already cleared the
+        // flag, so whatever is set now belongs to the run that replaced this
+        // one — and the actor is free to run this tail after that replacement
+        // has tripped (measured under forced priority inversion, issue #87).
+        if !Task.isCancelled { captureFlag.set(false) }
         if tripped, !captured.isEmpty, !Task.isCancelled, resampler.sampleRate > 0 {
             let utterance = RecordedUtterance(
                 audio: WAVEncoder.encode(samples: captured, sampleRate: resampler.sampleRate),

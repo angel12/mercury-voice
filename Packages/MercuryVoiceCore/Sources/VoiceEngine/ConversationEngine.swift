@@ -250,10 +250,15 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
     private var micBlocked: Bool { muted || paused }
 
+    /// Does a barge capture own the mic? `bargeCapturePending` alone is blind
+    /// for the length of the `onSpeech` actor hop, so every guard also asks
+    /// the monitor, which knows the instant it trips (issue #87).
+    private var bargeCaptureInFlight: Bool { bargeCapturePending || barge.isCapturing }
+
     private func startListening() async {
         pendingStart = false
         guard enabled, !micBlocked, !(await agent.isBusy) else { return }
-        guard !bargeCapturePending else { return }  // the monitor owns the mic
+        guard !bargeCaptureInFlight else { return }  // the monitor owns the mic
         guard status == .idle else { return }
         // A deliberate mic re-open (listenNow, unmute, the next turn)
         // invalidates any stale stop request — it only ever applies to the
@@ -476,13 +481,13 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         if awaitingSpokenResponse, status != .speaking {
             if status == .thinking {
                 let busy = await agent.isBusy
-                if busy || bargeCapturePending { await ensureBargeMonitor() }
+                if busy || bargeCaptureInFlight { await ensureBargeMonitor() }
             }
             if let response = await agent.pendingSpeech() {
                 await openLiveSpeech(responseID: response.id)
                 return
             }
-            if !(await agent.isBusy), status == .thinking, !bargeCapturePending {
+            if !(await agent.isBusy), status == .thinking, !bargeCaptureInFlight {
                 // Tool-only or errored turn: nothing to speak, go around.
                 awaitingSpokenResponse = false
                 await dropSpeechSession()
@@ -490,7 +495,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
                 setStatus(.idle)
             }
         }
-        if !awaitingSpokenResponse, status == .thinking, !bargeCapturePending,
+        if !awaitingSpokenResponse, status == .thinking, !bargeCaptureInFlight,
             !(await agent.isBusy)
         {
             // Stop landed while thinking, disowning this turn's reply. Settle
@@ -680,7 +685,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             awaitingSpokenResponse = false
             await agent.consumePendingSpeech()
         }
-        if bargeCapturePending {
+        if bargeCaptureInFlight {
             // The barge monitor's recorder owns the mic; it will hand the
             // captured utterance to submitCapturedUtterance.
             speechSession = nil

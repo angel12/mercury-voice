@@ -211,6 +211,8 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     private var _suspended = false
     private var _onSpeech: (@Sendable () -> Void)?
     private var _onUtterance: (@Sendable (RecordedUtterance?) -> Void)?
+    private var _capturing = false
+    private var _deferredTrip: (@Sendable () -> Void)?
 
     private func locked<T>(_ body: () -> T) -> T {
         lock.lock()
@@ -221,6 +223,9 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
     var startCount: Int { locked { _startCount } }
     var stopCount: Int { locked { _stopCount } }
     var isActive: Bool { locked { _onSpeech != nil } }
+    /// Mirrors the real monitor: set at the trip verdict — before the callback
+    /// — and cleared by delivery, `stop()` or `setSuspended(true)`.
+    var isCapturing: Bool { locked { _capturing } }
     var isSuspended: Bool { locked { _suspended } }
     /// True after `stop()` — analogue of the capture consumer being closed.
     var streamClosed: Bool { locked { _stopCount > 0 && _onSpeech == nil } }
@@ -233,6 +238,7 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
         locked {
             _startCount += 1
             _suspended = false
+            _capturing = false
             _onSpeech = onSpeech
             _onUtterance = onUtterance
         }
@@ -242,23 +248,52 @@ final class FakeBargeMonitor: BargeMonitoring, @unchecked Sendable {
         locked {
             _stopCount += 1
             _suspended = false
+            _capturing = false
             _onSpeech = nil
             _onUtterance = nil
         }
     }
 
     func setSuspended(_ newValue: Bool) async {
-        locked { _suspended = newValue }
+        locked {
+            _suspended = newValue
+            if newValue { _capturing = false }
+        }
     }
 
     func trip() {
-        let handler = locked { _onSpeech }
+        let handler: (@Sendable () -> Void)? = locked {
+            _capturing = true
+            return _onSpeech
+        }
+        handler?()
+    }
+
+    /// Trip the detector but hold the engine's `onSpeech` callback back — the
+    /// window the real monitor is in while that callback hops onto the engine
+    /// actor: capturing already, engine not yet told (issue #87). The handler
+    /// is captured now, since a trip already taken cannot be un-fired by a
+    /// later `stop()`, and runs on `flushDeferredTrip`.
+    func tripDeferred() {
+        locked {
+            _capturing = true
+            _deferredTrip = _onSpeech
+        }
+    }
+
+    func flushDeferredTrip() {
+        let handler: (@Sendable () -> Void)? = locked {
+            let handler = _deferredTrip
+            _deferredTrip = nil
+            return handler
+        }
         handler?()
     }
 
     func deliver(_ utterance: RecordedUtterance?) {
         let handler: (@Sendable (RecordedUtterance?) -> Void)? = locked {
             let handler = _onUtterance
+            _capturing = false
             _onSpeech = nil
             _onUtterance = nil
             return handler
