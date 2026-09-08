@@ -11,13 +11,13 @@ struct R26BrowsePumpTests {
         ProfileInfo(json: .object(["name": .string(name), "is_default": .bool(true)]))!
     }
 
-    private func script(_ browse: ScriptedBrowseService, name: String = "default") {
+    fileprivate func script(_ browse: ScriptedBrowseService, name: String = "default") {
         browse.enqueueProfiles([profile(name)])
         browse.enqueueTree(ProjectTree(json: .object([:])))
         browse.enqueueRecents([])
     }
 
-    private func model(
+    fileprivate func model(
         _ browse: ScriptedBrowseService, _ gateway: GatewayRecorder,
         defaults: UserDefaults, auth: ScriptedAuthenticator = ScriptedAuthenticator(),
         conversations: ConversationRecorder = ConversationRecorder()
@@ -29,66 +29,6 @@ struct R26BrowsePumpTests {
                 gateway: gateway, conversations: conversations, browse: browse, defaults: defaults))
         await model.connect(input: "http://127.0.0.1:8080", token: nil)
         return model
-    }
-
-    // The gate establishes actual in-flight I/O, not a guessed sleep. Bounded
-    // observable waits make RED fail cleanly; cleanup releases every producer.
-    @Test func slowProfilesDoNotBlockPromptDisconnectOrAuthExpiry() async {
-        let (defaults, suite) = makeTestDefaults()
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let browse = ScriptedBrowseService()
-        let gate = CallGate()
-        browse.profilesGate = gate
-        script(browse)
-        let gateway = GatewayRecorder()
-        let providers = CallGate()
-        let auth = ScriptedAuthenticator(providersGate: providers)
-        let conversations = ConversationRecorder()
-        conversations.script = { _, service in
-            service.enqueueCreate(Fixtures.resumeResult(runtimeID: "rt", storedID: "st"))
-        }
-        let model = await model(
-            browse, gateway, defaults: defaults, auth: auth,
-            conversations: conversations)
-        await model.startConversation(cwd: "/tmp")
-        let controller = model.conversation
-        let pump = model.updatePump
-        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
-        #expect(await eventuallyOnMain { browse.profileCallCount == 1 })
-        let initialBrowse = model.browseTask
-        gateway.send(
-            .event(
-                Fixtures.event(
-                    Fixtures.approvalRequest(
-                        sessionID: "rt", seq: 1, command: "ls", requestID: "req"))), toConnection: 0
-        )
-        #expect(await eventuallyOnMain { controller?.approval?.command == "ls" })
-        gateway.send(
-            .event(
-                Fixtures.event(
-                    Fixtures.messageComplete(
-                        sessionID: "rt", seq: 2, text: "reply while browsing"))), toConnection: 0)
-        #expect(
-            await eventuallyOnMain {
-                controller?.devMessages.contains { $0.text == "reply while browsing" } == true
-            })
-        gateway.send(.phase(.disconnected(reason: "closed")), toConnection: 0)
-        #expect(await eventuallyOnMain { controller?.connectionHealthy == false })
-        gateway.send(.phase(.authExpired), toConnection: 0)
-        #expect(await eventuallyOnMain { auth.providerEndpoints.count == 1 })
-        #expect(browse.treeCalls.isEmpty)
-        #expect(model.profiles.isEmpty)
-        // Bounded even in RED: release both gates before draining the pump.
-        await providers.release()
-        #expect(await eventuallyOnMain { model.connection == nil })
-        #expect(initialBrowse?.isCancelled == true)
-        await gate.release()
-        gateway.finishAll()
-        await pump?.value
-        await initialBrowse?.value
-        await model.pendingTeardown?.value
-        #expect(model.connection == nil)
-        #expect(model.profiles.isEmpty)
     }
 
     @Test func retrySupersedesInitialProfilesWithoutAnExtraTreeRefresh() async {
@@ -456,5 +396,72 @@ struct R26BrowsePumpTests {
         gateway.finishAll()
         await pump?.value
         await model.pendingTeardown?.value
+    }
+}
+
+// Only this browse test starts voice and owns the process-global meter.
+// Keep the remaining browse fixtures outside the shared serialization boundary.
+extension SharedMeterTests.R26VoiceStartBrowsePumpTests {
+    // The gate establishes actual in-flight I/O, not a guessed sleep. Bounded
+    // observable waits make RED fail cleanly; cleanup releases every producer.
+    @Test func slowProfilesDoNotBlockPromptDisconnectOrAuthExpiry() async {
+        let (defaults, suite) = makeTestDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let browse = ScriptedBrowseService()
+        let gate = CallGate()
+        browse.profilesGate = gate
+        let fixture = R26BrowsePumpTests()
+        fixture.script(browse)
+        let gateway = GatewayRecorder()
+        let providers = CallGate()
+        let auth = ScriptedAuthenticator(providersGate: providers)
+        let conversations = ConversationRecorder()
+        conversations.script = { _, service in
+            service.enqueueCreate(Fixtures.resumeResult(runtimeID: "rt", storedID: "st"))
+        }
+        let model = await fixture.model(
+            browse, gateway, defaults: defaults, auth: auth,
+            conversations: conversations)
+        await model.startConversation(cwd: "/tmp")
+        let controller = model.conversation
+        let pump = model.updatePump
+        gateway.send(.phase(.ready(isReconnect: false)), toConnection: 0)
+        #expect(await eventuallyOnMain { browse.profileCallCount == 1 })
+        let initialBrowse = model.browseTask
+        gateway.send(
+            .event(
+                Fixtures.event(
+                    Fixtures.approvalRequest(
+                        sessionID: "rt", seq: 1, command: "ls", requestID: "req"))), toConnection: 0
+        )
+        #expect(await eventuallyOnMain { controller?.approval?.command == "ls" })
+        gateway.send(
+            .event(
+                Fixtures.event(
+                    Fixtures.messageComplete(
+                        sessionID: "rt", seq: 2, text: "reply while browsing"))), toConnection: 0)
+        #expect(
+            await eventuallyOnMain {
+                controller?.devMessages.contains { $0.text == "reply while browsing" } == true
+            })
+        gateway.send(.phase(.disconnected(reason: "closed")), toConnection: 0)
+        #expect(await eventuallyOnMain { controller?.connectionHealthy == false })
+        gateway.send(.phase(.authExpired), toConnection: 0)
+        #expect(await eventuallyOnMain { auth.providerEndpoints.count == 1 })
+        #expect(browse.treeCalls.isEmpty)
+        #expect(model.profiles.isEmpty)
+        // Bounded even in RED: release both gates before draining the pump.
+        await providers.release()
+        #expect(await eventuallyOnMain { model.connection == nil })
+        let teardown = model.pendingTeardown
+        #expect(initialBrowse?.isCancelled == true)
+        await gate.release()
+        gateway.finishAll()
+        await pump?.value
+        await initialBrowse?.value
+        await teardown?.value
+        #expect(ConversationController.levelMeterOwner == nil)
+        #expect(model.connection == nil)
+        #expect(model.profiles.isEmpty)
     }
 }
