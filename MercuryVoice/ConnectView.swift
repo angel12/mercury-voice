@@ -38,6 +38,17 @@ struct ConnectView: View {
                     serverForm
                 }
 
+                if model.canRetryConnection {
+                    Button(
+                        "Retry connection",
+                        action: probed(.retryConnection) {
+                            Task { await model.manualRetry() }
+                        }
+                    )
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("retryConnection")
+                }
+
                 if model.pendingLogin == nil, !model.savedServers.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Recent servers").font(.headline)

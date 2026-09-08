@@ -6,6 +6,7 @@ enum ConnectControl: String, Sendable {
     case server
     case token
     case connect
+    case retryConnection
 }
 
 #if DEBUG

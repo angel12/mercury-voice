@@ -298,6 +298,7 @@ final class AppModel {
         self.connection = connection
         self.browse = deps.makeBrowse(connection)
         startUpdatePump(connection)
+        startPathMonitor(connection)
         await deps.startGateway(connection)
     }
 
@@ -430,6 +431,7 @@ final class AppModel {
         connectGeneration += 1  // invalidate any in-flight connect()
         browseGeneration += 1  // …and any in-flight browse load
         conversationGeneration += 1  // …and any in-flight conversation launch
+        stopPathRecovery()
         updatePump?.cancel()
         updatePump = nil
         browseTask?.cancel()
@@ -465,12 +467,68 @@ final class AppModel {
     /// and indistinguishable from a long quiet turn — a failed probe closes
     /// it so the supervisor redials), skip any pending backoff, and re-arm a
     /// mic parked by a background start refusal (issue #31).
+    private(set) var recoveryTask: Task<Void, Never>?
+    private var pathMonitor: (any NetworkPathMonitoring)?
+
+    var canRetryConnection: Bool {
+        if case .unreachable = phase { return connection != nil }
+        return false
+    }
+
+    func manualRetry() async {
+        guard canRetryConnection, let connection else { return }
+        let generation = connectGeneration
+        connectError = nil
+        phase = .connecting(attempt: 0)
+        startPathMonitor(connection)
+        await deps.startGateway(connection)
+        guard generation == connectGeneration, self.connection === connection else {
+            // A non-cooperative start may finish after disconnect already
+            // stopped this actor. Retire only the captured actor, never the
+            // replacement connection or its monitor/pump.
+            await deps.stopGateway(connection)
+            return
+        }
+    }
+
     func appBecameActive() {
         conversation?.appBecameActive()
-        guard let connection else { return }
-        Task {
-            await connection.verifyConnection()
-            await connection.pokeReconnect()
+        guard let connection, !canRetryConnection else { return }
+        recoverConnection(connection, generation: connectGeneration)
+    }
+
+    private func startPathMonitor(_ connection: HermesConnection) {
+        stopPathRecovery()
+        let generation = connectGeneration
+        let monitor = deps.makePathMonitor()
+        pathMonitor = monitor
+        monitor.start { [weak self, weak monitor] in
+            guard let self, let monitor, self.pathMonitor === monitor else { return }
+            self.recoverConnection(connection, generation: generation)
+        }
+    }
+
+    private func stopPathRecovery() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+    }
+
+    private func recoverConnection(_ connection: HermesConnection, generation: Int) {
+        guard generation == connectGeneration, self.connection === connection,
+            !canRetryConnection
+        else { return }
+        recoveryTask?.cancel()
+        let verify = deps.verifyGateway
+        let poke = deps.pokeGateway
+        recoveryTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await verify(connection)
+            guard let self, !Task.isCancelled, generation == self.connectGeneration,
+                self.connection === connection, !self.canRetryConnection
+            else { return }
+            await poke(connection)
         }
     }
 
@@ -498,6 +556,13 @@ final class AppModel {
                         }
                         await self.conversation?.connectionBecameReady(
                             isReconnect: isReconnect)
+                    }
+                    if case .unreachable(let reason) = phase {
+                        self.stopPathRecovery()
+                        self.connectError = reason
+                        self.conversationGeneration += 1
+                        let conversation = self.releaseConversation()
+                        self.pendingTeardown = Task { await conversation?.teardown() }
                     }
                     if case .authExpired = phase {
                         // Credentials are dead (dead refresh token, or the
