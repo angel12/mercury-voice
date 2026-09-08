@@ -12,6 +12,11 @@ struct ConnectView: View {
     @State private var passwordInput = ""
     @State private var connecting = false
     @State private var showHelp = false
+    #if DEBUG
+        /// Non-nil only for the one view an issue #88 test hosts; the app puts
+        /// no recorder in any environment. See `ConnectControlRecorder`.
+        @Environment(\.connectControlRecorder) private var controlRecorder
+    #endif
 
     var body: some View {
         ScrollView {
@@ -85,6 +90,11 @@ struct ConnectView: View {
 
     /// `ConnectFormState` owns the token/endpoint rules (issue #54); the
     /// fields drive it rather than mutating the two strings independently.
+    ///
+    /// The `probed(_:_:)` calls on the controls below are identity: they hand
+    /// each control's own binding and action to a hosting issue #88 test,
+    /// which is the only way a test can tell that the shipping fields still
+    /// route through these bindings.
     private var serverBinding: Binding<String> {
         Binding(get: { form.serverInput }, set: { form.setServerInput($0) })
     }
@@ -93,12 +103,33 @@ struct ConnectView: View {
         Binding(get: { form.token }, set: { form.setToken($0) })
     }
 
+    /// Identity. In a debug build it also hands `field` to the recorder a
+    /// hosting test put in this view's environment, so that test drives the
+    /// very binding the control writes through — not a second one that merely
+    /// looks the same.
+    private func probed(_ control: ConnectControl, _ field: Binding<String>) -> Binding<String> {
+        #if DEBUG
+            controlRecorder?.record(control, field: field)
+        #endif
+        return field
+    }
+
+    /// Identity, as `probed(_:_:)` is, for a button's action closure.
+    private func probed(
+        _ control: ConnectControl, action: @escaping () -> Void
+    ) -> () -> Void {
+        #if DEBUG
+            controlRecorder?.record(control, action: action)
+        #endif
+        return action
+    }
+
     private var serverForm: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Server").font(.headline)
             TextField(
                 "127.0.0.1:8080 or paste the dashboard URL",
-                text: serverBinding
+                text: probed(.server, serverBinding)
             )
             .textFieldStyle(.roundedBorder)
             .autocorrectionDisabled()
@@ -108,8 +139,11 @@ struct ConnectView: View {
             #endif
 
             Text("Session token").font(.headline)
-            SecureField("auto-filled from a pasted dashboard URL", text: tokenBinding)
-                .textFieldStyle(.roundedBorder)
+            SecureField(
+                "auto-filled from a pasted dashboard URL",
+                text: probed(.token, tokenBinding)
+            )
+            .textFieldStyle(.roundedBorder)
             Text("Gated servers with a username & password skip this — just Connect.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -126,13 +160,15 @@ struct ConnectView: View {
                     .foregroundStyle(.orange)
             }
 
-            Button {
-                connecting = true
-                Task {
-                    await model.connect(input: form.serverInput, token: form.token)
-                    connecting = false
+            Button(
+                action: probed(.connect) {
+                    connecting = true
+                    Task {
+                        await model.connect(input: form.serverInput, token: form.token)
+                        connecting = false
+                    }
                 }
-            } label: {
+            ) {
                 if connecting {
                     ProgressView().frame(maxWidth: .infinity)
                 } else {
