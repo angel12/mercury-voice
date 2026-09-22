@@ -33,7 +33,7 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     private let autoAnswersCapabilities: Bool
     private var peers: [ObjectIdentifier: Peer] = [:]
     private var _upgradeAttempts = 0
-    private var _receivedMethods: [String] = []
+    private var _receivedFrames: [JSONValue] = []
     private var _pendingCapabilitiesID: Int?
     private(set) var port: UInt16 = 0
 
@@ -204,11 +204,17 @@ final class LoopbackGatewayServer: @unchecked Sendable {
 
     // MARK: Client → server
 
+    /// Every frame the client has sent, decoded and in arrival order — so a
+    /// test can assert both `client.capabilities` is first *and* what params
+    /// it carried, without racing the auto-answer below.
+    var receivedFrames: [JSONValue] {
+        lock.withLock { _receivedFrames }
+    }
+
     /// The JSON-RPC `method` of every frame the client has sent, in arrival
-    /// order — so a test can assert `client.capabilities` is first without
-    /// racing the auto-answer below.
+    /// order.
     var receivedMethods: [String] {
-        lock.withLock { _receivedMethods }
+        receivedFrames.compactMap { $0["method"]?.stringValue }
     }
 
     /// Parse whatever complete WebSocket frames are sitting in `connection`'s
@@ -218,6 +224,11 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     /// captured for `answerCapabilities(result:)` to reply on cue; nothing
     /// else here needs a generic RPC dispatcher. Client frames are masked per
     /// RFC 6455 §5.3; unmask before decoding.
+    ///
+    /// Recording the frame and capturing the pending capabilities id happen
+    /// under the same lock acquisition: splitting them let a fast test call
+    /// `answerCapabilities()` between the two and find no id yet (issue found
+    /// in review, round 1).
     private func handleClientFrames(_ connection: NWConnection) {
         let key = ObjectIdentifier(connection)
         while true {
@@ -234,16 +245,17 @@ final class LoopbackGatewayServer: @unchecked Sendable {
                 let data = text.data(using: .utf8),
                 let frame = try? JSONDecoder().decode(JSONValue.self, from: data)
             else { continue }
-            if let method = frame["method"]?.stringValue {
-                lock.withLock { _receivedMethods.append(method) }
+            let isCapabilities = frame["method"]?.stringValue == "client.capabilities"
+            let requestID = frame["id"]?.intValue
+            lock.withLock {
+                _receivedFrames.append(frame)
+                if isCapabilities, let requestID, !autoAnswersCapabilities {
+                    _pendingCapabilitiesID = requestID
+                }
             }
-            guard frame["method"]?.stringValue == "client.capabilities",
-                let id = frame["id"]?.intValue
-            else { continue }
+            guard isCapabilities, let requestID else { continue }
             if autoAnswersCapabilities {
-                send(#"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#)
-            } else {
-                lock.withLock { _pendingCapabilitiesID = id }
+                send(#"{"jsonrpc":"2.0","id":\#(requestID),"result":{}}"#)
             }
         }
     }
@@ -344,6 +356,18 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         }
         for connection in open { connection.cancel() }
         listener.cancel()
+    }
+
+    /// Kill every open peer connection without stopping the listener — models
+    /// a transport loss (network reset, backend restart) mid-flight, while a
+    /// request the client is awaiting is still outstanding.
+    func dropConnections() {
+        let open = lock.withLock {
+            let open = peers.values.map(\.connection)
+            peers = [:]
+            return open
+        }
+        for connection in open { connection.cancel() }
     }
 
     deinit { listener.cancel() }
