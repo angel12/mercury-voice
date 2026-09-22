@@ -71,6 +71,32 @@ struct CapabilityAdvertisementTests {
         await connection.stop()
     }
 
+    /// Harness check (#128): the loopback server's reply must reach only the
+    /// peer that asked. Both clients number their first request 1, so a
+    /// broadcast reply would wrongly settle the other client's request too.
+    @Test func theCapabilitiesReplyReachesOnlyTheAskingPeer() async throws {
+        let server = try await LoopbackGatewayServer.start(autoAnswersCapabilities: false)
+        defer { server.stop() }
+        let endpoint = ServerEndpoint(baseURL: URL(string: "http://127.0.0.1:\(server.port)")!)
+        let first = HermesConnection(
+            endpoint: endpoint, authenticator: HermesAuthenticator(endpoint: endpoint, credentials: nil))
+        let second = HermesConnection(
+            endpoint: endpoint, authenticator: HermesAuthenticator(endpoint: endpoint, credentials: nil))
+
+        await first.start()
+        #expect(await eventually { server.receivedMethods.count == 1 })
+        await second.start()
+        #expect(await eventually { server.receivedMethods.count == 2 })
+
+        server.answerCapabilities()  // answers the most recent asker: `second`
+
+        #expect(await eventually(timeout: 1) { await second.phase == .ready(isReconnect: false) })
+        #expect(await first.phase != .ready(isReconnect: false))
+
+        await first.stop()
+        await second.stop()
+    }
+
     @Test func aSocketDroppedDuringTheCapabilitiesAwaitNeverPublishesReadyForThatGeneration()
         async throws
     {

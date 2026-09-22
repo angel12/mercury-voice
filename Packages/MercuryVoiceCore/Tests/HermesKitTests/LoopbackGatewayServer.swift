@@ -34,7 +34,9 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     private var peers: [ObjectIdentifier: Peer] = [:]
     private var _upgradeAttempts = 0
     private var _receivedFrames: [JSONValue] = []
-    private var _pendingCapabilitiesID: Int?
+    /// The withheld `client.capabilities` request: its id and the peer that
+    /// sent it, so the reply goes back on that socket only.
+    private var _pendingCapabilities: (id: Int, connection: NWConnection)?
     private(set) var port: UInt16 = 0
 
     /// One accepted TCP connection: its socket, its unparsed bytes, and
@@ -222,7 +224,9 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     /// sends before a test's own `onOpen` script runs — is auto-answered
     /// unless `autoAnswersCapabilities` is false, in which case its id is
     /// captured for `answerCapabilities(result:)` to reply on cue; nothing
-    /// else here needs a generic RPC dispatcher. Client frames are masked per
+    /// else here needs a generic RPC dispatcher. Either way the reply goes
+    /// only to the peer that asked — a leftover socket from an earlier dial
+    /// must not receive another connection's reply (#128). Client frames are masked per
     /// RFC 6455 §5.3; unmask before decoding.
     ///
     /// Recording the frame and capturing the pending capabilities id happen
@@ -250,12 +254,12 @@ final class LoopbackGatewayServer: @unchecked Sendable {
             lock.withLock {
                 _receivedFrames.append(frame)
                 if isCapabilities, let requestID, !autoAnswersCapabilities {
-                    _pendingCapabilitiesID = requestID
+                    _pendingCapabilities = (requestID, connection)
                 }
             }
             guard isCapabilities, let requestID else { continue }
             if autoAnswersCapabilities {
-                send(#"{"jsonrpc":"2.0","id":\#(requestID),"result":{}}"#)
+                send(#"{"jsonrpc":"2.0","id":\#(requestID),"result":{}}"#, to: connection)
             }
         }
     }
@@ -264,11 +268,13 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     /// `autoAnswersCapabilities` is false. `asError` sends `-32601` instead,
     /// the way a contract-6 backend answers.
     func answerCapabilities(asError: Bool = false) {
-        guard let id = lock.withLock({ _pendingCapabilitiesID }) else { return }
+        guard let (id, connection) = lock.withLock({ _pendingCapabilities }) else { return }
         if asError {
-            send(#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32601,"message":"method not found"}}"#)
+            send(
+                #"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32601,"message":"method not found"}}"#,
+                to: connection)
         } else {
-            send(#"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#)
+            send(#"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#, to: connection)
         }
     }
 
@@ -310,7 +316,10 @@ final class LoopbackGatewayServer: @unchecked Sendable {
 
     // MARK: Server → client
 
-    private func sendFrame(opcode: UInt8, payload: Data) {
+    /// Frame `payload` and send it to `target`, or to every handshaken peer
+    /// when nil — broadcast is right for events and closes, which model the
+    /// gateway pushing to whatever is attached; replies pass their peer.
+    private func sendFrame(opcode: UInt8, payload: Data, to target: NWConnection? = nil) {
         var frame = Data([0x80 | opcode])
         if payload.count < 126 {
             frame.append(UInt8(payload.count))
@@ -326,7 +335,10 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         }
         frame.append(payload)
         // Never hold the lock across a send.
-        let live = lock.withLock { peers.values.filter(\.handshaken).map(\.connection) }
+        let live = lock.withLock {
+            peers.values.filter { $0.handshaken && (target == nil || $0.connection === target) }
+                .map(\.connection)
+        }
         for connection in live {
             connection.send(content: frame, isComplete: true, completion: .idempotent)
         }
@@ -334,6 +346,10 @@ final class LoopbackGatewayServer: @unchecked Sendable {
 
     func send(_ text: String) {
         sendFrame(opcode: 0x1, payload: Data(text.utf8))
+    }
+
+    private func send(_ text: String, to connection: NWConnection) {
+        sendFrame(opcode: 0x1, payload: Data(text.utf8), to: connection)
     }
 
     /// Push a `{"method": "event"}` frame the way the gateway does.
