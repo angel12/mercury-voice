@@ -599,18 +599,18 @@ struct ClarifySheet: View {
     /// Records `answer` for the question on screen. Inside a batch this
     /// advances the paging state and only reaches the controller once every
     /// question (locked ones included) has an answer; outside a batch it
-    /// answers immediately, as before.
+    /// answers immediately, as before. The input survives a send so a failed
+    /// one can be retried as-is (`ClarifySubmitStep.clearsInput`).
     private func submit(_ answer: String) {
-        freeText = ""
-        selected = []
-        if var batch {
-            if let completed = batch.recordAndAdvance(answer) {
-                controller.respondClarify(answers: completed)
-            } else {
-                self.batch = batch
-            }
-        } else {
-            controller.respondClarify(answer: answer)
+        let step = ClarifySubmitStep(answer: answer, batch: batch)
+        if step.clearsInput {
+            freeText = ""
+            selected = []
+        }
+        switch step {
+        case .nextPage(let next): batch = next
+        case .sendBatch(let answers): controller.respondClarify(answers: answers)
+        case .sendSingle(let answer): controller.respondClarify(answer: answer)
         }
     }
 }

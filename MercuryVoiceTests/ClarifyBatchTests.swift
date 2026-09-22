@@ -69,4 +69,52 @@ struct ClarifyBatchTests {
         #expect(completed == ["q1": "a1", "q2": "a2", "q3": "locked3"])
         #expect(batch.current == nil)
     }
+
+    // MARK: Submit step (PR #126 review)
+
+    /// The input is only cleared for a *local* step. A send can fail, and
+    /// the sheet then stays up with the error — the answer the user typed
+    /// or picked must still be there so Send retries it.
+    @Test("a single-question answer is sent and the input kept until confirmation")
+    func singleQuestionKeepsInput() {
+        let step = ClarifySubmitStep(answer: "main", batch: nil)
+        #expect(step == .sendSingle("main"))
+        #expect(!step.clearsInput)
+    }
+
+    @Test("advancing to the next batch page clears the input for it")
+    func nextPageClearsInput() {
+        let step = ClarifySubmitStep(answer: "a1", batch: ClarifyBatch(request()))
+        guard case .nextPage(let next) = step else {
+            Issue.record("expected .nextPage, got \(step)")
+            return
+        }
+        #expect(next.current?.qid == "q2")
+        #expect(step.clearsInput)
+    }
+
+    @Test("the final batch page sends everything and keeps the input")
+    func finalPageKeepsInput() {
+        var batch = ClarifyBatch(request(qids: ["q1", "q2"]))
+        _ = batch.recordAndAdvance("a1")
+        let step = ClarifySubmitStep(answer: "a2", batch: batch)
+        #expect(step == .sendBatch(["q1": "a1", "q2": "a2"]))
+        #expect(!step.clearsInput)
+    }
+
+    /// The sheet keeps its stored batch on the final page (the completed
+    /// copy is never written back), so a retry after a failed send records
+    /// that same page again: the same completed answers, nothing doubled,
+    /// nothing skipped.
+    @Test("a retry on the final page resubmits the same completed answers")
+    func finalPageRetryResubmits() {
+        var batch = ClarifyBatch(request())
+        _ = batch.recordAndAdvance("a1")
+        _ = batch.recordAndAdvance("a2")
+        let first = ClarifySubmitStep(answer: "a3", batch: batch)
+        let retry = ClarifySubmitStep(answer: "a3", batch: batch)
+        #expect(first == .sendBatch(["q1": "a1", "q2": "a2", "q3": "a3"]))
+        #expect(retry == first)
+        #expect(batch.current?.qid == "q3")
+    }
 }

@@ -68,3 +68,39 @@ struct ClarifyBatch: Equatable {
         return current == nil ? answers : nil
     }
 }
+
+/// What one press of a `ClarifySheet` answer control does — pulled out of the
+/// view so it can be tested without a view harness (PR #126 review).
+enum ClarifySubmitStep: Equatable {
+    /// Another batch page is up. Purely local, so the input is cleared for it.
+    case nextPage(ClarifyBatch)
+    /// The final batch page: send every answer, locked ones included.
+    case sendBatch([String: String])
+    /// A single-question clarify.
+    case sendSingle(String)
+
+    init(answer: String, batch: ClarifyBatch?) {
+        guard var batch else {
+            self = .sendSingle(answer)
+            return
+        }
+        if let completed = batch.recordAndAdvance(answer) {
+            self = .sendBatch(completed)
+        } else {
+            self = .nextPage(batch)
+        }
+    }
+
+    /// Only a local step clears the input. A send can fail, and then the
+    /// sheet stays up with the error: the answer must still be there so Send
+    /// retries it. On success the sheet dismisses, taking the input with it.
+    ///
+    /// The completed batch of `.sendBatch` is deliberately not written back
+    /// to the sheet's stored batch, which stays on the final page — so a
+    /// retry records that page again and resubmits the same answers, with
+    /// nothing doubled or skipped.
+    var clearsInput: Bool {
+        if case .nextPage = self { return true }
+        return false
+    }
+}
