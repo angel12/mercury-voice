@@ -213,6 +213,9 @@ extension HermesConnection {
 
     /// `approval.respond` — session-keyed (no request id); absent choice
     /// means deny server-side, so always pass one of the event's choices.
+    /// Contract-6 backends only — an `ApprovalRequest` with a
+    /// `serverRequestID` came from a contract ≥ 7 server request and must be
+    /// answered with `answerServerRequest` instead.
     public func respondApproval(sessionID: String, choice: String) async throws {
         _ = try await request(
             "approval.respond",
@@ -220,10 +223,34 @@ extension HermesConnection {
     }
 
     /// `clarify.respond` — empty answer = skip. A late respond after expiry
-    /// returns `{"status":"expired"}`, never an error.
+    /// returns `{"status":"expired"}`, never an error. Contract-6 backends
+    /// only — a `ClarifyRequest` with a `serverRequestID` came from a
+    /// contract ≥ 7 server request and must be answered with
+    /// `answerServerRequest` instead.
     public func respondClarify(requestID: String, answer: String) async throws {
         _ = try await request(
             "clarify.respond",
             params: ["request_id": .string(requestID), "answer": .string(answer)])
+    }
+
+    /// `request.answer {id, result}` — answers an open server→client request
+    /// (contract ≥ 7). Used instead of a bare response frame because it is
+    /// acknowledged (`status: ok|expired`) and works from a socket that did
+    /// not receive the request (a reconnect restoring `open_requests`).
+    public func answerServerRequest(id: String, result: JSONValue) async throws
+        -> ServerRequestAnswer
+    {
+        let reply = try await request(
+            ServerRequestAnswer.method,
+            params: ServerRequestAnswer.answerParams(id: id, result: result))
+        return ServerRequestAnswer(reply: reply)
+    }
+
+    // MARK: TTS lease
+
+    /// `POST /api/audio/tts-lease` — plain REST, not a gateway RPC, so this
+    /// just forwards to `rest`.
+    public func ttsLease(_ lease: String, active: Bool, profile: String?) async {
+        await rest.ttsLease(lease, active: active, profile: profile)
     }
 }

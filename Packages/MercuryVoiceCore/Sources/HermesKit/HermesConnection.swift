@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Owns the lifecycle of a server connection: dial, stay connected, reconnect
 /// with full-jitter exponential backoff, and republish gateway events across
@@ -8,6 +9,8 @@ import Foundation
 /// the cue to re-`session.resume` by **stored** id (runtime ids are recycled
 /// across backend restarts).
 public actor HermesConnection {
+    private static let logger = Logger(subsystem: "MercuryVoice", category: "HermesKit")
+
     public enum Phase: Sendable, Equatable {
         case disconnected(reason: String?)
         case connecting(attempt: Int)
@@ -259,13 +262,50 @@ public actor HermesConnection {
             gateway = client
             failedDials = 0
             attempt = 0
-            publish(.phase(.ready(isReconnect: everConnected)))
-            everConnected = true
+
+            // Subscribe before the capabilities round-trip below: `events()`
+            // registers synchronously but `GatewayClient` does not buffer for
+            // a subscriber that isn't registered yet, so anything the server
+            // pushes while we await the capabilities reply must not be
+            // missed (issue found in review, round 1).
+            let events = await client.events()
+            if let supervisorCheckpoint { await supervisorCheckpoint(.eventsSubscribed) }
+
+            // Contract ≥ 7: without this, approvals are withdrawn and clarify
+            // questions skipped server-side before this client ever sees them
+            // (hermes-agent f9d178f78e). Once per socket — the server forgets
+            // the advertisement on disconnect. Old backends answer -32601.
+            // A failure is only logged — the socket is still usable — but on
+            // a contract ≥ 7 backend it means this socket's prompts may be
+            // auto-skipped, which is otherwise invisible from the client.
+            do {
+                _ = try await client.request(
+                    "client.capabilities",
+                    params: .object(["server_requests": .bool(true)]),
+                    timeout: 5)
+            } catch {
+                let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
+                Self.logger.error(
+                    "client.capabilities failed (\(reason, privacy: .public)); a contract ≥ 7 backend may auto-skip prompts on this socket"
+                )
+            }
+            guard ownsSupervisor(lifetime) else {
+                await client.close(reason: "stopped")
+                return
+            }
+
+            // A socket that died while we awaited that reply must not be
+            // reported ready for this generation: `events` below will finish
+            // immediately (or already has), and the existing close-cause
+            // handling further down decides whether to redial — the same
+            // path an ordinary mid-turn disconnect takes.
+            if await client.state == .ready {
+                publish(.phase(.ready(isReconnect: everConnected)))
+                everConnected = true
+            }
 
             // Pump this socket generation's events into the stable stream;
             // the event stream finishing is the disconnect signal.
-            let events = await client.events()
-            if let supervisorCheckpoint { await supervisorCheckpoint(.eventsSubscribed) }
             for await event in events {
                 if let supervisorCheckpoint { await supervisorCheckpoint(.eventReceived) }
                 if !ownsSupervisor(lifetime) { break }

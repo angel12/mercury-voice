@@ -16,7 +16,7 @@ import VoiceEngine
 /// read reports.
 final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private let lock = NSLock()
-    private var resumeAnswers: [JSONValue] = []
+    private var resumeAnswers: [Result<JSONValue, any Error>] = []
     private var createAnswers: [JSONValue] = []
     private var batches: [Result<EventReplayBatch, any Error>] = []
     private var activations: [Result<JSONValue, any Error>] = []
@@ -27,6 +27,9 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private var _eventsSinceCalls: [(sessionID: String, lastSeen: Int)] = []
     private var _activatedIDs: [String] = []
     private var _closedIDs: [String] = []
+    private var _promptResponses: [PromptResponse] = []
+    private var answerReplies: [Result<ServerRequestAnswer, any Error>] = []
+    private var _ttsLeaseCalls: [(lease: String, active: Bool, profile: String?)] = []
 
     /// When set, `createSession` suspends here until the test releases it —
     /// the window a second launch has to overlap the first (issue #77).
@@ -42,12 +45,36 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     /// When set, `activateSession` suspends here *after* reading its answer:
     /// the window a live frame has to arrive in *after* the prompt read.
     var activateReturnGate: CallGate?
+    /// When set, every prompt response (`approval.respond`,
+    /// `clarify.respond`, `request.answer`) suspends here after it is
+    /// recorded — the window in which the sheet must still be up.
+    var promptResponseGate: CallGate?
+    /// When set, the TTS-lease *acquire* (`active: true`) suspends here
+    /// after being recorded — the window in which teardown/close must be
+    /// able to complete without waiting on it (issue #125, Task 9 review).
+    var ttsLeaseAcquireGate: CallGate?
+
+    /// A prompt response the controller sent, in the shape it reached the
+    /// wire. `request.answer` is recorded as its full params object so a test
+    /// pins exactly what the gateway receives (`{id, result}`, nothing else).
+    enum PromptResponse: Equatable {
+        case approvalRespond(sessionID: String, choice: String)
+        case clarifyRespond(requestID: String, answer: String)
+        case requestAnswer(params: JSONValue)
+    }
 
     init(epoch: String? = "epoch-1") { _epoch = epoch }
 
     // MARK: Scripting
 
-    func enqueueResume(_ result: JSONValue) { lock.withLock { resumeAnswers.append(result) } }
+    func enqueueResume(_ result: JSONValue) {
+        lock.withLock { resumeAnswers.append(.success(result)) }
+    }
+    /// Script `session.resume` failing — e.g. a 4009 reattach refusal while
+    /// a client-gone interrupt settles (issue #125).
+    func enqueueResumeFailure(_ error: any Error) {
+        lock.withLock { resumeAnswers.append(.failure(error)) }
+    }
     func enqueueCreate(_ result: JSONValue) { lock.withLock { createAnswers.append(result) } }
     func enqueueBatch(_ batch: EventReplayBatch) {
         lock.withLock { batches.append(.success(batch)) }
@@ -64,6 +91,14 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     /// backend/fork without the method.
     func enqueueActivationFailure(_ error: any Error = HermesError.notConnected) {
         lock.withLock { activations.append(.failure(error)) }
+    }
+    /// Script the next `request.answer` reply; unscripted replies are
+    /// `.answered`.
+    func enqueueAnswerReply(_ reply: ServerRequestAnswer) {
+        lock.withLock { answerReplies.append(.success(reply)) }
+    }
+    func enqueueAnswerFailure(_ error: any Error = HermesError.notConnected) {
+        lock.withLock { answerReplies.append(.failure(error)) }
     }
     func setEpoch(_ epoch: String?) { lock.withLock { _epoch = epoch } }
     /// Epoch reported from the moment `activateSession` answers — a backend
@@ -82,6 +117,11 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     }
     var activatedIDs: [String] { lock.withLock { _activatedIDs } }
     var closedIDs: [String] { lock.withLock { _closedIDs } }
+    var promptResponses: [PromptResponse] { lock.withLock { _promptResponses } }
+    /// Every `ttsLease` call, in call order (issue #125, Task 9).
+    var ttsLeaseCalls: [(lease: String, active: Bool, profile: String?)] {
+        lock.withLock { _ttsLeaseCalls }
+    }
 
     // MARK: SessionServicing
 
@@ -106,10 +146,10 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func resumeSession(storedID: String, profile: String?) async throws -> SessionHandle {
         lock.withLock { _resumedIDs.append(storedID) }
         if let resumeGate { await resumeGate.arrive() }
-        let next: JSONValue? = lock.withLock {
+        let next: Result<JSONValue, any Error>? = lock.withLock {
             resumeAnswers.isEmpty ? nil : resumeAnswers.removeFirst()
         }
-        guard let next, let handle = SessionHandle(result: next) else {
+        guard let next, let handle = SessionHandle(result: try next.get()) else {
             throw HermesError.malformedResponse("no scripted session.resume answer")
         }
         return handle
@@ -154,6 +194,35 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func closeSession(sessionID: String) async -> SessionCloseOutcome {
         lock.withLock { _closedIDs.append(sessionID) }
         return .closed
+    }
+
+    func respondApproval(sessionID: String, choice: String) async throws {
+        lock.withLock {
+            _promptResponses.append(.approvalRespond(sessionID: sessionID, choice: choice))
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+    }
+
+    func respondClarify(requestID: String, answer: String) async throws {
+        lock.withLock {
+            _promptResponses.append(.clarifyRespond(requestID: requestID, answer: answer))
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+    }
+
+    func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer {
+        let reply: Result<ServerRequestAnswer, any Error> = lock.withLock {
+            _promptResponses.append(
+                .requestAnswer(params: ServerRequestAnswer.answerParams(id: id, result: result)))
+            return answerReplies.isEmpty ? .success(.answered) : answerReplies.removeFirst()
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+        return try reply.get()
+    }
+
+    func ttsLease(_ lease: String, active: Bool, profile: String?) async {
+        lock.withLock { _ttsLeaseCalls.append((lease, active, profile)) }
+        if active, let ttsLeaseAcquireGate { await ttsLeaseAcquireGate.arrive() }
     }
 }
 
@@ -315,6 +384,7 @@ enum Fixtures {
         running: Bool = false,
         pendingApproval: JSONValue? = nil,
         pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil,
         extra: [String: JSONValue] = [:]
     ) -> JSONValue {
         var object: [String: JSONValue] = [
@@ -328,6 +398,7 @@ enum Fixtures {
         ]
         if let pendingApproval { object["pending_approval"] = pendingApproval }
         if let pendingClarify { object["pending_clarify"] = pendingClarify }
+        if let openRequests { object["open_requests"] = .array(openRequests) }
         for (key, value) in extra { object[key] = value }
         return .object(object)
     }
@@ -340,6 +411,7 @@ enum Fixtures {
         startedAt: Double = 1_700_000_000,
         pendingApproval: JSONValue? = nil,
         pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil,
         running: Bool = false
     ) -> JSONValue {
         livePayload(
@@ -349,6 +421,7 @@ enum Fixtures {
             running: running,
             pendingApproval: pendingApproval,
             pendingClarify: pendingClarify,
+            openRequests: openRequests,
             extra: ["stored_session_id": .string(storedID)])
     }
 
@@ -359,7 +432,8 @@ enum Fixtures {
         startedAt: Double = 1_700_000_000,
         status: String = "idle",
         pendingApproval: JSONValue? = nil,
-        pendingClarify: JSONValue? = nil
+        pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil
     ) -> JSONValue {
         livePayload(
             runtimeID: runtimeID,
@@ -367,7 +441,8 @@ enum Fixtures {
             startedAt: startedAt,
             status: status,
             pendingApproval: pendingApproval,
-            pendingClarify: pendingClarify)
+            pendingClarify: pendingClarify,
+            openRequests: openRequests)
     }
 
     static func approvalPayload(command: String, requestID: String? = nil) -> JSONValue {
@@ -419,10 +494,152 @@ enum Fixtures {
             payload: .object(["request_id": .string(requestID)]))
     }
 
+    /// A contract-7 server→client `approval` request in the shape both the
+    /// live `srq-` frame and an `open_requests` entry share
+    /// (`ServerRequest.snapshot()`): `{id, method, params}`, with the
+    /// session id and the gateway's `request_id` inside `params`.
+    static func approvalServerRequest(
+        id: String, sessionID: String, command: String, requestID: String? = nil
+    ) -> JSONValue {
+        var params = approvalPayload(command: command, requestID: requestID).objectValue ?? [:]
+        params["session_id"] = .string(sessionID)
+        return .object([
+            "id": .string(id), "method": .string("approval"), "params": .object(params),
+        ])
+    }
+
+    /// A contract-7 single-question `clarify` server request; its `id` is the
+    /// correlation id (there is no separate `request_id`).
+    static func clarifyServerRequest(id: String, sessionID: String, question: String)
+        -> JSONValue
+    {
+        .object([
+            "id": .string(id), "method": .string("clarify"),
+            "params": .object([
+                "session_id": .string(sessionID), "question": .string(question),
+            ]),
+        ])
+    }
+
+    /// A contract-7 batch `clarify` server request: `params.questions` carries
+    /// each question and `params.answers` carries whatever the server already
+    /// locked (empty when nothing is locked).
+    static func clarifyBatchServerRequest(
+        id: String, sessionID: String,
+        questions: [(qid: String, question: String, choices: [String], multiSelect: Bool)],
+        lockedAnswers: [String: String] = [:]
+    ) -> JSONValue {
+        let questionsJSON: [JSONValue] = questions.map { q in
+            .object([
+                "qid": .string(q.qid), "question": .string(q.question),
+                "choices": .array(q.choices.map(JSONValue.string)),
+                "multi_select": .bool(q.multiSelect),
+            ])
+        }
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "questions": .array(questionsJSON),
+        ]
+        if !lockedAnswers.isEmpty {
+            params["answers"] = .object(lockedAnswers.mapValues(JSONValue.string))
+        }
+        return .object([
+            "id": .string(id), "method": .string("clarify"), "params": .object(params),
+        ])
+    }
+
+    /// The client-local event `GatewayClient` routes a server request frame
+    /// down the pipeline as (never seq-stamped).
+    static func serverRequestEvent(_ request: JSONValue) -> GatewayEvent {
+        guard let decoded = ServerRequest(snapshot: request) else {
+            fatalError("malformed server request fixture")
+        }
+        return GatewayEvent(serverRequest: decoded)
+    }
+
+    /// `request.cancel {id, method, reason}` — a normal, seq-stamped wire
+    /// event withdrawing server request `id`.
+    static func requestCancel(
+        sessionID: String, seq: Int, id: String, method: String = "approval",
+        reason: String = "resolved"
+    ) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.requestCancel, sessionID: sessionID, seq: seq,
+            payload: .object([
+                "id": .string(id), "method": .string(method), "reason": .string(reason),
+            ]))
+    }
+
     static func messageComplete(sessionID: String, seq: Int, text: String = "ok") -> JSONValue {
         eventParams(
             type: GatewayEvent.Kind.messageComplete, sessionID: sessionID, seq: seq,
             payload: .object(["text": .string(text)]))
+    }
+
+    static func statusUpdate(sessionID: String, seq: Int, kind: String, text: String = "")
+        -> JSONValue
+    {
+        eventParams(
+            type: GatewayEvent.Kind.statusUpdate, sessionID: sessionID, seq: seq,
+            payload: .object(["kind": .string(kind), "text": .string(text)]))
+    }
+
+    static func notificationShow(
+        sessionID: String, seq: Int, text: String, key: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = ["text": .string(text)]
+        if let key { payload["key"] = .string(key) }
+        return eventParams(
+            type: GatewayEvent.Kind.notificationShow, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func notificationClear(sessionID: String, seq: Int, key: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.notificationClear, sessionID: sessionID, seq: seq,
+            payload: .object(["key": .string(key)]))
+    }
+
+    static func subagentStart(
+        sessionID: String, seq: Int, goal: String, taskCount: Int = 1, taskIndex: Int = 0,
+        subagentID: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "goal": .string(goal),
+            "task_count": .number(Double(taskCount)),
+            "task_index": .number(Double(taskIndex)),
+        ]
+        if let subagentID { payload["subagent_id"] = .string(subagentID) }
+        return eventParams(
+            type: GatewayEvent.Kind.subagentStart, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func subagentComplete(
+        sessionID: String, seq: Int, goal: String, taskCount: Int = 1, taskIndex: Int = 0,
+        subagentID: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "goal": .string(goal),
+            "task_count": .number(Double(taskCount)),
+            "task_index": .number(Double(taskIndex)),
+        ]
+        if let subagentID { payload["subagent_id"] = .string(subagentID) }
+        return eventParams(
+            type: GatewayEvent.Kind.subagentComplete, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func toolStart(sessionID: String, seq: Int, name: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.toolStart, sessionID: sessionID, seq: seq,
+            payload: .object(["name": .string(name)]))
+    }
+
+    static func toolComplete(sessionID: String, seq: Int, name: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.toolComplete, sessionID: sessionID, seq: seq,
+            payload: .object(["name": .string(name)]))
     }
 
     static func event(_ params: JSONValue) -> GatewayEvent {

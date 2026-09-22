@@ -38,6 +38,11 @@ public struct LiveSessionSnapshot: Sendable, Equatable {
     public var pendingApproval: JSONValue?
     /// `pending_clarify`, or nil when the key is absent (nothing pending).
     public var pendingClarify: JSONValue?
+    /// `open_requests` (contract ≥ 7) — the server→client requests still
+    /// outstanding for this session, superseding `pendingApproval`/
+    /// `pendingClarify` on backends that populate it. Absent on contract-6
+    /// backends, where it defaults to empty.
+    public var openRequests: [ServerRequest]
 
     /// Fails when the response is not a live-session payload: every field
     /// checked here is written unconditionally by the builder, so a missing
@@ -82,11 +87,29 @@ public struct LiveSessionSnapshot: Sendable, Equatable {
             else { return nil }
         }
 
+        // Absent means "no open requests" (a contract-6 backend, or a
+        // contract-7 one with nothing outstanding) — `[]`. A *present* field
+        // that is not an array is an unvalidated shape, refused the same way
+        // an unusable `pending_clarify` is; so is an array holding an entry
+        // `ServerRequest(snapshot:)` cannot decode, because silently
+        // dropping it would understate what the backend actually has
+        // outstanding rather than report an unreadable payload.
+        let openRequestsField = result["open_requests"]
+        var openRequests: [ServerRequest] = []
+        if let openRequestsField {
+            guard let entries = openRequestsField.arrayValue else { return nil }
+            for entry in entries {
+                guard let decoded = ServerRequest(snapshot: entry) else { return nil }
+                openRequests.append(decoded)
+            }
+        }
+
         self.runtimeID = runtimeID
         self.sessionKey = sessionKey
         self.startedAt = startedAt
         self.pendingApproval = approvalField
         self.pendingClarify = clarifyField
+        self.openRequests = openRequests
     }
 
     /// A non-empty JSON object, which is the only thing the builder can write

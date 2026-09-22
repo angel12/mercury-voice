@@ -54,11 +54,26 @@ final class ConversationController {
     // confirmed responses and authoritative reconnect reads. Cancellation is
     // synchronous and scoped to that notice, not the shared speech output.
     var approval: ApprovalRequest? {
-        willSet { approvalAnnouncement?.cancel() }
+        willSet {
+            guard !stampingApprovalInPlace else { return }
+            approvalAnnouncement?.cancel()
+        }
     }
+    /// True only while `present(approval:)` stamps an srq id onto the sheet
+    /// already on screen (issue #125). That write is the *same* prompt, so
+    /// the notice announcing it must survive it — cancelling would leave
+    /// the prompt unannounced when the upgrade lands before it is spoken.
+    private var stampingApprovalInPlace = false
     var clarify: ClarifyRequest? {
-        willSet { clarifyAnnouncement?.cancel() }
+        willSet {
+            guard !mergingClarifyLocksInPlace else { return }
+            clarifyAnnouncement?.cancel()
+        }
     }
+    /// True only while `present(clarify:)` merges newly locked batch answers
+    /// into the sheet already on screen — the same prompt, so its notice
+    /// must survive, as with `stampingApprovalInPlace` (PR #126 review).
+    private var mergingClarifyLocksInPlace = false
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -85,6 +100,24 @@ final class ConversationController {
     /// nil in production: `startVoiceLoop` builds the live stack.
     private let audio: AudioStack?
     private let profile: String?
+    /// Names this controller's claim on the server-side TTS model
+    /// (`POST /api/audio/tts-lease`, issue #125). Minted once per
+    /// controller — NOT a fixed shared name — because upstream keys leases
+    /// by name only: a shared name would let one device's release drop
+    /// another's warm-up.
+    private let ttsLeaseName = "mercury:conversation:\(UUID().uuidString)"
+    /// Fire-and-forget handle for the acquire kicked off in `openSession`.
+    /// `closeSessionIfOpen` consumes this (sets it nil) so the release task
+    /// it spawns can await this exact acquire before sending `active:
+    /// false` — the acquire is slow by design (the backend preloads the TTS
+    /// model off-loop, which can take seconds), so ordering the release
+    /// after it must never block teardown/close itself. Also joined by
+    /// `diagnosticAwaitTTSLeaseAcquire()` in tests.
+    private var ttsLeaseAcquireTask: Task<Void, Never>?
+    /// Fire-and-forget handle for the release spawned by
+    /// `closeSessionIfOpen`; joined only by
+    /// `diagnosticAwaitTTSLeaseRelease()` in tests.
+    private var ttsLeaseReleaseTask: Task<Void, Never>?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
@@ -120,6 +153,8 @@ final class ConversationController {
         private let lock = NSLock()
         private var _runtimeID: String?
         private var _storedID: String?
+        private var _recover: (@Sendable (_ reResume: Bool) async -> Bool)?
+        private var _submitsInFlight = 0
 
         var runtimeID: String? {
             get {
@@ -146,6 +181,19 @@ final class ConversationController {
                 lock.unlock()
             }
         }
+
+        /// The controller's reattach-refusal recovery (issue #125), set once
+        /// in init; the tracker's submit closure cannot capture self.
+        var recover: (@Sendable (_ reResume: Bool) async -> Bool)? {
+            get { lock.withLock { _recover } }
+            set { lock.withLock { _recover = newValue } }
+        }
+
+        /// prompt.submit calls (including a reattach retry) not yet returned.
+        /// A reconnect reset must not clear `busy` under one (issue #125).
+        var submitsInFlight: Int { lock.withLock { _submitsInFlight } }
+        func beginSubmit() { lock.withLock { _submitsInFlight += 1 } }
+        func endSubmit() { lock.withLock { _submitsInFlight -= 1 } }
     }
 
     /// MainActor admits both events and resets to this one FIFO. A direct
@@ -195,6 +243,11 @@ final class ConversationController {
     private let trackerResets = TrackerResets()
     private let trackerResetRequested: (@MainActor @Sendable () -> Void)?
     private let trackerPumpWillJoin: (@MainActor @Sendable () -> Void)?
+    /// Backoff before a reattach-refusal retry; seamed so tests don't wait.
+    private let retryDelay: @Sendable (Duration) async throws -> Void
+    /// Test hook: a 4007 recovery is about to await a reconnect resume;
+    /// true when it joins one already in flight rather than starting its own.
+    private let reattachRecoveryWillResume: (@MainActor @Sendable (Bool) -> Void)?
 
     init(
         connection: HermesConnection,
@@ -206,13 +259,17 @@ final class ConversationController {
         beforeTrackerEvent: (@Sendable (GatewayEvent) async -> Void)? = nil,
         trackerResetRequested: (@MainActor @Sendable () -> Void)? = nil,
         trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil,
-        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil
+        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil,
+        retryDelay: (@Sendable (Duration) async throws -> Void)? = nil,
+        reattachRecoveryWillResume: (@MainActor @Sendable (Bool) -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
         self.audio = audio
         self.trackerResetRequested = trackerResetRequested
         self.trackerPumpWillJoin = trackerPumpWillJoin
+        self.retryDelay = retryDelay ?? { try await Task.sleep(for: $0) }
+        self.reattachRecoveryWillResume = reattachRecoveryWillResume
         self.capture = capture ?? .shared
         self.profile = profile
         self.profileName = profile
@@ -228,18 +285,37 @@ final class ConversationController {
         let box = sessionBox
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
-                guard let sid = box.runtimeID else { throw HermesError.notConnected }
-                if let submitPrompt {
-                    try await submitPrompt(sid, text, interrupted)
-                } else {
-                    try await connection.submitPrompt(
-                        sessionID: sid, text: text, interrupted: interrupted)
+                box.beginSubmit()
+                defer { box.endSubmit() }
+                @Sendable func send() async throws {
+                    guard let sid = box.runtimeID else { throw HermesError.notConnected }
+                    if let submitPrompt {
+                        try await submitPrompt(sid, text, interrupted)
+                    } else {
+                        try await connection.submitPrompt(
+                            sessionID: sid, text: text, interrupted: interrupted)
+                    }
+                }
+                do {
+                    try await send()
+                } catch let error as HermesError
+                    where error.isSessionNotLive || error.isInterruptSettling
+                {
+                    // Reattach refusals (issue #125) come before the gateway
+                    // accepts the prompt, so exactly one resubmit cannot
+                    // duplicate the turn. A second refusal surfaces as-is.
+                    guard await box.recover?(error.isSessionNotLive) == true else { throw error }
+                    try await send()
                 }
             },
             interrupt: {
                 guard let sid = box.runtimeID else { return }
                 try? await connection.interruptSession(sessionID: sid)
             })
+
+        box.recover = { [weak self] reResume in
+            await self?.recoverRefusedSubmit(reResume: reResume) ?? false
+        }
 
         let (stream, continuation) = AsyncStream.makeStream(of: TrackerInput.self)
         trackerEventContinuation = continuation
@@ -275,6 +351,19 @@ final class ConversationController {
         trackerEventPump?.cancel()
     }
 
+    /// Diagnostic only: join the fire-and-forget TTS-lease acquire kicked
+    /// off by `openSession`, so a test can assert on it deterministically
+    /// instead of racing the detached task.
+    func diagnosticAwaitTTSLeaseAcquire() async {
+        await ttsLeaseAcquireTask?.value
+    }
+
+    /// Diagnostic only: join the fire-and-forget TTS-lease release spawned
+    /// by `closeSessionIfOpen`.
+    func diagnosticAwaitTTSLeaseRelease() async {
+        await ttsLeaseReleaseTask?.value
+    }
+
     /// Read the same actor that the real voice engine uses, without starting
     /// that engine or installing any process-global audio handlers.
     func diagnosticTrackerState() async -> (text: String, busy: Bool, pendingText: String?) {
@@ -291,6 +380,11 @@ final class ConversationController {
     /// instead cancels the whole pump and resolves every outstanding waiter.
     func resetTracker(busy: Bool) async -> Bool {
         guard !isTornDown, !Task.isCancelled else { return false }
+        // A new session identity (fresh conversation or reconnect resume)
+        // starts with no subagents running, whatever the old runtime last
+        // reported — otherwise a dropped subagent.complete would leak a
+        // stuck "Delegating: …" ticker across the reset.
+        runningSubagents.removeAll()
         let id = UUID()
         let resets = trackerResets
         let completion = resets.register(id)
@@ -367,12 +461,24 @@ final class ConversationController {
         }
         sessionBox.runtimeID = handle.runtimeID
         sessionBox.storedID = handle.storedID
+        // Acquire the TTS lease as the conversation starts. Fire-and-forget:
+        // warm-up is a nicety the backend reports failures for in its own
+        // body (never an HTTP error), and it must never delay `begin()`
+        // reaching `startVoiceLoop()` — i.e. never delay listening.
+        let leaseService = sessionService
+        let leaseName = ttsLeaseName
+        let leaseProfile = profile
+        ttsLeaseAcquireTask = Task {
+            await leaseService.ttsLease(leaseName, active: true, profile: leaseProfile)
+        }
         sessionTitle = handle.title?.isEmpty == false ? handle.title : nil
         projectName = handle.project
         if let contract = handle.desktopContract,
             contract < GatewayClient.builtAgainstDesktopContract
         {
-            notice = "This Hermes backend is older than the app was built for (contract \(contract) < \(GatewayClient.builtAgainstDesktopContract)); some features may misbehave."
+            setNotice(
+                "This Hermes backend is older than the app was built for (contract \(contract) < \(GatewayClient.builtAgainstDesktopContract)); some features may misbehave."
+            )
         }
         let running = handle.raw["running"]?.truthy ?? false
         usage = nil  // new session identity; the first turn re-reports
@@ -395,10 +501,11 @@ final class ConversationController {
     /// hydration should be visible; the resume_progress events clear or fail
     /// it.
     private static let hydrationNotice = "Loading session history…"
+    private static let compactingTicker = "Compacting context…"
 
     private func noteHydration(from handle: SessionHandle) {
         if handle.raw["hydrating"]?.truthy == true {
-            notice = Self.hydrationNotice
+            setNotice(Self.hydrationNotice)
         }
     }
 
@@ -470,7 +577,7 @@ final class ConversationController {
                     Task { @MainActor in self?.setupError = message }
                 },
                 onNotice: { [weak self] message in
-                    Task { @MainActor in self?.notice = message }
+                    Task { @MainActor in self?.setNotice(message) }
                 },
                 onTurnCaptured: { [cues] in cues.playTurnCaptured() },
                 onThinkingTick: { [cues] in cues.playThinkingTick() },
@@ -553,7 +660,31 @@ final class ConversationController {
     private func closeSessionIfOpen() async {
         guard let sid = sessionBox.runtimeID else { return }
         sessionBox.runtimeID = nil
+        // Paired with the acquire in `openSession`: this guard only passes
+        // once per session, so the release below fires exactly once per
+        // acquire.
+        releaseTTSLease()
         await sessionService.closeSession(sessionID: sid)
+    }
+
+    /// Spawns the release (`active: false`) as its own fire-and-forget task
+    /// that first awaits the stored acquire task, then sends the release —
+    /// never the other way around, and never awaited here. The acquire can
+    /// take seconds (the backend preloads the TTS model off-loop), so
+    /// close/teardown must complete without waiting on it; ordering the
+    /// release after it, off this call's critical path, is what stops a
+    /// short conversation's release racing ahead of its acquire and leaving
+    /// this controller's uniquely-named lease held forever.
+    private func releaseTTSLease() {
+        let acquireTask = ttsLeaseAcquireTask
+        ttsLeaseAcquireTask = nil
+        let leaseService = sessionService
+        let leaseName = ttsLeaseName
+        let leaseProfile = profile
+        ttsLeaseReleaseTask = Task {
+            _ = await acquireTask?.value
+            await leaseService.ttsLease(leaseName, active: false, profile: leaseProfile)
+        }
     }
 
     /// AppModel forwards scene-active. Foregrounding is authoritative: an
@@ -692,11 +823,35 @@ final class ConversationController {
     /// whenever the runtime session identity changes.
     private var lastSeenSeq: Int?
     private var replayEpoch: String?
+    /// The `key` of the `notification.show` currently shown as `notice`, so
+    /// `notification.clear {key}` only withdraws the notice it named — not
+    /// one from an unrelated code path (reconnect banner, resume failure,
+    /// live-activity report). Every other site that writes `notice` resets
+    /// this to nil so a stale clear can never reach it.
+    private var noticeKey: String?
+    /// Subagents currently delegating, keyed by `subagent_id` (falling back
+    /// to the string task index when absent, since parallel children without
+    /// an id are otherwise indistinguishable). Drives the "Delegating: …"
+    /// ticker while non-empty; reset wherever turn state resets so a
+    /// dropped `subagent.complete` can't leak a stuck ticker forever.
+    private var runningSubagents: Set<String> = []
+    /// The newest "Delegating: …" text `subagent.start` set, so a
+    /// `tool.complete` landing mid-delegation can hand the ticker back to it
+    /// instead of blanking it (PR #126 review). Only read while
+    /// `runningSubagents` is non-empty, and every insert rewrites it, so a
+    /// stale value from an earlier delegation is never shown.
+    private var delegatingTicker: String?
     /// While a reconnect-resume is deciding between event replay and a tracker
     /// reset, live events are parked here so replayed frames can't interleave
     /// out of order with them; the seq gate dedups any overlap on drain.
     private var holdingEvents = false
     private var heldEvents: [GatewayEvent] = []
+    /// Server-request ids withdrawn by a `request.cancel` in the replay batch
+    /// just applied. A server request is never seq-stamped, so a held copy of
+    /// one cancelled during the outage would pass the seq gate on drain and
+    /// be presented again — while the live copy of its cancel, which *is*
+    /// stamped, is dropped there as already seen. Consumed by the drain.
+    private var replayCancelledRequestIDs: Set<String> = []
 
     /// Called by AppModel's pump for every gateway event.
     func handle(event: GatewayEvent) {
@@ -718,8 +873,17 @@ final class ConversationController {
     private func drainHeldEvents() {
         holdingEvents = false
         let held = heldEvents
+        let cancelled = replayCancelledRequestIDs
         heldEvents = []
-        for event in held { apply(event) }
+        replayCancelledRequestIDs = []
+        for event in held {
+            if event.type == GatewayEvent.Kind.serverRequest,
+                let id = event.payload["id"]?.stringValue, cancelled.contains(id)
+            {
+                continue
+            }
+            apply(event)
+        }
     }
 
     /// The event families whose state a post-batch prompt read owns.
@@ -727,6 +891,10 @@ final class ConversationController {
         GatewayEvent.Kind.approvalRequest,
         GatewayEvent.Kind.clarifyRequest,
         GatewayEvent.Kind.clarifyExpire,
+        // Contract ≥ 7 (issue #125): the same two sheets, raised as
+        // server→client requests and withdrawn by `request.cancel`.
+        GatewayEvent.Kind.serverRequest,
+        GatewayEvent.Kind.requestCancel,
     ]
 
     /// `skippingPromptFamilies` is set while applying a replay batch: the
@@ -756,6 +924,7 @@ final class ConversationController {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")
                 toolTicker = nil
+                runningSubagents.removeAll()
                 // End-of-turn usage is authoritative; the server guarantees no
                 // stale session.usage tick lands after this event.
                 if let complete = event.payload["usage"].flatMap(SessionUsage.init(json:)) {
@@ -773,7 +942,9 @@ final class ConversationController {
             toolTicker = "Running: \(name)…"
 
         case GatewayEvent.Kind.toolComplete:
-            toolTicker = nil
+            // A delegating parent runs tools of its own; once one finishes,
+            // the delegation still in progress owns the ticker again.
+            toolTicker = runningSubagents.isEmpty ? nil : delegatingTicker
 
         case GatewayEvent.Kind.approvalRequest:
             if let request = ApprovalRequest(event: event) {
@@ -788,6 +959,40 @@ final class ConversationController {
         case GatewayEvent.Kind.clarifyExpire:
             if clarify?.requestID == event.payload["request_id"]?.stringValue {
                 clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+            }
+
+        case GatewayEvent.Kind.serverRequest:
+            // Contract ≥ 7 (issue #125). GatewayClient only routes the
+            // methods this app renders; anything that decodes as neither
+            // sheet is ignored.
+            guard let request = ServerRequest(event: event) else { break }
+            if let approvalRequest = ApprovalRequest(serverRequest: request) {
+                present(approval: approvalRequest)
+            } else if let clarifyRequest = ClarifyRequest(serverRequest: request) {
+                present(clarify: clarifyRequest)
+            }
+
+        case GatewayEvent.Kind.requestCancel:
+            // The server withdrew a request (answered on another surface,
+            // timed out, interrupted). Matched by srq id only, so a sheet
+            // that came from a legacy event — which has none — is never
+            // cleared by it, and only the card the id names comes down.
+            guard let id = event.payload["id"]?.stringValue else { break }
+            var withdrew = false
+            if approval?.serverRequestID == id {
+                approval = nil
+                // A late confirmation for the withdrawn approval must not
+                // dismiss the next one (issue #39).
+                approvalEpoch += 1
+                withdrew = true
+            }
+            if clarify?.serverRequestID == id {
+                clarify = nil
+                withdrew = true
+            }
+            if withdrew {
                 promptSendError = nil
                 resumeIfUnprompted()
             }
@@ -814,7 +1019,7 @@ final class ConversationController {
         case GatewayEvent.Kind.sessionResumeProgress:
             switch event.payload["status"]?.stringValue {
             case "complete":
-                if notice == Self.hydrationNotice { notice = nil }
+                if notice == Self.hydrationNotice { setNotice(nil) }
             case "failed":
                 // The gateway discards the session on hydration failure; the
                 // setup-error alert offers the way back to the session list.
@@ -826,7 +1031,47 @@ final class ConversationController {
             }
 
         case GatewayEvent.Kind.notificationShow:
-            notice = event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue
+            setNotice(
+                event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue,
+                key: event.payload["key"]?.stringValue)
+
+        case GatewayEvent.Kind.notificationClear:
+            // Withdraws the notice `notification.show` set with this key —
+            // only that one; a stale or unrelated key leaves `notice` alone,
+            // and a notice with no key was never eligible to be cleared.
+            if let key = event.payload["key"]?.stringValue, key == noticeKey {
+                setNotice(nil)
+            }
+
+        case GatewayEvent.Kind.statusUpdate:
+            switch event.payload["kind"]?.stringValue {
+            case "compacting":
+                toolTicker = Self.compactingTicker
+            case "compacted":
+                // The terminal edge of a compaction (upstream
+                // conversation_compression.py `_emit_compaction_done`). The
+                // turn continues, so without this the ticker would stick
+                // until `message.complete`. Only our own ticker comes down:
+                // a tool or delegation that started since owns it now.
+                if toolTicker == Self.compactingTicker { toolTicker = nil }
+            default:
+                break
+            }
+
+        case GatewayEvent.Kind.subagentStart:
+            let goal = event.payload["goal"]?.stringValue ?? "subtask"
+            runningSubagents.insert(subagentKey(for: event))
+            delegatingTicker = "Delegating: \(Self.truncatedGoal(goal))…"
+            toolTicker = delegatingTicker
+
+        case GatewayEvent.Kind.subagentComplete:
+            runningSubagents.remove(subagentKey(for: event))
+            // Only retire the ticker once every child is done, and only if
+            // it's still the delegating ticker this family set — a tool
+            // ticker started since (or another family's) must survive.
+            if runningSubagents.isEmpty, toolTicker?.hasPrefix("Delegating: ") == true {
+                toolTicker = nil
+            }
 
         case GatewayEvent.Kind.sessionReclaimed:
             // Broadcast (no session_id on the frame): the server reaped a
@@ -849,6 +1094,23 @@ final class ConversationController {
         }
     }
 
+    /// Identifies one child of a `subagent.start`/`subagent.complete` pair
+    /// for `runningSubagents`. `subagent_id` when the payload carries one;
+    /// otherwise `task_index`, which is stable across the pair for a given
+    /// child even when several run in parallel.
+    private func subagentKey(for event: GatewayEvent) -> String {
+        event.payload["subagent_id"]?.stringValue
+            ?? "\(event.payload["task_index"]?.intValue ?? 0)"
+    }
+
+    /// The ticker shows the goal's first line, capped at 60 characters, so a
+    /// multi-line or long delegation goal can't blow out the status line.
+    private static func truncatedGoal(_ goal: String) -> String {
+        let firstLine = goal.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? goal
+        guard firstLine.count > 60 else { return firstLine }
+        return String(firstLine.prefix(60)) + "…"
+    }
+
     /// Bumped each time an approval sheet is presented. Approvals are
     /// session-keyed (no request_id), so a late confirmation for A must not
     /// dismiss B (issue #39).
@@ -864,7 +1126,22 @@ final class ConversationController {
         // approvals that both lack one are not assumed to be the same
         // approval, so a backend that does not stamp ids keeps today's
         // behaviour.
-        if let requestID = request.requestID, approval?.requestID == requestID { return }
+        //
+        // Contract ≥ 7 reports one approval twice over — as the `srq-`
+        // request and as `pending_approval` — and both carry the same
+        // gateway `request_id`. When the sheet on screen came from the
+        // legacy source and this copy carries the srq id, adopt the id in
+        // place (no epoch bump, no re-announce): the answer then goes
+        // through `request.answer`, which is the only reply the server
+        // request is resolved by (issue #125).
+        if let requestID = request.requestID, approval?.requestID == requestID {
+            if approval?.serverRequestID == nil, let serverRequestID = request.serverRequestID {
+                stampingApprovalInPlace = true
+                defer { stampingApprovalInPlace = false }
+                approval?.serverRequestID = serverRequestID
+            }
+            return
+        }
         approvalEpoch += 1
         approval = request
         promptSendError = nil
@@ -873,11 +1150,53 @@ final class ConversationController {
 
     private func present(clarify request: ClarifyRequest) {
         // Idempotent by request id, for the same reason as the approval
-        // sheet; clarify requests always carry one.
-        if clarify?.requestID == request.requestID { return }
+        // sheet; clarify requests always carry one. No in-place srq upgrade
+        // is needed here, unlike approvals: an srq clarify's request id *is*
+        // its `srq-` id, which never equals a legacy `clarify.request` id,
+        // and a contract ≥ 7 backend reports clarify only as a server
+        // request (no `pending_clarify` twin).
+        //
+        // The one thing a repeat can bring is a batch's new locks: another
+        // client answered a question (`clarify.lock`) while this phone was
+        // away, and the reconnect's `open_requests` snapshot carries it as
+        // `params.answers` (PR #126 review). Merge those in place — no
+        // re-announce, same sheet identity; `ClarifySheet` rebases its
+        // paging on them. If that leaves nothing unlocked, upstream already
+        // resolved the request on its last lock, so the sheet comes down and
+        // nothing is sent (see the fully-locked case below).
+        if let current = clarify, current.requestID == request.requestID {
+            guard !current.questions.isEmpty else { return }
+            let merged = current.lockedAnswers.merging(request.lockedAnswers) { _, new in new }
+            guard merged != current.lockedAnswers else { return }
+            if current.questions.allSatisfy({ merged[$0.qid] != nil }) {
+                clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+                return
+            }
+            mergingClarifyLocksInPlace = true
+            defer { mergingClarifyLocksInPlace = false }
+            clarify?.lockedAnswers = merged
+            return
+        }
+        let isBatch = !request.questions.isEmpty
+        let remaining =
+            isBatch
+            ? request.questions.filter { request.lockedAnswers[$0.qid] == nil }.count : 1
+        // A batch that arrived with every question already locked has
+        // nothing left to ask (review round 1, issue #125): presenting it
+        // would show "Question 1 of 0" and speak "Hermes has 0 questions for
+        // you.", and its "Skip all" would send `{}` — cancel-all — discarding
+        // the locked answers instead of confirming them. Nor is anything
+        // sent: upstream resolves the request the moment its last question
+        // locks, so it is already settled and a `request.answer` could only
+        // come back `expired`. It is simply not shown.
+        if isBatch, remaining == 0 { return }
         clarify = request
         promptSendError = nil
-        announce(.clarify(requestID: request.requestID))
+        announce(
+            .clarify(requestID: request.requestID, remainingQuestions: remaining, isBatch: isBatch)
+        )
     }
 
     // MARK: Spoken prompt notices
@@ -888,12 +1207,20 @@ final class ConversationController {
     /// clarify by its request id.
     private enum PromptNotice {
         case approval(epoch: Int)
-        case clarify(requestID: String)
+        /// `isBatch` distinguishes a `questions`-carrying request (wording
+        /// always counts, even down to its last question — "1 questions" is
+        /// deliberate, matching `ClarifyRequest.questions` being non-empty)
+        /// from a single legacy/srq clarify, which keeps the singular
+        /// phrasing regardless. `remainingQuestions` is the unlocked count.
+        case clarify(requestID: String, remainingQuestions: Int, isBatch: Bool)
 
         var text: String {
             switch self {
             case .approval: "Hermes is asking for approval to run a command."
-            case .clarify: "Hermes has a question for you."
+            case .clarify(_, let remaining, let isBatch):
+                isBatch
+                    ? "Hermes has \(remaining) questions for you."
+                    : "Hermes has a question for you."
             }
         }
     }
@@ -970,7 +1297,7 @@ final class ConversationController {
         guard !isTornDown, !Task.isCancelled else { return false }
         switch notice {
         case .approval(let epoch): return approval != nil && approvalEpoch == epoch
-        case .clarify(let requestID): return clarify?.requestID == requestID
+        case .clarify(let requestID, _, _): return clarify?.requestID == requestID
         }
     }
 
@@ -995,16 +1322,39 @@ final class ConversationController {
     /// (`if value: payload[key] = value`), so nil here is a real answer and
     /// not a missing one — with the caveat recorded on `LiveSessionSnapshot`
     /// that a backend omitting the fields entirely reads the same way.
+    ///
+    /// `openRequests` (contract ≥ 7, issue #125) outranks the legacy fields
+    /// per family: an approval/clarify entry there is the authority for its
+    /// sheet and `pending_approval` / `pending_clarify` are ignored, because
+    /// only the srq entry carries the id `request.answer` needs. The legacy
+    /// field is the fallback only when no usable entry of that family exists
+    /// — the contract-6 case. Entries are taken oldest first, as the gateway
+    /// lists them, matching `pending_approval`'s oldest-unresolved choice.
+    ///
+    /// Entries of any other method (sudo, secret, vault.*, …) are ignored,
+    /// deliberately *not* refused — as `GatewayClient` also drops such a
+    /// live frame: the first response to a server request settles it
+    /// for every surface, and another attached client (the desktop) may
+    /// still answer it through `request.answer` or its own response frame.
+    /// If the phone is the only client, the request waits out its
+    /// server-side deadline (upstream `_ask`); instant failure while another
+    /// advertising client may be attached would need an upstream change.
     private func adoptPendingPrompts(
         sessionID: String,
         approvalPayload: JSONValue?,
         clarifyPayload: JSONValue?,
+        openRequests: [ServerRequest],
         clearStale: Bool
     ) {
-        if let approvalPayload,
-            let request = ApprovalRequest(payload: approvalPayload, sessionID: sessionID)
-        {
-            present(approval: request)
+        let approvalRequest =
+            openRequests.lazy.compactMap { ApprovalRequest(serverRequest: $0) }.first
+            ?? approvalPayload.flatMap { ApprovalRequest(payload: $0, sessionID: sessionID) }
+        let clarifyRequest =
+            openRequests.lazy.compactMap { ClarifyRequest(serverRequest: $0) }.first
+            ?? clarifyPayload.flatMap { ClarifyRequest(payload: $0, sessionID: sessionID) }
+
+        if let approvalRequest {
+            present(approval: approvalRequest)
         } else if clearStale, approval != nil {
             // Invalidate error ownership too: a late failure for A must not
             // write into the next sheet (clarify B) via the shared footer.
@@ -1012,10 +1362,8 @@ final class ConversationController {
             approvalEpoch += 1
         }
 
-        if let clarifyPayload,
-            let request = ClarifyRequest(payload: clarifyPayload, sessionID: sessionID)
-        {
-            present(clarify: request)
+        if let clarifyRequest {
+            present(clarify: clarifyRequest)
         } else if clearStale, clarify != nil {
             clarify = nil
         }
@@ -1026,11 +1374,22 @@ final class ConversationController {
     /// The `session.resume` snapshot as prompt authority — the first read of
     /// the reconnect, and the only one on any path where the replay is not
     /// usable.
+    ///
+    /// `open_requests` is decoded fail-soft here — a non-array reads as
+    /// empty and an unreadable entry is dropped — which is how this path
+    /// already treats `pending_*` (passed through unvalidated; a value the
+    /// decoders cannot use reads as absent). Unlike the `session.activate`
+    /// read, whose snapshot fails closed into this path, there is no more
+    /// conservative read to fall back to: refusing the handle would fail the
+    /// whole resume. A dropped entry only means its family falls back to the
+    /// legacy field, as on a contract-6 backend.
     private func adoptPendingPrompts(from handle: SessionHandle, clearStale: Bool) {
         adoptPendingPrompts(
             sessionID: handle.runtimeID,
             approvalPayload: handle.raw["pending_approval"],
             clarifyPayload: handle.raw["pending_clarify"],
+            openRequests: handle.raw["open_requests"]?.arrayValue?
+                .compactMap { ServerRequest(snapshot: $0) } ?? [],
             clearStale: clearStale)
     }
 
@@ -1042,6 +1401,7 @@ final class ConversationController {
             sessionID: snapshot.runtimeID,
             approvalPayload: snapshot.pendingApproval,
             clarifyPayload: snapshot.pendingClarify,
+            openRequests: snapshot.openRequests,
             clearStale: clearStale)
     }
 
@@ -1063,27 +1423,75 @@ final class ConversationController {
     ///
     /// Reordering rather than merging is deliberate. The snapshot carries
     /// resolutions but no seq, the frames carry seq but never a resolution
-    /// (nothing is emitted when an approval or clarify is answered), so the
-    /// two cannot be placed on one axis at all; taking the last read as the
-    /// whole answer needs no ordering rule.
+    /// (on contract 6, nothing is emitted when an approval or clarify is
+    /// answered), so the two cannot be placed on one axis at all; taking the
+    /// last read as the whole answer needs no ordering rule.
     ///
     /// The batch is fetched before that read but applied only after it
     /// succeeds, so a failure leaves the watermark and every sheet exactly
     /// where the un-replayed path would have them.
     ///
-    /// **Known residual, tracked separately.** A prompt whose frame is
-    /// emitted before the read and resolved by another client before the
-    /// read still resurrects: the frame is held, drains after the sheets are
-    /// adopted, and no resolution frame exists to clear it. That is the
-    /// silent-resolution defect, and it reproduces with no reconnect at all —
-    /// a continuously connected client shows the same dead sheet from the
-    /// same server history. It needs `approval.resolved` / `clarify.resolved`
-    /// on the gateway, and no read order can substitute for them.
+    /// **Resolution frames.** Contract ≥ 7 does have one: a server request
+    /// is withdrawn by `request.cancel {id}` (answered elsewhere, timed out,
+    /// interrupted). A held srq whose cancel is in the replay batch is
+    /// dropped on drain (`replayCancelledRequestIDs`), since the srq carries
+    /// no seq and its held cancel would be gated out as already seen; a
+    /// cancel that is itself still held clears the sheet as it drains.
+    ///
+    /// **Known residual (contract 6 only).** A legacy `approval.request` /
+    /// `clarify.request` frame emitted before the read and resolved by
+    /// another client before the read still resurrects: the frame is held,
+    /// drains after the sheets are adopted, and no resolution frame exists
+    /// to clear it. That is the silent-resolution defect, and it reproduces
+    /// with no reconnect at all — a continuously connected client shows the
+    /// same dead sheet from the same server history. No read order can
+    /// substitute for a resolution frame.
     func connectionBecameReady(isReconnect: Bool) async {
         guard !isTornDown else { return }
         connectionHealthy = true
         guard isReconnect else { return }
-        guard let storedID = sessionBox.storedID else { return }
+        // A 4007 recovery may already be resuming on the old routing. Let it
+        // finish before this socket runs its own resume: two resumes share
+        // one event hold, and the first to finish would drain it under the
+        // second while that one is still deciding replay vs reset. This
+        // socket still resumes afterwards — the recovery's attach may have
+        // gone to the socket this one replaced.
+        if let inFlight = reconnectResume {
+            _ = await inFlight.value
+            guard !isTornDown, !Task.isCancelled else { return }
+        }
+        let task = startReconnectResume(recovering: false)
+        await withTaskCancellationHandler {
+            _ = await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// The reconnect resume in flight, so a 4007 recovery joins it instead of
+    /// racing a second resume on the same stored id — two would interleave
+    /// the event hold and could refuse each other (issue #125).
+    private var reconnectResume: Task<Bool, Never>?
+    private var reconnectResumeGeneration = 0
+
+    private func startReconnectResume(recovering: Bool) -> Task<Bool, Never> {
+        reconnectResumeGeneration += 1
+        let generation = reconnectResumeGeneration
+        let task = Task {
+            let resumed = await resumeAfterReconnect(recovering: recovering)
+            if reconnectResumeGeneration == generation { reconnectResume = nil }
+            return resumed
+        }
+        reconnectResume = task
+        return task
+    }
+
+    /// The reconnect resume proper; true when the session was reattached.
+    /// `recovering` is a 4007 recovery the user never saw a disconnect for:
+    /// no "Reconnected." notice, and a failure is left to the refused submit
+    /// to surface rather than also raised as a setup error.
+    private func resumeAfterReconnect(recovering: Bool) async -> Bool {
+        guard let storedID = sessionBox.storedID else { return false }
         let previousRuntimeID = sessionBox.runtimeID
         let previousEpoch = replayEpoch
         let watermark = lastSeenSeq
@@ -1092,13 +1500,24 @@ final class ConversationController {
             if isTornDown {
                 holdingEvents = false
                 heldEvents.removeAll()
+                replayCancelledRequestIDs.removeAll()
             } else {
                 drainHeldEvents()
             }
         }
         do {
-            let handle = try await sessionService.resumeSession(
-                storedID: storedID, profile: profile)
+            let handle: SessionHandle
+            do {
+                handle = try await sessionService.resumeSession(
+                    storedID: storedID, profile: profile)
+            } catch let error as HermesError where error.isInterruptSettling {
+                // The previous socket's client-gone interrupt is still
+                // settling (issue #125): wait once rather than abandon.
+                try await retryDelay(.milliseconds(500))
+                guard !isTornDown else { return false }
+                handle = try await sessionService.resumeSession(
+                    storedID: storedID, profile: profile)
+            }
             guard !isTornDown else {
                 // Teardown owns the old runtime; consume it only if it has
                 // not already been closed. A cold resume returned a new
@@ -1108,14 +1527,14 @@ final class ConversationController {
                 } else {
                     await sessionService.closeSession(sessionID: handle.runtimeID)
                 }
-                return
+                return false
             }
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
             let currentEpoch = await sessionService.replayEpoch
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
             replayEpoch = currentEpoch
 
@@ -1127,7 +1546,7 @@ final class ConversationController {
                 watermark: watermark)
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
             let prompts =
                 batch == nil
@@ -1135,11 +1554,18 @@ final class ConversationController {
                 : await readPromptState(handle: handle, previousEpoch: previousEpoch)
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
 
             if let batch, let prompts {
-                for event in batch { apply(event, skippingPromptFamilies: true) }
+                for event in batch {
+                    if event.type == GatewayEvent.Kind.requestCancel,
+                        let id = event.payload["id"]?.stringValue
+                    {
+                        replayCancelledRequestIDs.insert(id)
+                    }
+                    apply(event, skippingPromptFamilies: true)
+                }
                 adoptPendingPrompts(from: prompts, clearStale: true)
             } else {
                 // No usable replay: the batch (if one was fetched) is
@@ -1150,20 +1576,46 @@ final class ConversationController {
                 // would swallow every frame after it.
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
-                let resetApplied = await resetTracker(busy: running)
+                // A submit still awaiting its ACK (a 4007 recovery's retry)
+                // owns a turn the snapshot cannot show yet; clearing `busy`
+                // under it would make the engine skip the reply.
+                let resetApplied = await resetTracker(
+                    busy: running || sessionBox.submitsInFlight > 0)
                 guard !isTornDown else {
                     await closeSessionIfOpen()
-                    return
+                    return false
                 }
-                guard resetApplied else { return }
+                guard resetApplied else { return false }
                 adoptPendingPrompts(from: handle, clearStale: true)
             }
-            notice = "Reconnected."
+            if !recovering { setNotice("Reconnected.") }
             noteHydration(from: handle)
+            return true
         } catch {
-            guard !isTornDown else { return }
+            guard !isTornDown, !recovering else { return false }
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
+            return false
         }
+    }
+
+    /// One recovery step before resubmitting a reattach-refused prompt
+    /// (issue #125): 4007 re-resumes (joining a reconnect resume already in
+    /// flight) so the retry routes to the live runtime, 4009 waits out the
+    /// settling interrupt. False when
+    /// the conversation ended meanwhile — the refusal then surfaces.
+    private func recoverRefusedSubmit(reResume: Bool) async -> Bool {
+        guard !isTornDown else { return false }
+        if reResume {
+            // A failed re-resume leaves only the stale runtime: resubmitting
+            // there would just be refused again, so the refusal surfaces.
+            let inFlight = reconnectResume
+            reattachRecoveryWillResume?(inFlight != nil)
+            let task = inFlight ?? startReconnectResume(recovering: true)
+            guard await task.value else { return false }
+        } else {
+            guard (try? await retryDelay(.milliseconds(500))) != nil else { return false }
+        }
+        return !isTornDown
     }
 
     /// Fetch the frames missed during the outage, or nil when a lossless
@@ -1276,7 +1728,15 @@ final class ConversationController {
         guard let request = approval, !promptResponseInFlight else { return }
         let epoch = approvalEpoch
         sendPromptResponse {
-            try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+            // A server-request approval (contract ≥ 7, issue #125) is only
+            // resolved by `request.answer`. `.expired` counts as confirmed:
+            // the backend has already moved on, so the sheet closes.
+            if let serverRequestID = request.serverRequestID {
+                _ = try await $0.answerServerRequest(
+                    id: serverRequestID, result: .object(["choice": .string(choice)]))
+            } else {
+                try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+            }
         } onConfirmed: { [weak self] in
             guard let self, self.approvalEpoch == epoch else { return }
             self.approval = nil
@@ -1289,8 +1749,15 @@ final class ConversationController {
     func respondClarify(answer: String) {
         guard let request = clarify, !promptResponseInFlight else { return }
         let requestID = request.requestID
+        let serverRequestID = request.serverRequestID
         sendPromptResponse {
-            try await $0.respondClarify(requestID: requestID, answer: answer)
+            // Same routing and `.expired` rule as `respondApproval`.
+            if let serverRequestID {
+                _ = try await $0.answerServerRequest(
+                    id: serverRequestID, result: .object(["answer": .string(answer)]))
+            } else {
+                try await $0.respondClarify(requestID: requestID, answer: answer)
+            }
         } onConfirmed: { [weak self] in
             guard let self, self.clarify?.requestID == requestID else { return }
             self.clarify = nil
@@ -1299,17 +1766,63 @@ final class ConversationController {
         }
     }
 
+    /// Answers a batch `clarify` (issue #125 Task 5) with the whole set of
+    /// `qid: answer` pairs at once — locked answers included, since the
+    /// server never re-asks something it already has. `answers` empty means
+    /// "Skip all": `ClarifyResult` treats a result with neither `answer` nor
+    /// `answers` as cancel-all, so that case sends a bare `{}` rather than
+    /// `{"answers": {}}` (`tui_gateway/contracts/server_requests.py`).
+    ///
+    /// Batch answers only exist for a contract-≥7 server request — legacy
+    /// `clarify.request` has no `questions`/`answers` shape to submit, so a
+    /// request without `serverRequestID` is a no-op guard rather than a
+    /// fallback to the single-answer RPC.
+    func respondClarify(answers: [String: String]) {
+        guard let request = clarify, let serverRequestID = request.serverRequestID,
+            !promptResponseInFlight
+        else { return }
+        let requestID = request.requestID
+        // Server-held locks win over anything the sheet collected for the
+        // same qid: upstream merges `{answers}` *over* `req.locked`, so a
+        // stale local answer would silently overwrite another client's lock
+        // (PR #126 review). "Skip all" stays a bare `{}` — cancel-all.
+        let submitted = answers.merging(request.lockedAnswers) { _, locked in locked }
+        let result: JSONValue =
+            answers.isEmpty
+            ? .object([:])
+            : .object(["answers": .object(submitted.mapValues(JSONValue.string))])
+        sendPromptResponse {
+            _ = try await $0.answerServerRequest(id: serverRequestID, result: result)
+        } onConfirmed: { [weak self] in
+            guard let self, self.clarify?.requestID == requestID else { return }
+            self.clarify = nil
+        } applyError: { [weak self] in
+            self?.clarify?.requestID == requestID
+        }
+    }
+
+    /// The in-flight prompt response, kept only so a test can await it.
+    private var promptResponseTask: Task<Void, Never>?
+
+    /// Test seam: await the prompt response `respondApproval` /
+    /// `respondClarify` started, the same way `awaitPromptAnnouncements`
+    /// exposes the notice tasks — the sheet closing on the reply has no
+    /// other signal to wait on (issue #125).
+    func awaitPromptResponse() async {
+        await promptResponseTask?.value
+    }
+
     private func sendPromptResponse(
-        _ send: @escaping (HermesConnection) async throws -> Void,
+        _ send: @escaping (any SessionServicing) async throws -> Void,
         onConfirmed: @escaping @MainActor () -> Void,
         applyError: @escaping @MainActor () -> Bool
     ) {
         promptResponseInFlight = true
         promptSendError = nil
-        Task {
+        promptResponseTask = Task {
             defer { promptResponseInFlight = false }
             do {
-                try await send(connection)
+                try await send(sessionService)
                 onConfirmed()
                 if applyError() { promptSendError = nil }
                 resumeIfUnprompted()
@@ -1330,13 +1843,21 @@ final class ConversationController {
     }
 
     func clearNotice() {
-        notice = nil
+        setNotice(nil)
     }
 
     /// Show an out-of-band notice from outside the engine (the Live
     /// Activity controller reports a failed request this way).
     func showNotice(_ message: String) {
+        setNotice(message)
+    }
+
+    /// The one place `notice` is written. `key` is the `notification.show`
+    /// key this notice can be withdrawn by (nil for every other source), so
+    /// a later `notification.clear` can only ever reach the notice it named.
+    private func setNotice(_ message: String?, key: String? = nil) {
         notice = message
+        noticeKey = key
     }
 
     /// Try the microphone again after a permission denial (the user may

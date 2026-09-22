@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The socket surface `GatewayClient` drives. `URLSessionWebSocketTask` is the
 /// only production conformer; tests script one so a reply, a close, a write
@@ -36,6 +37,7 @@ extension URLSessionWebSocketTask: GatewaySocket {
 /// a busy agent turn can legitimately go minutes without a frame — quiet is
 /// NOT dead here, so no read timeout is applied.
 public actor GatewayClient {
+    private static let logger = Logger(subsystem: "MercuryVoice", category: "HermesKit")
     public enum State: Sendable, Equatable {
         case idle
         case connecting
@@ -84,8 +86,10 @@ public actor GatewayClient {
 
     /// Backend contract version reported in gateway payloads (session.info's
     /// `desktop_contract`); the app warns when older than what it was built
-    /// against.
-    public static let builtAgainstDesktopContract = 6
+    /// against. This is the lowest contract whose prompt protocol this build
+    /// speaks — not the newest one it knows about (8 is Connectors only and
+    /// would warn needlessly against a v7 backend).
+    public static let builtAgainstDesktopContract = 7
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         let config = URLSessionConfiguration.ephemeral
@@ -400,7 +404,7 @@ public actor GatewayClient {
         else { return }
 
         // Only frames with method == "event" and params.type are events;
-        // everything else is a response.
+        // everything else is a response or a server request.
         if frame["method"]?.stringValue == "event",
             let params = frame["params"], let event = GatewayEvent(eventParams: params)
         {
@@ -415,6 +419,28 @@ public actor GatewayClient {
                 }
             }
             for sub in subscribers.values { sub.yield(event) }
+            return
+        }
+
+        if let request = ServerRequest(frame: frame) {
+            if ServerRequest.answerableMethods.contains(request.method) {
+                let event = GatewayEvent(serverRequest: request)
+                for sub in subscribers.values { sub.yield(event) }
+            } else {
+                // Left unanswered on purpose (#125, PR #126 review): the
+                // first response frame for an id settles it for every
+                // attached client (upstream `resolve_response`), and frames
+                // are fanned out to all of them, so an error reply here
+                // would take a sudo/secret/vault.* prompt away from a
+                // co-attached desktop that can render it. If the phone is
+                // the only client the request waits out its server-side
+                // deadline (upstream `_ask`); failing it fast while another
+                // advertising client may be attached would need an upstream
+                // change, since any error response settles the wait.
+                Self.logger.debug(
+                    "left server request \(request.method, privacy: .public) for another client"
+                )
+            }
             return
         }
 

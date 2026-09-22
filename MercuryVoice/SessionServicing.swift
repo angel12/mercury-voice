@@ -11,6 +11,11 @@ import HermesKit
 /// only pin that ordering if it can script each answer and hold each call
 /// open, which a live `HermesConnection` cannot offer.
 ///
+/// The prompt responses (`approval.respond`, `clarify.respond` and the
+/// contract-7 `request.answer`, issue #125) are here too: which of them a
+/// sheet is answered through is the behaviour under test there, and a test
+/// can only observe it — and hold the reply open — through this seam.
+///
 /// The connection itself stays concrete: `rest` (speech, transcription,
 /// voice config) and the tracker's submit/interrupt closure are not part of
 /// this seam and still go straight to `HermesConnection`.
@@ -26,6 +31,18 @@ protocol SessionServicing: Sendable {
 
     @discardableResult
     func closeSession(sessionID: String) async -> SessionCloseOutcome
+
+    func respondApproval(sessionID: String, choice: String) async throws
+    func respondClarify(requestID: String, answer: String) async throws
+    func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer
+
+    /// `POST /api/audio/tts-lease` (contract ≥ 7) — acquire/release this
+    /// conversation's claim on the server-side TTS model. Best-effort: never
+    /// throws, so the controller can fire it without gating on the result.
+    /// Part of this seam (unlike the rest of `rest`) because *whether* and
+    /// *how many times* it fires is exactly the acquire/release-once
+    /// behaviour under test here.
+    func ttsLease(_ lease: String, active: Bool, profile: String?) async
 }
 
 extension HermesConnection: SessionServicing {}

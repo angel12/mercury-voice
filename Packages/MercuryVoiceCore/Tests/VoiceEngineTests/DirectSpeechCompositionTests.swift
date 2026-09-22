@@ -280,4 +280,31 @@ struct DirectSpeechSessionCompositionTests {
         #expect(codeOnly.texts == ["code block omitted"])
         #expect(codeOnly.outcome == .done)
     }
+
+    /// `tts.streaming.min_len` on the resolved config drives the cutter the
+    /// session actually uses — a short sentence that would stay buffered
+    /// under the default 24-char minimum is spoken once the config lowers it.
+    @Test func configuredMinLenLowersTheSessionsCutter() async throws {
+        let shortMinLenConfig = try #require(
+            DirectTTSConfig(
+                json: try JSONDecoder().decode(
+                    JSONValue.self,
+                    from: Data(
+                        """
+                        {"mode": "direct", "wire": "openai-speech", "provider": "openai",
+                         "base_url": "https://api.example.com/v1/", "api_key": "sk-t",
+                         "min_len": 7}
+                        """.utf8))))
+        let synth = RecordingSynthesizer()
+        let clip = RecordingClipPlayer()
+        let session = DirectSpeechSession(
+            config: shortMinLenConfig, client: synth, makePlayer: { clip })
+
+        await session.append("Hi there. ")
+        await session.finish()
+        let outcome = await session.waitDone()
+
+        #expect(synth.texts == ["Hi there."])
+        #expect(outcome == .done)
+    }
 }

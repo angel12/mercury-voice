@@ -167,4 +167,46 @@ struct LiveSessionSnapshotTests {
         let bare = SessionHandle(result: .object(["session_id": .string("rt1")]))!
         #expect(snapshot?.describesSameSession(as: bare) == false)
     }
+
+    // MARK: open_requests (contract ≥ 7)
+
+    @Test func absentOpenRequestsDefaultsToEmpty() throws {
+        let snapshot = LiveSessionSnapshot(result: try json("{\(envelope)}"))
+        #expect(snapshot?.openRequests == [])
+    }
+
+    @Test func decodesOpenRequestsEntries() throws {
+        let snapshot = LiveSessionSnapshot(
+            result: try json(
+                """
+                {\(envelope),
+                 "open_requests": [
+                   {"id": "srq-aaaaaaaaaaaa", "method": "approval", "params": {"session_id": "rt1"}}
+                 ]}
+                """))
+        #expect(snapshot?.openRequests.count == 1)
+        #expect(snapshot?.openRequests.first?.id == "srq-aaaaaaaaaaaa")
+        #expect(snapshot?.openRequests.first?.method == "approval")
+    }
+
+    @Test func openRequestsThatIsNotAnArrayFailsTheSnapshot() throws {
+        #expect(
+            LiveSessionSnapshot(result: try json("{\(envelope), \"open_requests\": {}}")) == nil)
+        #expect(
+            LiveSessionSnapshot(result: try json("{\(envelope), \"open_requests\": \"x\"}"))
+                == nil)
+    }
+
+    /// An entry that fails to decode as a `ServerRequest` fails the whole
+    /// snapshot closed, the same way an unusable `pending_clarify` does —
+    /// silently dropping the entry would let the caller believe fewer
+    /// requests are open than the backend actually has outstanding.
+    @Test func openRequestsWithAnUndecodableEntryFailsClosed() throws {
+        #expect(
+            LiveSessionSnapshot(
+                result: try json(
+                    """
+                    {\(envelope), "open_requests": [{"method": "approval"}]}
+                    """)) == nil)
+    }
 }

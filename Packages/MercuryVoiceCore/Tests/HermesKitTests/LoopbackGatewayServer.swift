@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import Network
 
+@testable import HermesKit
+
 /// A real WebSocket gateway on 127.0.0.1 with an OS-assigned port, so
 /// `GatewayClient` is exercised over an actual `URLSessionWebSocketTask`
 /// against actual bytes.
@@ -25,8 +27,14 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     /// like (no status code ever reaches the client).
     private let dropsUpgrade: Bool
     private let onOpen: @Sendable (LoopbackGatewayServer) -> Void
+    /// False lets a test hold back the `client.capabilities` reply and fire
+    /// it explicitly via `answerCapabilities(asError:)`, to pin down the
+    /// ordering against `.phase(.ready)`.
+    private let autoAnswersCapabilities: Bool
     private var peers: [ObjectIdentifier: Peer] = [:]
     private var _upgradeAttempts = 0
+    private var _receivedFrames: [JSONValue] = []
+    private var _pendingCapabilitiesID: Int?
     private(set) var port: UInt16 = 0
 
     /// One accepted TCP connection: its socket, its unparsed bytes, and
@@ -47,6 +55,7 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     static func start(
         refuseUpgradeWith: Int? = nil,
         dropsUpgrade: Bool = false,
+        autoAnswersCapabilities: Bool = true,
         onOpen: @escaping @Sendable (LoopbackGatewayServer) -> Void = { server in
             server.sendEvent(type: "gateway.ready")
         }
@@ -57,7 +66,8 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         let listener = try NWListener(using: parameters)
         let server = LoopbackGatewayServer(
             listener: listener, refuseUpgradeWith: refuseUpgradeWith,
-            dropsUpgrade: dropsUpgrade, onOpen: onOpen)
+            dropsUpgrade: dropsUpgrade, autoAnswersCapabilities: autoAnswersCapabilities,
+            onOpen: onOpen)
         try await server.waitUntilReady()
         return server
     }
@@ -66,11 +76,13 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         listener: NWListener,
         refuseUpgradeWith: Int?,
         dropsUpgrade: Bool,
+        autoAnswersCapabilities: Bool,
         onOpen: @escaping @Sendable (LoopbackGatewayServer) -> Void
     ) {
         self.listener = listener
         self.refuseUpgradeWith = refuseUpgradeWith
         self.dropsUpgrade = dropsUpgrade
+        self.autoAnswersCapabilities = autoAnswersCapabilities
         self.onOpen = onOpen
         // Installed before start(): a started NWListener without a
         // newConnectionHandler fails with EINVAL.
@@ -133,7 +145,10 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     private func drain(_ connection: NWConnection) {
         let key = ObjectIdentifier(connection)
         let needsHandshake = lock.withLock { peers[key].map { !$0.handshaken } ?? false }
-        guard needsHandshake else { return }  // client frames are ignored
+        guard needsHandshake else {
+            handleClientFrames(connection)
+            return
+        }
         guard let response = lock.withLock({ takeHandshakeLocked(key) }) else { return }
         if dropsUpgrade {
             drop(connection)
@@ -187,6 +202,112 @@ final class LoopbackGatewayServer: @unchecked Sendable {
                 + "Connection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n").utf8)
     }
 
+    // MARK: Client → server
+
+    /// Every frame the client has sent, decoded and in arrival order — so a
+    /// test can assert both `client.capabilities` is first *and* what params
+    /// it carried, without racing the auto-answer below.
+    var receivedFrames: [JSONValue] {
+        lock.withLock { _receivedFrames }
+    }
+
+    /// The JSON-RPC `method` of every frame the client has sent, in arrival
+    /// order.
+    var receivedMethods: [String] {
+        receivedFrames.compactMap { $0["method"]?.stringValue }
+    }
+
+    /// Parse whatever complete WebSocket frames are sitting in `connection`'s
+    /// pending bytes. `client.capabilities` — the only request the supervisor
+    /// sends before a test's own `onOpen` script runs — is auto-answered
+    /// unless `autoAnswersCapabilities` is false, in which case its id is
+    /// captured for `answerCapabilities(result:)` to reply on cue; nothing
+    /// else here needs a generic RPC dispatcher. Client frames are masked per
+    /// RFC 6455 §5.3; unmask before decoding.
+    ///
+    /// Recording the frame and capturing the pending capabilities id happen
+    /// under the same lock acquisition: splitting them let a fast test call
+    /// `answerCapabilities()` between the two and find no id yet (issue found
+    /// in review, round 1).
+    private func handleClientFrames(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        while true {
+            let payload: Data? = lock.withLock {
+                guard let peer = peers[key] else { return nil }
+                guard let (opcode, unmasked, consumed) = Self.takeFrame(peer.pending) else {
+                    return nil
+                }
+                peer.pending.removeSubrange(..<consumed)
+                return opcode == 0x1 ? unmasked : nil
+            }
+            guard let payload else { break }
+            guard let text = String(data: payload, encoding: .utf8),
+                let data = text.data(using: .utf8),
+                let frame = try? JSONDecoder().decode(JSONValue.self, from: data)
+            else { continue }
+            let isCapabilities = frame["method"]?.stringValue == "client.capabilities"
+            let requestID = frame["id"]?.intValue
+            lock.withLock {
+                _receivedFrames.append(frame)
+                if isCapabilities, let requestID, !autoAnswersCapabilities {
+                    _pendingCapabilitiesID = requestID
+                }
+            }
+            guard isCapabilities, let requestID else { continue }
+            if autoAnswersCapabilities {
+                send(#"{"jsonrpc":"2.0","id":\#(requestID),"result":{}}"#)
+            }
+        }
+    }
+
+    /// Reply to the `client.capabilities` request captured while
+    /// `autoAnswersCapabilities` is false. `asError` sends `-32601` instead,
+    /// the way a contract-6 backend answers.
+    func answerCapabilities(asError: Bool = false) {
+        guard let id = lock.withLock({ _pendingCapabilitiesID }) else { return }
+        if asError {
+            send(#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32601,"message":"method not found"}}"#)
+        } else {
+            send(#"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#)
+        }
+    }
+
+    /// Decode one masked client WebSocket frame from the front of `bytes`.
+    /// Returns the opcode, the unmasked payload, and how many bytes to
+    /// consume — or nil while the frame is not fully buffered yet. Only the
+    /// single-frame (FIN=1, no fragmentation) case is handled; that is all a
+    /// small JSON-RPC request ever produces.
+    private static func takeFrame(_ bytes: [UInt8]) -> (opcode: UInt8, payload: Data, consumed: Int)? {
+        guard bytes.count >= 2 else { return nil }
+        let opcode = bytes[0] & 0x0F
+        let masked = bytes[1] & 0x80 != 0
+        var lengthByte = Int(bytes[1] & 0x7F)
+        var offset = 2
+        if lengthByte == 126 {
+            guard bytes.count >= offset + 2 else { return nil }
+            lengthByte = Int(bytes[offset]) << 8 | Int(bytes[offset + 1])
+            offset += 2
+        } else if lengthByte == 127 {
+            guard bytes.count >= offset + 8 else { return nil }
+            var extended = 0
+            for i in 0..<8 { extended = (extended << 8) | Int(bytes[offset + i]) }
+            lengthByte = extended
+            offset += 8
+        }
+        var maskKey: [UInt8] = []
+        if masked {
+            guard bytes.count >= offset + 4 else { return nil }
+            maskKey = Array(bytes[offset..<offset + 4])
+            offset += 4
+        }
+        guard bytes.count >= offset + lengthByte else { return nil }
+        var payloadBytes = Array(bytes[offset..<offset + lengthByte])
+        if masked {
+            for i in 0..<payloadBytes.count { payloadBytes[i] ^= maskKey[i % 4] }
+        }
+        return (opcode, Data(payloadBytes), offset + lengthByte)
+    }
+
     // MARK: Server → client
 
     private func sendFrame(opcode: UInt8, payload: Data) {
@@ -235,6 +356,18 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         }
         for connection in open { connection.cancel() }
         listener.cancel()
+    }
+
+    /// Kill every open peer connection without stopping the listener — models
+    /// a transport loss (network reset, backend restart) mid-flight, while a
+    /// request the client is awaiting is still outstanding.
+    func dropConnections() {
+        let open = lock.withLock {
+            let open = peers.values.map(\.connection)
+            peers = [:]
+            return open
+        }
+        for connection in open { connection.cancel() }
     }
 
     deinit { listener.cancel() }

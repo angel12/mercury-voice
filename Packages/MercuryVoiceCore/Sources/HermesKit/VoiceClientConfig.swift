@@ -52,6 +52,11 @@ public struct DirectSTTConfig: Sendable, Equatable {
     public var apiKey: String
     public var model: String?
     public var language: String?
+    /// `stt.openai.timeout` — the gateway's own transcription-request
+    /// deadline; nil when absent, zero, negative, or not a number (falls
+    /// back to 60s at the call site, matching the desktop's
+    /// `sttTimeoutSeconds`).
+    public var timeoutS: Double?
 
     /// nil for relay verdicts, unknown wires, or malformed configs — all of
     /// which mean "use the relay endpoint".
@@ -68,6 +73,11 @@ public struct DirectSTTConfig: Sendable, Equatable {
         self.apiKey = apiKey
         self.model = json["model"]?.stringValue
         self.language = json["language"]?.stringValue
+        if let timeoutS = json["timeout_s"]?.doubleValue, timeoutS > 0 {
+            self.timeoutS = timeoutS
+        } else {
+            self.timeoutS = nil
+        }
     }
 }
 
@@ -88,6 +98,14 @@ public struct DirectTTSConfig: Sendable, Equatable {
     public var model: String?
     public var voice: String?
     public var speed: Double?
+    /// `tts.streaming.min_len` — shortest sentence (chars) the cutter emits
+    /// on its own; nil when absent, zero, negative, or not a number (falls
+    /// back to `SentenceCutter.minSentenceChars` at the call site).
+    public var minLen: Int?
+    /// `tts.openai` fields the server forwards verbatim (`lang_code`,
+    /// `consent_attestation`, …) — openai-speech wire only. nil when absent
+    /// or not a JSON object.
+    public var extraBody: [String: JSONValue]?
 
     public init?(json: JSONValue) {
         guard json["mode"]?.stringValue == "direct",
@@ -103,5 +121,11 @@ public struct DirectTTSConfig: Sendable, Equatable {
         self.model = json["model"]?.stringValue
         self.voice = json["voice"]?.stringValue
         self.speed = json["speed"]?.doubleValue
+        if let minLen = json["min_len"]?.intValue, minLen > 0 {
+            self.minLen = minLen
+        } else {
+            self.minLen = nil
+        }
+        self.extraBody = json["extra_body"]?.objectValue
     }
 }

@@ -75,6 +75,117 @@ struct VoiceClientConfigDecodingTests {
         #expect(DirectSTTConfig(json: .object(stt)) != nil)
         #expect(DirectTTSConfig(json: .object(tts)) != nil)
     }
+
+    // MARK: - stt.timeout_s (`stt.openai.timeout`, default 60)
+
+    @Test func timeoutSDecodesWhenPresentAndPositive() throws {
+        let stt = try #require(
+            DirectSTTConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-multipart", "base_url": "https://x.example",
+                     "api_key": "k", "timeout_s": 45}
+                    """)))
+        #expect(stt.timeoutS == 45)
+    }
+
+    @Test func timeoutSIsNilWhenAbsent() throws {
+        let stt = try #require(
+            DirectSTTConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-multipart", "base_url": "https://x.example",
+                     "api_key": "k"}
+                    """)))
+        #expect(stt.timeoutS == nil)
+    }
+
+    @Test(arguments: ["0", "-5", "\"soon\"", "null"])
+    func timeoutSIsNilWhenNonPositiveOrInvalid(literal: String) throws {
+        let stt = try #require(
+            DirectSTTConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-multipart", "base_url": "https://x.example",
+                     "api_key": "k", "timeout_s": \(literal)}
+                    """)))
+        #expect(stt.timeoutS == nil)
+    }
+
+    // MARK: - tts.min_len (`tts.streaming.min_len`)
+
+    @Test func minLenDecodesWhenPresentAndPositive() throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k", "min_len": 7}
+                    """)))
+        #expect(tts.minLen == 7)
+    }
+
+    @Test func minLenIsNilWhenAbsent() throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k"}
+                    """)))
+        #expect(tts.minLen == nil)
+    }
+
+    @Test(arguments: ["0", "-3", "\"seven\"", "null"])
+    func minLenIsNilWhenNonPositiveOrInvalid(literal: String) throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k", "min_len": \(literal)}
+                    """)))
+        #expect(tts.minLen == nil)
+    }
+
+    // MARK: - tts.extra_body (openai-speech wire only, forwarded verbatim)
+
+    @Test func extraBodyDecodesArbitraryJSONWhenPresent() throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k",
+                     "extra_body": {"lang_code": "en", "consent_attestation": true, "n": 3}}
+                    """)))
+        #expect(tts.extraBody?["lang_code"]?.stringValue == "en")
+        #expect(tts.extraBody?["consent_attestation"]?.boolValue == true)
+        #expect(tts.extraBody?["n"]?.intValue == 3)
+    }
+
+    @Test func extraBodyIsNilWhenAbsent() throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k"}
+                    """)))
+        #expect(tts.extraBody == nil)
+    }
+
+    @Test(arguments: ["\"not-an-object\"", "[1,2]", "42", "null"])
+    func extraBodyIsNilWhenNotAnObject(literal: String) throws {
+        let tts = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "base_url": "https://x.example",
+                     "api_key": "k", "extra_body": \(literal)}
+                    """)))
+        #expect(tts.extraBody == nil)
+    }
 }
 
 @Suite("Event replay decoding (reconnect contract)")
