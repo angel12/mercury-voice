@@ -506,6 +506,16 @@ struct ClarifySheet: View {
         _batch = State(initialValue: request.questions.isEmpty ? nil : ClarifyBatch(request))
     }
 
+    /// The controller's current locks for *this* request, nil once the
+    /// controller holds a different (or no) clarify — so a sheet on its way
+    /// out never rebases on another request's locks (PR #126 review).
+    private var liveLockedAnswers: [String: String]? {
+        guard let live = controller.clarify, live.requestID == request.requestID else {
+            return nil
+        }
+        return live.lockedAnswers
+    }
+
     /// The question on screen: the batch's current page, or the request's
     /// own single question outside a batch.
     private var question: String {
@@ -581,8 +591,13 @@ struct ClarifySheet: View {
         // follow, or it would still ask — and submit — a locked question.
         // When the lock took the last open page, the rest are answered, so
         // this submits exactly as answering that page would have.
-        .onChange(of: request.lockedAnswers) { _, locked in
-            guard var batch else { return }
+        //
+        // Read from the controller, not the `request` snapshot: that only
+        // refreshes if the parent re-renders, and the parent's body reads
+        // `controller.clarify` only inside the sheet binding's closure.
+        // Reading it here makes this view observe the locks itself.
+        .onChange(of: liveLockedAnswers) { _, locked in
+            guard let locked, var batch else { return }
             if let completed = batch.rebase(lockedAnswers: locked) {
                 controller.respondClarify(answers: completed)
             }
