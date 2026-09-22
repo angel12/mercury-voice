@@ -16,7 +16,7 @@ import VoiceEngine
 /// read reports.
 final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private let lock = NSLock()
-    private var resumeAnswers: [JSONValue] = []
+    private var resumeAnswers: [Result<JSONValue, any Error>] = []
     private var createAnswers: [JSONValue] = []
     private var batches: [Result<EventReplayBatch, any Error>] = []
     private var activations: [Result<JSONValue, any Error>] = []
@@ -62,7 +62,14 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
 
     // MARK: Scripting
 
-    func enqueueResume(_ result: JSONValue) { lock.withLock { resumeAnswers.append(result) } }
+    func enqueueResume(_ result: JSONValue) {
+        lock.withLock { resumeAnswers.append(.success(result)) }
+    }
+    /// Script `session.resume` failing — e.g. a 4009 reattach refusal while
+    /// a client-gone interrupt settles (issue #125).
+    func enqueueResumeFailure(_ error: any Error) {
+        lock.withLock { resumeAnswers.append(.failure(error)) }
+    }
     func enqueueCreate(_ result: JSONValue) { lock.withLock { createAnswers.append(result) } }
     func enqueueBatch(_ batch: EventReplayBatch) {
         lock.withLock { batches.append(.success(batch)) }
@@ -130,10 +137,10 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func resumeSession(storedID: String, profile: String?) async throws -> SessionHandle {
         lock.withLock { _resumedIDs.append(storedID) }
         if let resumeGate { await resumeGate.arrive() }
-        let next: JSONValue? = lock.withLock {
+        let next: Result<JSONValue, any Error>? = lock.withLock {
             resumeAnswers.isEmpty ? nil : resumeAnswers.removeFirst()
         }
-        guard let next, let handle = SessionHandle(result: next) else {
+        guard let next, let handle = SessionHandle(result: try next.get()) else {
             throw HermesError.malformedResponse("no scripted session.resume answer")
         }
         return handle

@@ -128,6 +128,7 @@ final class ConversationController {
         private let lock = NSLock()
         private var _runtimeID: String?
         private var _storedID: String?
+        private var _recover: (@Sendable (_ reResume: Bool) async -> Bool)?
 
         var runtimeID: String? {
             get {
@@ -153,6 +154,13 @@ final class ConversationController {
                 _storedID = newValue
                 lock.unlock()
             }
+        }
+
+        /// The controller's reattach-refusal recovery (issue #125), set once
+        /// in init; the tracker's submit closure cannot capture self.
+        var recover: (@Sendable (_ reResume: Bool) async -> Bool)? {
+            get { lock.withLock { _recover } }
+            set { lock.withLock { _recover = newValue } }
         }
     }
 
@@ -203,6 +211,8 @@ final class ConversationController {
     private let trackerResets = TrackerResets()
     private let trackerResetRequested: (@MainActor @Sendable () -> Void)?
     private let trackerPumpWillJoin: (@MainActor @Sendable () -> Void)?
+    /// Backoff before a reattach-refusal retry; seamed so tests don't wait.
+    private let retryDelay: @Sendable (Duration) async throws -> Void
 
     init(
         connection: HermesConnection,
@@ -214,13 +224,15 @@ final class ConversationController {
         beforeTrackerEvent: (@Sendable (GatewayEvent) async -> Void)? = nil,
         trackerResetRequested: (@MainActor @Sendable () -> Void)? = nil,
         trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil,
-        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil
+        submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil,
+        retryDelay: (@Sendable (Duration) async throws -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
         self.audio = audio
         self.trackerResetRequested = trackerResetRequested
         self.trackerPumpWillJoin = trackerPumpWillJoin
+        self.retryDelay = retryDelay ?? { try await Task.sleep(for: $0) }
         self.capture = capture ?? .shared
         self.profile = profile
         self.profileName = profile
@@ -236,18 +248,35 @@ final class ConversationController {
         let box = sessionBox
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
-                guard let sid = box.runtimeID else { throw HermesError.notConnected }
-                if let submitPrompt {
-                    try await submitPrompt(sid, text, interrupted)
-                } else {
-                    try await connection.submitPrompt(
-                        sessionID: sid, text: text, interrupted: interrupted)
+                @Sendable func send() async throws {
+                    guard let sid = box.runtimeID else { throw HermesError.notConnected }
+                    if let submitPrompt {
+                        try await submitPrompt(sid, text, interrupted)
+                    } else {
+                        try await connection.submitPrompt(
+                            sessionID: sid, text: text, interrupted: interrupted)
+                    }
+                }
+                do {
+                    try await send()
+                } catch let error as HermesError
+                    where error.isSessionNotLive || error.isInterruptSettling
+                {
+                    // Reattach refusals (issue #125) come before the gateway
+                    // accepts the prompt, so exactly one resubmit cannot
+                    // duplicate the turn. A second refusal surfaces as-is.
+                    guard await box.recover?(error.isSessionNotLive) == true else { throw error }
+                    try await send()
                 }
             },
             interrupt: {
                 guard let sid = box.runtimeID else { return }
                 try? await connection.interruptSession(sessionID: sid)
             })
+
+        box.recover = { [weak self] reResume in
+            await self?.recoverRefusedSubmit(reResume: reResume) ?? false
+        }
 
         let (stream, continuation) = AsyncStream.makeStream(of: TrackerInput.self)
         trackerEventContinuation = continuation
@@ -1231,8 +1260,18 @@ final class ConversationController {
             }
         }
         do {
-            let handle = try await sessionService.resumeSession(
-                storedID: storedID, profile: profile)
+            let handle: SessionHandle
+            do {
+                handle = try await sessionService.resumeSession(
+                    storedID: storedID, profile: profile)
+            } catch let error as HermesError where error.isInterruptSettling {
+                // The previous socket's client-gone interrupt is still
+                // settling (issue #125): wait once rather than abandon.
+                try await retryDelay(.milliseconds(500))
+                guard !isTornDown else { return }
+                handle = try await sessionService.resumeSession(
+                    storedID: storedID, profile: profile)
+            }
             guard !isTornDown else {
                 // Teardown owns the old runtime; consume it only if it has
                 // not already been closed. A cold resume returned a new
@@ -1298,6 +1337,20 @@ final class ConversationController {
             guard !isTornDown else { return }
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
         }
+    }
+
+    /// One recovery step before resubmitting a reattach-refused prompt
+    /// (issue #125): 4007 re-runs the reconnect resume so the retry routes to
+    /// the live runtime, 4009 waits out the settling interrupt. False when
+    /// the conversation ended meanwhile — the refusal then surfaces.
+    private func recoverRefusedSubmit(reResume: Bool) async -> Bool {
+        guard !isTornDown else { return false }
+        if reResume {
+            await connectionBecameReady(isReconnect: true)
+        } else {
+            guard (try? await retryDelay(.milliseconds(500))) != nil else { return false }
+        }
+        return !isTornDown
     }
 
     /// Fetch the frames missed during the outage, or nil when a lossless

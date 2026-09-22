@@ -79,4 +79,33 @@ struct RPCErrorReasonTests {
         let error = HermesError.rpcError(code: 4007, message: "session not found", data: .null)
         #expect(error.errorDescription == "Hermes error 4007: session not found")
     }
+
+    // Reattach refusals (tui_gateway session_lifecycle `_reattach_refusal`):
+    // issued before prompt.submit accepts anything, so one resubmit is safe.
+
+    @Test func sessionNotLiveIsClassifiedByCode() {
+        let error = HermesError.rpcError(
+            code: 4007, message: "session no longer live; retry resume", data: nil)
+        #expect(error.isSessionNotLive)
+        #expect(!error.isInterruptSettling)
+    }
+
+    @Test func interruptSettlingIsClassifiedByCode() {
+        let error = HermesError.rpcError(
+            code: 4009, message: "session disconnect interrupt settling", data: nil)
+        #expect(error.isInterruptSettling)
+        #expect(!error.isSessionNotLive)
+    }
+
+    @Test func reattachClassifiersIgnoreOtherErrors() {
+        let others: [HermesError] = [
+            .notConnected,
+            .rpcError(code: 4090, message: "refused", data: nil),
+            .connectionClosed(nil),
+        ]
+        for error in others {
+            #expect(!error.isSessionNotLive)
+            #expect(!error.isInterruptSettling)
+        }
+    }
 }

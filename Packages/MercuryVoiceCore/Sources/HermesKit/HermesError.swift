@@ -83,4 +83,19 @@ public enum HermesError: Error, LocalizedError, Sendable {
         guard case .rpcError(_, _, let data) = self else { return nil }
         return data?["reason"]?.stringValue
     }
+
+    /// 4007 from a reattaching RPC: the live session was replaced under us
+    /// ("session no longer live; retry resume"). On `prompt.submit` it is a
+    /// refusal issued before the prompt is accepted — re-resume and resubmit.
+    public var isSessionNotLive: Bool { rpcCode == RPCCode.sessionNotFound }
+
+    /// 4009 from a reattaching RPC: a client-gone interrupt is still settling.
+    /// The same code also carries prompt.submit's other pre-acceptance busy
+    /// refusals, so a short wait and one resubmit is safe for all of them.
+    public var isInterruptSettling: Bool { rpcCode == RPCCode.sessionBusy }
+
+    private var rpcCode: Int? {
+        guard case .rpcError(let code, _, _) = self else { return nil }
+        return code
+    }
 }
