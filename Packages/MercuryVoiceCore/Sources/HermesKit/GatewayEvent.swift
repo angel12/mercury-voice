@@ -50,6 +50,11 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let notificationShow = "notification.show"
         public static let sessionReclaimed = "session.reclaimed"
         public static let error = "error"
+        /// Client-local: a server→client request routed as an event
+        /// (`GatewayEvent(serverRequest:)`). Never appears on the wire.
+        public static let serverRequest = "mercury.server_request"
+        /// Contract ≥ 7: withdraws an open server request `{id, method, reason}`.
+        public static let requestCancel = "request.cancel"
     }
 }
 

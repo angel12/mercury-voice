@@ -400,7 +400,7 @@ public actor GatewayClient {
         else { return }
 
         // Only frames with method == "event" and params.type are events;
-        // everything else is a response.
+        // everything else is a response or a server request.
         if frame["method"]?.stringValue == "event",
             let params = frame["params"], let event = GatewayEvent(eventParams: params)
         {
@@ -418,6 +418,16 @@ public actor GatewayClient {
             return
         }
 
+        if let request = ServerRequest(frame: frame) {
+            if ServerRequest.answerableMethods.contains(request.method) {
+                let event = GatewayEvent(serverRequest: request)
+                for sub in subscribers.values { sub.yield(event) }
+            } else {
+                refuse(request)
+            }
+            return
+        }
+
         guard let id = frame["id"]?.intValue, let cont = pending.removeValue(forKey: id) else {
             return
         }
@@ -430,5 +440,25 @@ public actor GatewayClient {
         } else {
             cont.resume(returning: frame["result"] ?? .null)
         }
+    }
+
+    /// JSON-RPC "method not found" for a server request this app cannot
+    /// render, so the backend's `send()` returns at once instead of parking
+    /// the agent until its deadline. Fire-and-forget: a lost write is a lost
+    /// socket, and the request then reaches `open_requests` anyway.
+    private func refuse(_ request: ServerRequest) {
+        guard let task else { return }
+        let frame: JSONValue = .object([
+            "jsonrpc": "2.0",
+            "id": .string(request.id),
+            "error": .object([
+                "code": .number(-32601),
+                "message": .string("\(request.method) is not supported by Mercury Voice"),
+            ]),
+        ])
+        guard let data = try? JSONEncoder().encode(frame),
+            let text = String(data: data, encoding: .utf8)
+        else { return }
+        task.sendText(text) { _ in }
     }
 }
