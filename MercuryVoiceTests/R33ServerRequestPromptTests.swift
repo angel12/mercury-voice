@@ -343,6 +343,135 @@ struct R33ServerRequestPromptTests {
         await controller.teardown()
     }
 
+    // MARK: Batch clarify (issue #125 Task 5)
+
+    private func srqClarifyBatch(
+        id: String = "srq-b1",
+        questions: [(qid: String, question: String, choices: [String], multiSelect: Bool)] = [
+            (qid: "q1", question: "Which branch?", choices: [], multiSelect: false),
+            (qid: "q2", question: "Which env?", choices: [], multiSelect: false),
+        ],
+        lockedAnswers: [String: String] = [:]
+    ) -> JSONValue {
+        Fixtures.clarifyBatchServerRequest(
+            id: id, sessionID: Self.runtimeID, questions: questions, lockedAnswers: lockedAnswers)
+    }
+
+    @Test("an srq batch clarify presents with its questions and no locked answers pre-asked")
+    func srqBatchClarifyPresents() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+
+        #expect(controller.clarify?.serverRequestID == "srq-b1")
+        #expect(controller.clarify?.questions.map(\.qid) == ["q1", "q2"])
+        await controller.teardown()
+    }
+
+    @Test("a batch's spoken notice counts the unlocked questions")
+    func batchNoticeCountsUnlockedQuestions() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+
+        controller.handle(
+            event: Fixtures.serverRequestEvent(
+                srqClarifyBatch(lockedAnswers: ["q1": "main"])))
+        await controller.awaitPromptAnnouncements()
+
+        #expect(speech.spoken == ["Hermes has 1 questions for you."])
+        await controller.teardown()
+    }
+
+    @Test("answering a 2-question batch sends one answers object with both qids")
+    func answeringABatchSendsOneAnswersObject() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        try #require(controller.clarify != nil)
+
+        controller.respondClarify(answers: ["q1": "main", "q2": "prod"])
+        await controller.awaitPromptResponse()
+
+        #expect(
+            service.promptResponses == [
+                .requestAnswer(
+                    params: answerParams(
+                        id: "srq-b1",
+                        [
+                            "answers": .object([
+                                "q1": .string("main"), "q2": .string("prod"),
+                            ])
+                        ]))
+            ])
+        #expect(controller.clarify == nil)
+        await controller.teardown()
+    }
+
+    @Test("pre-locked answers are included in the final submission without being re-asked")
+    func lockedAnswersAreIncludedInFinalSubmission() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(
+            event: Fixtures.serverRequestEvent(
+                srqClarifyBatch(lockedAnswers: ["q1": "main"])))
+        try #require(controller.clarify != nil)
+
+        // Only q2 is still open; the final submission must still carry q1.
+        controller.respondClarify(answers: ["q1": "main", "q2": "prod"])
+        await controller.awaitPromptResponse()
+
+        #expect(
+            service.promptResponses == [
+                .requestAnswer(
+                    params: answerParams(
+                        id: "srq-b1",
+                        [
+                            "answers": .object([
+                                "q1": .string("main"), "q2": .string("prod"),
+                            ])
+                        ]))
+            ])
+        await controller.teardown()
+    }
+
+    @Test("Skip all sends an empty result, not an empty answers object")
+    func skipAllSendsEmptyResult() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        try #require(controller.clarify != nil)
+
+        controller.respondClarify(answers: [:])
+        await controller.awaitPromptResponse()
+
+        #expect(
+            service.promptResponses == [
+                .requestAnswer(params: answerParams(id: "srq-b1", [:]))
+            ])
+        #expect(controller.clarify == nil)
+        await controller.teardown()
+    }
+
+    @Test("respondClarify(answers:) is a no-op on a request without a serverRequestID")
+    func batchAnswersNoOpsOnLegacyClarify() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.clarifyRequest(
+                    sessionID: Self.runtimeID, seq: 11, requestID: "q1",
+                    question: "Which branch?")))
+        try #require(controller.clarify != nil)
+
+        controller.respondClarify(answers: ["q1": "main"])
+
+        #expect(service.promptResponses.isEmpty)
+        #expect(controller.clarify != nil)
+        await controller.teardown()
+    }
+
     @Test("a contract-6 clarify.request is answered through clarify.respond")
     func legacyClarifyUsesClarifyRespond() async throws {
         let service = ScriptedSessionService()

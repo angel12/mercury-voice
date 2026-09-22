@@ -500,6 +500,33 @@ enum Fixtures {
         ])
     }
 
+    /// A contract-7 batch `clarify` server request: `params.questions` carries
+    /// each question and `params.answers` carries whatever the server already
+    /// locked (empty when nothing is locked).
+    static func clarifyBatchServerRequest(
+        id: String, sessionID: String,
+        questions: [(qid: String, question: String, choices: [String], multiSelect: Bool)],
+        lockedAnswers: [String: String] = [:]
+    ) -> JSONValue {
+        let questionsJSON: [JSONValue] = questions.map { q in
+            .object([
+                "qid": .string(q.qid), "question": .string(q.question),
+                "choices": .array(q.choices.map(JSONValue.string)),
+                "multi_select": .bool(q.multiSelect),
+            ])
+        }
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "questions": .array(questionsJSON),
+        ]
+        if !lockedAnswers.isEmpty {
+            params["answers"] = .object(lockedAnswers.mapValues(JSONValue.string))
+        }
+        return .object([
+            "id": .string(id), "method": .string("clarify"), "params": .object(params),
+        ])
+    }
+
     /// The client-local event `GatewayClient` routes a server request frame
     /// down the pipeline as (never seq-stamped).
     static func serverRequestEvent(_ request: JSONValue) -> GatewayEvent {

@@ -942,7 +942,13 @@ final class ConversationController {
         if clarify?.requestID == request.requestID { return }
         clarify = request
         promptSendError = nil
-        announce(.clarify(requestID: request.requestID))
+        let isBatch = !request.questions.isEmpty
+        let remaining =
+            isBatch
+            ? request.questions.filter { request.lockedAnswers[$0.qid] == nil }.count : 1
+        announce(
+            .clarify(requestID: request.requestID, remainingQuestions: remaining, isBatch: isBatch)
+        )
     }
 
     // MARK: Spoken prompt notices
@@ -953,12 +959,20 @@ final class ConversationController {
     /// clarify by its request id.
     private enum PromptNotice {
         case approval(epoch: Int)
-        case clarify(requestID: String)
+        /// `isBatch` distinguishes a `questions`-carrying request (wording
+        /// always counts, even down to its last question — "1 questions" is
+        /// deliberate, matching `ClarifyRequest.questions` being non-empty)
+        /// from a single legacy/srq clarify, which keeps the singular
+        /// phrasing regardless. `remainingQuestions` is the unlocked count.
+        case clarify(requestID: String, remainingQuestions: Int, isBatch: Bool)
 
         var text: String {
             switch self {
             case .approval: "Hermes is asking for approval to run a command."
-            case .clarify: "Hermes has a question for you."
+            case .clarify(_, let remaining, let isBatch):
+                isBatch
+                    ? "Hermes has \(remaining) questions for you."
+                    : "Hermes has a question for you."
             }
         }
     }
@@ -1035,7 +1049,7 @@ final class ConversationController {
         guard !isTornDown, !Task.isCancelled else { return false }
         switch notice {
         case .approval(let epoch): return approval != nil && approvalEpoch == epoch
-        case .clarify(let requestID): return clarify?.requestID == requestID
+        case .clarify(let requestID, _, _): return clarify?.requestID == requestID
         }
     }
 
@@ -1395,6 +1409,36 @@ final class ConversationController {
             } else {
                 try await $0.respondClarify(requestID: requestID, answer: answer)
             }
+        } onConfirmed: { [weak self] in
+            guard let self, self.clarify?.requestID == requestID else { return }
+            self.clarify = nil
+        } applyError: { [weak self] in
+            self?.clarify?.requestID == requestID
+        }
+    }
+
+    /// Answers a batch `clarify` (issue #125 Task 5) with the whole set of
+    /// `qid: answer` pairs at once — locked answers included, since the
+    /// server never re-asks something it already has. `answers` empty means
+    /// "Skip all": `ClarifyResult` treats a result with neither `answer` nor
+    /// `answers` as cancel-all, so that case sends a bare `{}` rather than
+    /// `{"answers": {}}` (`tui_gateway/contracts/server_requests.py`).
+    ///
+    /// Batch answers only exist for a contract-≥7 server request — legacy
+    /// `clarify.request` has no `questions`/`answers` shape to submit, so a
+    /// request without `serverRequestID` is a no-op guard rather than a
+    /// fallback to the single-answer RPC.
+    func respondClarify(answers: [String: String]) {
+        guard let request = clarify, let serverRequestID = request.serverRequestID,
+            !promptResponseInFlight
+        else { return }
+        let requestID = request.requestID
+        let result: JSONValue =
+            answers.isEmpty
+            ? .object([:])
+            : .object(["answers": .object(answers.mapValues(JSONValue.string))])
+        sendPromptResponse {
+            _ = try await $0.answerServerRequest(id: serverRequestID, result: result)
         } onConfirmed: { [weak self] in
             guard let self, self.clarify?.requestID == requestID else { return }
             self.clarify = nil

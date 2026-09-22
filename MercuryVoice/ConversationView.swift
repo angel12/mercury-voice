@@ -495,21 +495,48 @@ struct ClarifySheet: View {
     let controller: ConversationController
     @State private var freeText = ""
     @State private var selected: Set<String> = []
+    /// nil for a single-question request; `ClarifySheet` never constructs
+    /// one in that case, and `submit` reaches straight for `respondClarify
+    /// (answer:)` instead of paging.
+    @State private var batch: ClarifyBatch?
+
+    init(request: ClarifyRequest, controller: ConversationController) {
+        self.request = request
+        self.controller = controller
+        _batch = State(initialValue: request.questions.isEmpty ? nil : ClarifyBatch(request))
+    }
+
+    /// The question on screen: the batch's current page, or the request's
+    /// own single question outside a batch.
+    private var question: String {
+        batch != nil ? (batch?.current?.question ?? "") : request.question
+    }
+    private var choices: [String] {
+        batch != nil ? (batch?.current?.choices ?? []) : request.choices
+    }
+    private var multiSelect: Bool {
+        batch != nil ? (batch?.current?.multiSelect ?? false) : request.multiSelect
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Hermes asks", systemImage: "questionmark.bubble")
                 .font(.title2.bold())
-            Text(request.question)
+            if let batch {
+                Text("Question \(batch.questionNumber) of \(batch.totalQuestions)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(question)
 
-            if request.choices.isEmpty {
+            if choices.isEmpty {
                 TextField("Your answer", text: $freeText)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { controller.respondClarify(answer: freeText) }
-                Button("Send") { controller.respondClarify(answer: freeText) }
+                    .onSubmit { submit(freeText) }
+                Button("Send") { submit(freeText) }
                     .buttonStyle(.borderedProminent)
-            } else if request.multiSelect {
-                ForEach(request.choices, id: \.self) { choice in
+            } else if multiSelect {
+                ForEach(choices, id: \.self) { choice in
                     Toggle(
                         choice,
                         isOn: Binding(
@@ -519,16 +546,14 @@ struct ClarifySheet: View {
                             }))
                 }
                 Button("Send") {
-                    controller.respondClarify(
-                        answer: request.choices.filter(selected.contains)
-                            .joined(separator: ", "))
+                    submit(choices.filter(selected.contains).joined(separator: ", "))
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(selected.isEmpty)
             } else {
-                ForEach(request.choices, id: \.self) { choice in
+                ForEach(choices, id: \.self) { choice in
                     Button {
-                        controller.respondClarify(answer: choice)
+                        submit(choice)
                     } label: {
                         Text(choice).frame(maxWidth: .infinity)
                     }
@@ -536,8 +561,18 @@ struct ClarifySheet: View {
                 }
             }
 
-            Button("Skip") { controller.respondClarify(answer: "") }
-                .buttonStyle(.borderless)
+            if batch != nil {
+                HStack {
+                    Button("Skip") { submit("") }
+                        .buttonStyle(.borderless)
+                    Spacer()
+                    Button("Skip all") { controller.respondClarify(answers: [:]) }
+                        .buttonStyle(.borderless)
+                }
+            } else {
+                Button("Skip") { controller.respondClarify(answer: "") }
+                    .buttonStyle(.borderless)
+            }
             PromptSendStatus(controller: controller)
         }
         .disabled(controller.promptResponseInFlight)
@@ -547,5 +582,23 @@ struct ClarifySheet: View {
         #else
             .presentationDetents([.medium])
         #endif
+    }
+
+    /// Records `answer` for the question on screen. Inside a batch this
+    /// advances the paging state and only reaches the controller once every
+    /// question (locked ones included) has an answer; outside a batch it
+    /// answers immediately, as before.
+    private func submit(_ answer: String) {
+        freeText = ""
+        selected = []
+        if var batch {
+            if let completed = batch.recordAndAdvance(answer) {
+                controller.respondClarify(answers: completed)
+            } else {
+                self.batch = batch
+            }
+        } else {
+            controller.respondClarify(answer: answer)
+        }
     }
 }
