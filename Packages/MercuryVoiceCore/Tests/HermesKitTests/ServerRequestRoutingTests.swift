@@ -5,8 +5,7 @@ import Testing
 
 /// Contract v7 (hermes-agent d3a44784b1): blocking prompts are JSON-RPC
 /// requests the *server* sends, ids `srq-<12hex>`. The client surfaces the
-/// ones it can answer and refuses the rest at once, so the agent does not
-/// park for the 300 s clarify deadline on a frame nobody will answer.
+/// ones it can answer and leaves the rest for another attached client.
 @Suite("Server request routing")
 struct ServerRequestRoutingTests {
     @Test func anApprovalRequestFrameIsSurfacedAsAnEvent() async throws {
@@ -27,17 +26,30 @@ struct ServerRequestRoutingTests {
         await client.close(reason: "test over")
     }
 
-    @Test func anUnsupportedRequestIsRefusedImmediately() async throws {
+    /// An unsupported request (sudo, secret, vault.*, preview, tour, …) is
+    /// dropped: no error reply, no event. The first response frame settles
+    /// a server request for every attached client (upstream
+    /// `resolve_response`), so a refusal would take it away from a
+    /// co-attached desktop that can render it (#125, PR #126 review).
+    /// Proved with more than silence — a supported frame delivered *after*
+    /// the unsupported one is the first event out, and by then the socket
+    /// has still seen no write, so the unsupported frame was provably
+    /// processed and provably produced nothing.
+    @Test func anUnsupportedRequestIsLeftForAnotherClient() async throws {
         let (client, socket) = try await readyGatewayClient()
+        let events = await client.events()
         socket.deliverText(
             #"{"jsonrpc":"2.0","id":"srq-aaaaaaaaaaaa","method":"sudo","params":{"session_id":"s1","command":"x"}}"#
         )
-        await socket.awaitSend(count: 1)
-        let reply = try JSONDecoder().decode(
-            JSONValue.self, from: Data(socket.sentFrames[0].utf8))
-        #expect(reply["id"]?.stringValue == "srq-aaaaaaaaaaaa")
-        #expect(reply["error"]?["code"]?.intValue == -32601)
-        #expect(reply["method"] == nil)
+        socket.deliverText(
+            #"{"jsonrpc":"2.0","id":"srq-0123456789ab","method":"approval","params":{"session_id":"s1","request_id":"a1","command":"ls","choices":["once","deny"]}}"#
+        )
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(await iterator.next())
+        let request = try #require(ServerRequest(event: event))
+        #expect(request.id == "srq-0123456789ab")
+        #expect(request.method == "approval")
+        #expect(socket.sentFrames.isEmpty)
         await client.close(reason: "test over")
     }
 

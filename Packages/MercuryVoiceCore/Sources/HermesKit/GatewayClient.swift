@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The socket surface `GatewayClient` drives. `URLSessionWebSocketTask` is the
 /// only production conformer; tests script one so a reply, a close, a write
@@ -36,6 +37,7 @@ extension URLSessionWebSocketTask: GatewaySocket {
 /// a busy agent turn can legitimately go minutes without a frame — quiet is
 /// NOT dead here, so no read timeout is applied.
 public actor GatewayClient {
+    private static let logger = Logger(subsystem: "MercuryVoice", category: "HermesKit")
     public enum State: Sendable, Equatable {
         case idle
         case connecting
@@ -425,7 +427,19 @@ public actor GatewayClient {
                 let event = GatewayEvent(serverRequest: request)
                 for sub in subscribers.values { sub.yield(event) }
             } else {
-                refuse(request)
+                // Left unanswered on purpose (#125, PR #126 review): the
+                // first response frame for an id settles it for every
+                // attached client (upstream `resolve_response`), and frames
+                // are fanned out to all of them, so an error reply here
+                // would take a sudo/secret/vault.* prompt away from a
+                // co-attached desktop that can render it. If the phone is
+                // the only client the request waits out its server-side
+                // deadline (upstream `_ask`); failing it fast while another
+                // advertising client may be attached would need an upstream
+                // change, since any error response settles the wait.
+                Self.logger.debug(
+                    "left server request \(request.method, privacy: .public) for another client"
+                )
             }
             return
         }
@@ -442,34 +456,5 @@ public actor GatewayClient {
         } else {
             cont.resume(returning: frame["result"] ?? .null)
         }
-    }
-
-    /// JSON-RPC "method not found" for a server request this app cannot
-    /// render, so the backend's `send()` returns at once instead of parking
-    /// the agent until its deadline. Fire-and-forget: a lost write is a lost
-    /// socket, and the request simply stays open server-side.
-    ///
-    /// Only a live frame is refused. An unanswerable entry seen later in
-    /// `open_requests` (sudo, secret, vault.*, …) is deliberately left alone
-    /// — the controller ignores it rather than refusing it — because another
-    /// attached client (the desktop) may still answer it through
-    /// `request.answer` or its own response frame, and a refusal there would
-    /// take that away. Upstream fails a request fast only once every
-    /// attached client is non-advertising; until then it waits on whichever
-    /// client can render it.
-    private func refuse(_ request: ServerRequest) {
-        guard let task else { return }
-        let frame: JSONValue = .object([
-            "jsonrpc": "2.0",
-            "id": .string(request.id),
-            "error": .object([
-                "code": .number(-32601),
-                "message": .string("\(request.method) is not supported by Mercury Voice"),
-            ]),
-        ])
-        guard let data = try? JSONEncoder().encode(frame),
-            let text = String(data: data, encoding: .utf8)
-        else { return }
-        task.sendText(text) { _ in }
     }
 }

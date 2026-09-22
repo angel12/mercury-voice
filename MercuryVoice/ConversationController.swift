@@ -1293,12 +1293,13 @@ final class ConversationController {
     /// lists them, matching `pending_approval`'s oldest-unresolved choice.
     ///
     /// Entries of any other method (sudo, secret, vault.*, …) are ignored,
-    /// deliberately *not* refused the way `GatewayClient` refuses such a live
-    /// frame: the first response to a server request settles it for every
-    /// surface, and another attached client (the desktop) may still answer
-    /// it through `request.answer` or its own response frame. Upstream only
-    /// fails such a request fast when every attached client is
-    /// non-advertising (server_requests.py `_answerable`).
+    /// deliberately *not* refused — as `GatewayClient` also drops such a
+    /// live frame: the first response to a server request settles it
+    /// for every surface, and another attached client (the desktop) may
+    /// still answer it through `request.answer` or its own response frame.
+    /// If the phone is the only client, the request waits out its
+    /// server-side deadline (upstream `_ask`); instant failure while another
+    /// advertising client may be attached would need an upstream change.
     private func adoptPendingPrompts(
         sessionID: String,
         approvalPayload: JSONValue?,
