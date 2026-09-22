@@ -27,6 +27,8 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private var _eventsSinceCalls: [(sessionID: String, lastSeen: Int)] = []
     private var _activatedIDs: [String] = []
     private var _closedIDs: [String] = []
+    private var _promptResponses: [PromptResponse] = []
+    private var answerReplies: [Result<ServerRequestAnswer, any Error>] = []
 
     /// When set, `createSession` suspends here until the test releases it —
     /// the window a second launch has to overlap the first (issue #77).
@@ -42,6 +44,19 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     /// When set, `activateSession` suspends here *after* reading its answer:
     /// the window a live frame has to arrive in *after* the prompt read.
     var activateReturnGate: CallGate?
+    /// When set, every prompt response (`approval.respond`,
+    /// `clarify.respond`, `request.answer`) suspends here after it is
+    /// recorded — the window in which the sheet must still be up.
+    var promptResponseGate: CallGate?
+
+    /// A prompt response the controller sent, in the shape it reached the
+    /// wire. `request.answer` is recorded as its full params object so a test
+    /// pins exactly what the gateway receives (`{id, result}`, nothing else).
+    enum PromptResponse: Equatable {
+        case approvalRespond(sessionID: String, choice: String)
+        case clarifyRespond(requestID: String, answer: String)
+        case requestAnswer(params: JSONValue)
+    }
 
     init(epoch: String? = "epoch-1") { _epoch = epoch }
 
@@ -65,6 +80,14 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func enqueueActivationFailure(_ error: any Error = HermesError.notConnected) {
         lock.withLock { activations.append(.failure(error)) }
     }
+    /// Script the next `request.answer` reply; unscripted replies are
+    /// `.answered`.
+    func enqueueAnswerReply(_ reply: ServerRequestAnswer) {
+        lock.withLock { answerReplies.append(.success(reply)) }
+    }
+    func enqueueAnswerFailure(_ error: any Error = HermesError.notConnected) {
+        lock.withLock { answerReplies.append(.failure(error)) }
+    }
     func setEpoch(_ epoch: String?) { lock.withLock { _epoch = epoch } }
     /// Epoch reported from the moment `activateSession` answers — a backend
     /// restart the fetch-time checks could not have seen.
@@ -82,6 +105,7 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     }
     var activatedIDs: [String] { lock.withLock { _activatedIDs } }
     var closedIDs: [String] { lock.withLock { _closedIDs } }
+    var promptResponses: [PromptResponse] { lock.withLock { _promptResponses } }
 
     // MARK: SessionServicing
 
@@ -154,6 +178,30 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func closeSession(sessionID: String) async -> SessionCloseOutcome {
         lock.withLock { _closedIDs.append(sessionID) }
         return .closed
+    }
+
+    func respondApproval(sessionID: String, choice: String) async throws {
+        lock.withLock {
+            _promptResponses.append(.approvalRespond(sessionID: sessionID, choice: choice))
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+    }
+
+    func respondClarify(requestID: String, answer: String) async throws {
+        lock.withLock {
+            _promptResponses.append(.clarifyRespond(requestID: requestID, answer: answer))
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+    }
+
+    func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer {
+        let reply: Result<ServerRequestAnswer, any Error> = lock.withLock {
+            _promptResponses.append(
+                .requestAnswer(params: ServerRequestAnswer.answerParams(id: id, result: result)))
+            return answerReplies.isEmpty ? .success(.answered) : answerReplies.removeFirst()
+        }
+        if let promptResponseGate { await promptResponseGate.arrive() }
+        return try reply.get()
     }
 }
 
@@ -315,6 +363,7 @@ enum Fixtures {
         running: Bool = false,
         pendingApproval: JSONValue? = nil,
         pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil,
         extra: [String: JSONValue] = [:]
     ) -> JSONValue {
         var object: [String: JSONValue] = [
@@ -328,6 +377,7 @@ enum Fixtures {
         ]
         if let pendingApproval { object["pending_approval"] = pendingApproval }
         if let pendingClarify { object["pending_clarify"] = pendingClarify }
+        if let openRequests { object["open_requests"] = .array(openRequests) }
         for (key, value) in extra { object[key] = value }
         return .object(object)
     }
@@ -340,6 +390,7 @@ enum Fixtures {
         startedAt: Double = 1_700_000_000,
         pendingApproval: JSONValue? = nil,
         pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil,
         running: Bool = false
     ) -> JSONValue {
         livePayload(
@@ -349,6 +400,7 @@ enum Fixtures {
             running: running,
             pendingApproval: pendingApproval,
             pendingClarify: pendingClarify,
+            openRequests: openRequests,
             extra: ["stored_session_id": .string(storedID)])
     }
 
@@ -359,7 +411,8 @@ enum Fixtures {
         startedAt: Double = 1_700_000_000,
         status: String = "idle",
         pendingApproval: JSONValue? = nil,
-        pendingClarify: JSONValue? = nil
+        pendingClarify: JSONValue? = nil,
+        openRequests: [JSONValue]? = nil
     ) -> JSONValue {
         livePayload(
             runtimeID: runtimeID,
@@ -367,7 +420,8 @@ enum Fixtures {
             startedAt: startedAt,
             status: status,
             pendingApproval: pendingApproval,
-            pendingClarify: pendingClarify)
+            pendingClarify: pendingClarify,
+            openRequests: openRequests)
     }
 
     static func approvalPayload(command: String, requestID: String? = nil) -> JSONValue {
@@ -417,6 +471,55 @@ enum Fixtures {
         eventParams(
             type: GatewayEvent.Kind.clarifyExpire, sessionID: sessionID, seq: seq,
             payload: .object(["request_id": .string(requestID)]))
+    }
+
+    /// A contract-7 server→client `approval` request in the shape both the
+    /// live `srq-` frame and an `open_requests` entry share
+    /// (`ServerRequest.snapshot()`): `{id, method, params}`, with the
+    /// session id and the gateway's `request_id` inside `params`.
+    static func approvalServerRequest(
+        id: String, sessionID: String, command: String, requestID: String? = nil
+    ) -> JSONValue {
+        var params = approvalPayload(command: command, requestID: requestID).objectValue ?? [:]
+        params["session_id"] = .string(sessionID)
+        return .object([
+            "id": .string(id), "method": .string("approval"), "params": .object(params),
+        ])
+    }
+
+    /// A contract-7 single-question `clarify` server request; its `id` is the
+    /// correlation id (there is no separate `request_id`).
+    static func clarifyServerRequest(id: String, sessionID: String, question: String)
+        -> JSONValue
+    {
+        .object([
+            "id": .string(id), "method": .string("clarify"),
+            "params": .object([
+                "session_id": .string(sessionID), "question": .string(question),
+            ]),
+        ])
+    }
+
+    /// The client-local event `GatewayClient` routes a server request frame
+    /// down the pipeline as (never seq-stamped).
+    static func serverRequestEvent(_ request: JSONValue) -> GatewayEvent {
+        guard let decoded = ServerRequest(snapshot: request) else {
+            fatalError("malformed server request fixture")
+        }
+        return GatewayEvent(serverRequest: decoded)
+    }
+
+    /// `request.cancel {id, method, reason}` — a normal, seq-stamped wire
+    /// event withdrawing server request `id`.
+    static func requestCancel(
+        sessionID: String, seq: Int, id: String, method: String = "approval",
+        reason: String = "resolved"
+    ) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.requestCancel, sessionID: sessionID, seq: seq,
+            payload: .object([
+                "id": .string(id), "method": .string(method), "reason": .string(reason),
+            ]))
     }
 
     static func messageComplete(sessionID: String, seq: Int, text: String = "ok") -> JSONValue {

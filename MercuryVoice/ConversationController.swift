@@ -54,8 +54,16 @@ final class ConversationController {
     // confirmed responses and authoritative reconnect reads. Cancellation is
     // synchronous and scoped to that notice, not the shared speech output.
     var approval: ApprovalRequest? {
-        willSet { approvalAnnouncement?.cancel() }
+        willSet {
+            guard !stampingApprovalInPlace else { return }
+            approvalAnnouncement?.cancel()
+        }
     }
+    /// True only while `present(approval:)` stamps an srq id onto the sheet
+    /// already on screen (issue #125). That write is the *same* prompt, so
+    /// the notice announcing it must survive it — cancelling would leave
+    /// the prompt unannounced when the upgrade lands before it is spoken.
+    private var stampingApprovalInPlace = false
     var clarify: ClarifyRequest? {
         willSet { clarifyAnnouncement?.cancel() }
     }
@@ -727,6 +735,10 @@ final class ConversationController {
         GatewayEvent.Kind.approvalRequest,
         GatewayEvent.Kind.clarifyRequest,
         GatewayEvent.Kind.clarifyExpire,
+        // Contract ≥ 7 (issue #125): the same two sheets, raised as
+        // server→client requests and withdrawn by `request.cancel`.
+        GatewayEvent.Kind.serverRequest,
+        GatewayEvent.Kind.requestCancel,
     ]
 
     /// `skippingPromptFamilies` is set while applying a replay batch: the
@@ -788,6 +800,40 @@ final class ConversationController {
         case GatewayEvent.Kind.clarifyExpire:
             if clarify?.requestID == event.payload["request_id"]?.stringValue {
                 clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+            }
+
+        case GatewayEvent.Kind.serverRequest:
+            // Contract ≥ 7 (issue #125). GatewayClient only routes the
+            // methods this app renders; anything that decodes as neither
+            // sheet is ignored.
+            guard let request = ServerRequest(event: event) else { break }
+            if let approvalRequest = ApprovalRequest(serverRequest: request) {
+                present(approval: approvalRequest)
+            } else if let clarifyRequest = ClarifyRequest(serverRequest: request) {
+                present(clarify: clarifyRequest)
+            }
+
+        case GatewayEvent.Kind.requestCancel:
+            // The server withdrew a request (answered on another surface,
+            // timed out, interrupted). Matched by srq id only, so a sheet
+            // that came from a legacy event — which has none — is never
+            // cleared by it, and only the card the id names comes down.
+            guard let id = event.payload["id"]?.stringValue else { break }
+            var withdrew = false
+            if approval?.serverRequestID == id {
+                approval = nil
+                // A late confirmation for the withdrawn approval must not
+                // dismiss the next one (issue #39).
+                approvalEpoch += 1
+                withdrew = true
+            }
+            if clarify?.serverRequestID == id {
+                clarify = nil
+                withdrew = true
+            }
+            if withdrew {
                 promptSendError = nil
                 resumeIfUnprompted()
             }
@@ -864,7 +910,22 @@ final class ConversationController {
         // approvals that both lack one are not assumed to be the same
         // approval, so a backend that does not stamp ids keeps today's
         // behaviour.
-        if let requestID = request.requestID, approval?.requestID == requestID { return }
+        //
+        // Contract ≥ 7 reports one approval twice over — as the `srq-`
+        // request and as `pending_approval` — and both carry the same
+        // gateway `request_id`. When the sheet on screen came from the
+        // legacy source and this copy carries the srq id, adopt the id in
+        // place (no epoch bump, no re-announce): the answer then goes
+        // through `request.answer`, which is the only reply the server
+        // request is resolved by (issue #125).
+        if let requestID = request.requestID, approval?.requestID == requestID {
+            if approval?.serverRequestID == nil, let serverRequestID = request.serverRequestID {
+                stampingApprovalInPlace = true
+                defer { stampingApprovalInPlace = false }
+                approval?.serverRequestID = serverRequestID
+            }
+            return
+        }
         approvalEpoch += 1
         approval = request
         promptSendError = nil
@@ -873,7 +934,11 @@ final class ConversationController {
 
     private func present(clarify request: ClarifyRequest) {
         // Idempotent by request id, for the same reason as the approval
-        // sheet; clarify requests always carry one.
+        // sheet; clarify requests always carry one. No in-place srq upgrade
+        // is needed here, unlike approvals: an srq clarify's request id *is*
+        // its `srq-` id, which never equals a legacy `clarify.request` id,
+        // and a contract ≥ 7 backend reports clarify only as a server
+        // request (no `pending_clarify` twin).
         if clarify?.requestID == request.requestID { return }
         clarify = request
         promptSendError = nil
@@ -995,16 +1060,30 @@ final class ConversationController {
     /// (`if value: payload[key] = value`), so nil here is a real answer and
     /// not a missing one — with the caveat recorded on `LiveSessionSnapshot`
     /// that a backend omitting the fields entirely reads the same way.
+    ///
+    /// `openRequests` (contract ≥ 7, issue #125) outranks the legacy fields
+    /// per family: an approval/clarify entry there is the authority for its
+    /// sheet and `pending_approval` / `pending_clarify` are ignored, because
+    /// only the srq entry carries the id `request.answer` needs. The legacy
+    /// field is the fallback only when no usable entry of that family exists
+    /// — the contract-6 case. Entries are taken oldest first, as the gateway
+    /// lists them, matching `pending_approval`'s oldest-unresolved choice.
     private func adoptPendingPrompts(
         sessionID: String,
         approvalPayload: JSONValue?,
         clarifyPayload: JSONValue?,
+        openRequests: [ServerRequest],
         clearStale: Bool
     ) {
-        if let approvalPayload,
-            let request = ApprovalRequest(payload: approvalPayload, sessionID: sessionID)
-        {
-            present(approval: request)
+        let approvalRequest =
+            openRequests.lazy.compactMap { ApprovalRequest(serverRequest: $0) }.first
+            ?? approvalPayload.flatMap { ApprovalRequest(payload: $0, sessionID: sessionID) }
+        let clarifyRequest =
+            openRequests.lazy.compactMap { ClarifyRequest(serverRequest: $0) }.first
+            ?? clarifyPayload.flatMap { ClarifyRequest(payload: $0, sessionID: sessionID) }
+
+        if let approvalRequest {
+            present(approval: approvalRequest)
         } else if clearStale, approval != nil {
             // Invalidate error ownership too: a late failure for A must not
             // write into the next sheet (clarify B) via the shared footer.
@@ -1012,10 +1091,8 @@ final class ConversationController {
             approvalEpoch += 1
         }
 
-        if let clarifyPayload,
-            let request = ClarifyRequest(payload: clarifyPayload, sessionID: sessionID)
-        {
-            present(clarify: request)
+        if let clarifyRequest {
+            present(clarify: clarifyRequest)
         } else if clearStale, clarify != nil {
             clarify = nil
         }
@@ -1026,11 +1103,22 @@ final class ConversationController {
     /// The `session.resume` snapshot as prompt authority — the first read of
     /// the reconnect, and the only one on any path where the replay is not
     /// usable.
+    ///
+    /// `open_requests` is decoded fail-soft here — a non-array reads as
+    /// empty and an unreadable entry is dropped — which is how this path
+    /// already treats `pending_*` (passed through unvalidated; a value the
+    /// decoders cannot use reads as absent). Unlike the `session.activate`
+    /// read, whose snapshot fails closed into this path, there is no more
+    /// conservative read to fall back to: refusing the handle would fail the
+    /// whole resume. A dropped entry only means its family falls back to the
+    /// legacy field, as on a contract-6 backend.
     private func adoptPendingPrompts(from handle: SessionHandle, clearStale: Bool) {
         adoptPendingPrompts(
             sessionID: handle.runtimeID,
             approvalPayload: handle.raw["pending_approval"],
             clarifyPayload: handle.raw["pending_clarify"],
+            openRequests: handle.raw["open_requests"]?.arrayValue?
+                .compactMap { ServerRequest(snapshot: $0) } ?? [],
             clearStale: clearStale)
     }
 
@@ -1042,6 +1130,7 @@ final class ConversationController {
             sessionID: snapshot.runtimeID,
             approvalPayload: snapshot.pendingApproval,
             clarifyPayload: snapshot.pendingClarify,
+            openRequests: snapshot.openRequests,
             clearStale: clearStale)
     }
 
@@ -1276,7 +1365,15 @@ final class ConversationController {
         guard let request = approval, !promptResponseInFlight else { return }
         let epoch = approvalEpoch
         sendPromptResponse {
-            try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+            // A server-request approval (contract ≥ 7, issue #125) is only
+            // resolved by `request.answer`. `.expired` counts as confirmed:
+            // the backend has already moved on, so the sheet closes.
+            if let serverRequestID = request.serverRequestID {
+                _ = try await $0.answerServerRequest(
+                    id: serverRequestID, result: .object(["choice": .string(choice)]))
+            } else {
+                try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+            }
         } onConfirmed: { [weak self] in
             guard let self, self.approvalEpoch == epoch else { return }
             self.approval = nil
@@ -1289,8 +1386,15 @@ final class ConversationController {
     func respondClarify(answer: String) {
         guard let request = clarify, !promptResponseInFlight else { return }
         let requestID = request.requestID
+        let serverRequestID = request.serverRequestID
         sendPromptResponse {
-            try await $0.respondClarify(requestID: requestID, answer: answer)
+            // Same routing and `.expired` rule as `respondApproval`.
+            if let serverRequestID {
+                _ = try await $0.answerServerRequest(
+                    id: serverRequestID, result: .object(["answer": .string(answer)]))
+            } else {
+                try await $0.respondClarify(requestID: requestID, answer: answer)
+            }
         } onConfirmed: { [weak self] in
             guard let self, self.clarify?.requestID == requestID else { return }
             self.clarify = nil
@@ -1299,17 +1403,28 @@ final class ConversationController {
         }
     }
 
+    /// The in-flight prompt response, kept only so a test can await it.
+    private var promptResponseTask: Task<Void, Never>?
+
+    /// Test seam: await the prompt response `respondApproval` /
+    /// `respondClarify` started, the same way `awaitPromptAnnouncements`
+    /// exposes the notice tasks — the sheet closing on the reply has no
+    /// other signal to wait on (issue #125).
+    func awaitPromptResponse() async {
+        await promptResponseTask?.value
+    }
+
     private func sendPromptResponse(
-        _ send: @escaping (HermesConnection) async throws -> Void,
+        _ send: @escaping (any SessionServicing) async throws -> Void,
         onConfirmed: @escaping @MainActor () -> Void,
         applyError: @escaping @MainActor () -> Bool
     ) {
         promptResponseInFlight = true
         promptSendError = nil
-        Task {
+        promptResponseTask = Task {
             defer { promptResponseInFlight = false }
             do {
-                try await send(connection)
+                try await send(sessionService)
                 onConfirmed()
                 if applyError() { promptSendError = nil }
                 resumeIfUnprompted()

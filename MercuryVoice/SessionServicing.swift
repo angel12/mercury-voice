@@ -11,6 +11,11 @@ import HermesKit
 /// only pin that ordering if it can script each answer and hold each call
 /// open, which a live `HermesConnection` cannot offer.
 ///
+/// The prompt responses (`approval.respond`, `clarify.respond` and the
+/// contract-7 `request.answer`, issue #125) are here too: which of them a
+/// sheet is answered through is the behaviour under test there, and a test
+/// can only observe it — and hold the reply open — through this seam.
+///
 /// The connection itself stays concrete: `rest` (speech, transcription,
 /// voice config) and the tracker's submit/interrupt closure are not part of
 /// this seam and still go straight to `HermesConnection`.
@@ -26,6 +31,10 @@ protocol SessionServicing: Sendable {
 
     @discardableResult
     func closeSession(sessionID: String) async -> SessionCloseOutcome
+
+    func respondApproval(sessionID: String, choice: String) async throws
+    func respondClarify(requestID: String, answer: String) async throws
+    func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer
 }
 
 extension HermesConnection: SessionServicing {}
