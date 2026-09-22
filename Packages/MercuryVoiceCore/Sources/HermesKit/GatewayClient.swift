@@ -84,8 +84,10 @@ public actor GatewayClient {
 
     /// Backend contract version reported in gateway payloads (session.info's
     /// `desktop_contract`); the app warns when older than what it was built
-    /// against.
-    public static let builtAgainstDesktopContract = 6
+    /// against. This is the lowest contract whose prompt protocol this build
+    /// speaks — not the newest one it knows about (8 is Connectors only and
+    /// would warn needlessly against a v7 backend).
+    public static let builtAgainstDesktopContract = 7
 
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         let config = URLSessionConfiguration.ephemeral

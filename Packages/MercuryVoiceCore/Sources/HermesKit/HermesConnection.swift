@@ -259,6 +259,20 @@ public actor HermesConnection {
             gateway = client
             failedDials = 0
             attempt = 0
+
+            // Contract ≥ 7: without this, approvals are withdrawn and clarify
+            // questions skipped server-side before this client ever sees them
+            // (hermes-agent f9d178f78e). Once per socket — the server forgets
+            // the advertisement on disconnect. Old backends answer -32601.
+            _ = try? await client.request(
+                "client.capabilities",
+                params: .object(["server_requests": .bool(true)]),
+                timeout: 5)
+            guard ownsSupervisor(lifetime) else {
+                await client.close(reason: "stopped")
+                return
+            }
+
             publish(.phase(.ready(isReconnect: everConnected)))
             everConnected = true
 
