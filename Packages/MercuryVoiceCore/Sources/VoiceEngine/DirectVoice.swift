@@ -146,12 +146,17 @@ public actor VoiceConfigStore {
 /// as an opener and follows to the end of the string. Holding the cut keeps
 /// every fence whole within one sentence.
 public enum SentenceCutter {
-    static let minSentenceChars = 24
+    public static let minSentenceChars = 24
     private static let fenceMarker = "```"
     private static let boundary = try! NSRegularExpression(
         pattern: #"[.!?…。！？]+["'”’)\]]*\s+"#)
 
-    public static func cut(_ buffer: String, flush: Bool) -> (sentences: [String], rest: String) {
+    /// `minSentenceChars` defaults to the historical 24; callers pass the
+    /// resolved `tts.streaming.min_len` (the desktop's `cutSentences`
+    /// `minSentenceChars` parameter) when the backend sent one.
+    public static func cut(
+        _ buffer: String, flush: Bool, minSentenceChars: Int = Self.minSentenceChars
+    ) -> (sentences: [String], rest: String) {
         var sentences: [String] = []
         let ns = buffer as NSString
         let fences = fenceSpans(ns)
@@ -227,12 +232,20 @@ public enum SentenceCutter {
 /// together was to reproduce the composition in the test.
 struct SpeechSegmenter {
     private var buffer = ""
+    private let minSentenceChars: Int
+
+    /// `minSentenceChars` defaults to `SentenceCutter`'s historical 24;
+    /// `DirectSpeechSession` passes the resolved `tts.streaming.min_len`
+    /// when the backend sent one.
+    init(minSentenceChars: Int = SentenceCutter.minSentenceChars) {
+        self.minSentenceChars = minSentenceChars
+    }
 
     /// Feed one streamed delta; pass `flush: true` (with `""` if there is
     /// nothing left to add) when the reply is complete.
     mutating func accept(_ text: String, flush: Bool) -> [String] {
         buffer += text
-        let cut = SentenceCutter.cut(buffer, flush: flush)
+        let cut = SentenceCutter.cut(buffer, flush: flush, minSentenceChars: minSentenceChars)
         buffer = cut.rest
         return cut.sentences.map(SpeechText.sanitizeForSpeech).filter { !$0.isEmpty }
     }
@@ -303,6 +316,10 @@ public struct DirectVoiceClient: Sendable {
 
         var request = URLRequest(url: Self.join(config.baseURL, path))
         request.httpMethod = "POST"
+        // `stt.openai.timeout` — same deadline the gateway's own transcription
+        // client applies, so a wedged provider fails this request instead of
+        // hanging it forever (mirrors the desktop's `sttTimeoutSeconds`).
+        request.timeoutInterval = config.timeoutS ?? 60
         switch config.wire {
         case .openAIMultipart, .xai:
             request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
@@ -347,10 +364,13 @@ public struct DirectVoiceClient: Sendable {
     static func ttsRequest(config: DirectTTSConfig, text: String) throws -> URLRequest {
         switch config.wire {
         case .openAISpeech:
-            var body: [String: JSONValue] = [
-                "input": .string(text),
-                "response_format": .string("mp3"),
-            ]
+            // `tts.openai` fields the server forwards verbatim (lang_code,
+            // consent_attestation, …), spread first so the app's own keys
+            // below always win — matches the desktop's
+            // `{ ...(tts.extra_body ?? {}), model, voice, input, ... }`.
+            var body: [String: JSONValue] = config.extraBody ?? [:]
+            body["input"] = .string(text)
+            body["response_format"] = .string("mp3")
             if let model = config.model { body["model"] = .string(model) }
             if let voice = config.voice { body["voice"] = .string(voice) }
             if let speed = config.speed, speed != 1 { body["speed"] = .number(speed) }
@@ -469,7 +489,7 @@ public actor DirectSpeechSession: SpeechStreaming {
     private let client: any SpeechSynthesizing
     private let makePlayer: @Sendable () -> any FallbackClipPlaying
 
-    private var segmenter = SpeechSegmenter()
+    private var segmenter: SpeechSegmenter
     private var finished = false
     private var started = false
     private var queue: [String] = []
@@ -491,6 +511,7 @@ public actor DirectSpeechSession: SpeechStreaming {
         self.config = config
         self.client = client
         self.makePlayer = makePlayer
+        self.segmenter = SpeechSegmenter(minSentenceChars: config.minLen ?? SentenceCutter.minSentenceChars)
     }
 
     public var isAudiblyPlaying: Bool { player?.isPlaying ?? false }
@@ -578,7 +599,7 @@ public actor DirectSpeechSession: SpeechStreaming {
         outcome = result
         player?.stop()
         player = nil
-        segmenter = SpeechSegmenter()
+        segmenter = SpeechSegmenter(minSentenceChars: config.minLen ?? SentenceCutter.minSentenceChars)
         queue.removeAll()
         // Issue #72: Stop must abort the in-flight synthesis Task, not only
         // suppress playback after the provider returns.

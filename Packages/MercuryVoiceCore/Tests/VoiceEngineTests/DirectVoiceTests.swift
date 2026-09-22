@@ -49,6 +49,22 @@ struct SentenceCutterTests {
             "He said \"this is the whole reply.\" And then the tail", flush: false)
         #expect(cut.sentences == ["He said \"this is the whole reply.\""])
     }
+
+    // MARK: - tts.streaming.min_len override (issue #125)
+
+    @Test func customMinSentenceCharsCutsShorterSentences() {
+        // Below the default 24-char minimum, but above a configured min_len
+        // of 7 — mirrors the desktop's `cutSentences(buffer, flush, minLen)`.
+        let cut = SentenceCutter.cut("Hi there. tail", flush: false, minSentenceChars: 7)
+        #expect(cut.sentences == ["Hi there."])
+        #expect(cut.rest == "tail")
+    }
+
+    @Test func defaultMinSentenceCharsStillAppliesWhenNoOverrideGiven() {
+        let cut = SentenceCutter.cut("Hi there. tail", flush: false)
+        #expect(cut.sentences.isEmpty)
+        #expect(cut.rest == "Hi there. tail")
+    }
 }
 
 @Suite("Client-direct voice requests")
@@ -174,6 +190,82 @@ struct DirectVoiceRequestTests {
         #expect(body["model_id"]?.stringValue == "eleven_turbo")
         // No speed field on the ElevenLabs wire even when configured absent.
         #expect(body["speed"] == nil)
+    }
+
+    @Test func openAISpeechRequestMergesExtraBodyVerbatim() throws {
+        let config = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "provider": "openai",
+                     "base_url": "https://api.example.com/v1", "api_key": "sk-t",
+                     "model": "tts-1", "voice": "alloy",
+                     "extra_body": {"lang_code": "en", "consent_attestation": true}}
+                    """)))
+        let request = try DirectVoiceClient.ttsRequest(config: config, text: "Say this.")
+        let body = try json(String(decoding: request.httpBody ?? Data(), as: UTF8.self))
+
+        #expect(body["lang_code"]?.stringValue == "en")
+        #expect(body["consent_attestation"]?.boolValue == true)
+        #expect(body["model"]?.stringValue == "tts-1")
+        #expect(body["voice"]?.stringValue == "alloy")
+        #expect(body["input"]?.stringValue == "Say this.")
+    }
+
+    @Test func extraBodyCannotOverrideTheAppsOwnKeys() throws {
+        let config = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "provider": "openai",
+                     "base_url": "https://api.example.com/v1", "api_key": "sk-t",
+                     "model": "tts-1", "voice": "alloy",
+                     "extra_body": {"model": "hijacked-model", "voice": "hijacked-voice",
+                                     "input": "hijacked input"}}
+                    """)))
+        let request = try DirectVoiceClient.ttsRequest(config: config, text: "Say this.")
+        let body = try json(String(decoding: request.httpBody ?? Data(), as: UTF8.self))
+
+        // The app's own model/voice/input win over anything extra_body sends.
+        #expect(body["model"]?.stringValue == "tts-1")
+        #expect(body["voice"]?.stringValue == "alloy")
+        #expect(body["input"]?.stringValue == "Say this.")
+    }
+
+    @Test func openAISpeechRequestWithoutExtraBodyIsUnaffected() throws {
+        let config = try #require(
+            DirectTTSConfig(
+                json: try json(
+                    """
+                    {"mode": "direct", "wire": "openai-speech", "provider": "openai",
+                     "base_url": "https://api.example.com/v1", "api_key": "sk-t",
+                     "model": "tts-1", "voice": "alloy"}
+                    """)))
+        let request = try DirectVoiceClient.ttsRequest(config: config, text: "Say this.")
+        let body = try json(String(decoding: request.httpBody ?? Data(), as: UTF8.self))
+
+        #expect(body["model"]?.stringValue == "tts-1")
+        #expect(body["voice"]?.stringValue == "alloy")
+        #expect(body["input"]?.stringValue == "Say this.")
+    }
+
+    // MARK: - stt.timeout_s applied to the request (issue #125)
+
+    @Test func sttTimeoutSAppliesConfiguredTimeout() throws {
+        let config = try sttConfig(wire: "openai-multipart")
+        var withTimeout = config
+        withTimeout.timeoutS = 12
+        let request = DirectVoiceClient.sttRequest(
+            config: withTimeout, audio: Data("A".utf8), mimeType: "audio/wav", boundary: "BND")
+        #expect(request.timeoutInterval == 12)
+    }
+
+    @Test func sttTimeoutSFallsBackTo60WhenAbsent() throws {
+        let config = try sttConfig(wire: "openai-multipart")
+        #expect(config.timeoutS == nil)
+        let request = DirectVoiceClient.sttRequest(
+            config: config, audio: Data("A".utf8), mimeType: "audio/wav", boundary: "BND")
+        #expect(request.timeoutInterval == 60)
     }
 
     @Test func providerErrorDetailExtraction() {
