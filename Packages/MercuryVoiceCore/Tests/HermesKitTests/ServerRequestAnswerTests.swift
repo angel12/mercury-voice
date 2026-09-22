@@ -4,31 +4,59 @@ import Testing
 @testable import HermesKit
 
 /// `request.answer {id, result}` (contract ≥ 7) — answers an open
-/// server→client request. `SessionAPI.answerServerRequest` is a thin
-/// extension on the `HermesConnection` actor, which has no seam for
-/// injecting a scripted socket (unlike `GatewayClient`, which
-/// `readyGatewayClient()` wires directly). So this exercises the exact wire
-/// encoding and status mapping `answerServerRequest` uses — `{id, result}`
-/// params and `status == "expired"` vs. anything else — against a
-/// `GatewayClient` from `readyGatewayClient()`, the same helper
-/// `ServerRequestRoutingTests`/`GatewayRequestCancellationTests` use.
+/// server→client request. The params shape and the `status` mapping live on
+/// `ServerRequestAnswer` itself (`answerParams(id:result:)`, `init(reply:)`)
+/// so `SessionAPI.answerServerRequest` and these tests share one source of
+/// truth instead of the tests re-deriving the production logic.
 @Suite("request.answer encoding")
 struct ServerRequestAnswerTests {
-    /// Mirrors the mapping in `SessionAPI.answerServerRequest`.
-    private func mapAnswer(_ reply: JSONValue) -> ServerRequestAnswer {
-        reply["status"]?.stringValue == "expired" ? .expired : .answered
+    // MARK: Params shape
+
+    @Test func answerParamsCarriesExactlyIDAndResult() throws {
+        let params = ServerRequestAnswer.answerParams(
+            id: "srq-aaaaaaaaaaaa", result: .object(["choice": .string("once")]))
+        #expect(params.objectValue?.keys.sorted() == ["id", "result"])
+        #expect(params["id"]?.stringValue == "srq-aaaaaaaaaaaa")
+        #expect(params["result"]?["choice"]?.stringValue == "once")
     }
 
-    @Test func sendsIdAndResultAndMapsAnOkStatusToAnswered() async throws {
+    // MARK: Status mapping
+
+    @Test func okStatusMapsToAnswered() throws {
+        #expect(ServerRequestAnswer(reply: try json(#"{"status":"ok"}"#)) == .answered)
+    }
+
+    @Test func expiredStatusMapsToExpired() throws {
+        #expect(ServerRequestAnswer(reply: try json(#"{"status":"expired"}"#)) == .expired)
+    }
+
+    @Test func anUnrecognisedOrAbsentStatusMapsToAnswered() throws {
+        #expect(ServerRequestAnswer(reply: try json(#"{"status":"something-new"}"#)) == .answered)
+        #expect(ServerRequestAnswer(reply: try json(#"{}"#)) == .answered)
+    }
+
+    private func json(_ string: String) throws -> JSONValue {
+        try JSONDecoder().decode(JSONValue.self, from: Data(string.utf8))
+    }
+
+    // MARK: Wire encoding, through the same request path `answerServerRequest` uses
+
+    /// `SessionAPI.answerServerRequest` is a thin extension on the
+    /// `HermesConnection` actor, which has no seam for injecting a scripted
+    /// socket (unlike `GatewayClient`, which `readyGatewayClient()` wires
+    /// directly). So this exercises the production `ServerRequestAnswer`
+    /// helpers — `method`, `answerParams(id:result:)`, `init(reply:)` — over
+    /// `GatewayClient.request`, the same call `answerServerRequest` makes,
+    /// against the same scripted-socket helper
+    /// `ServerRequestRoutingTests`/`GatewayRequestCancellationTests` use.
+    @Test func sendsIDAndResultAndMapsAnOkStatusToAnswered() async throws {
         let (client, socket) = try await readyGatewayClient()
         let call = Task<RPCOutcome, Never> {
             await rpcOutcome {
                 try await client.request(
-                    "request.answer",
-                    params: [
-                        "id": .string("srq-aaaaaaaaaaaa"),
-                        "result": .object(["choice": .string("once")]),
-                    ])
+                    ServerRequestAnswer.method,
+                    params: ServerRequestAnswer.answerParams(
+                        id: "srq-aaaaaaaaaaaa", result: .object(["choice": .string("once")])))
             }
         }
         await socket.awaitSend(count: 1)
@@ -44,7 +72,7 @@ struct ServerRequestAnswerTests {
             Issue.record("request.answer did not settle with a value")
             return
         }
-        #expect(mapAnswer(result) == .answered)
+        #expect(ServerRequestAnswer(reply: result) == .answered)
         await client.close(reason: "test over")
     }
 
@@ -53,11 +81,9 @@ struct ServerRequestAnswerTests {
         let call = Task<RPCOutcome, Never> {
             await rpcOutcome {
                 try await client.request(
-                    "request.answer",
-                    params: [
-                        "id": .string("srq-bbbbbbbbbbbb"),
-                        "result": .object(["answer": .string("dev")]),
-                    ])
+                    ServerRequestAnswer.method,
+                    params: ServerRequestAnswer.answerParams(
+                        id: "srq-bbbbbbbbbbbb", result: .object(["answer": .string("dev")])))
             }
         }
         await socket.awaitSend(count: 1)
@@ -67,7 +93,7 @@ struct ServerRequestAnswerTests {
             Issue.record("request.answer did not settle with a value")
             return
         }
-        #expect(mapAnswer(result) == .expired)
+        #expect(ServerRequestAnswer(reply: result) == .expired)
         await client.close(reason: "test over")
     }
 }

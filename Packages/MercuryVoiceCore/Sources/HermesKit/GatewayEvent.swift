@@ -311,6 +311,13 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
     /// single question to promote), so they are left empty/blank and the
     /// per-question data lives in `questions` instead. Its absence means a
     /// single question, decoded the same way as the legacy payload.
+    ///
+    /// A batch decodes fail-closed: an entry `ClarifyQuestion(json:)` cannot
+    /// read, or an empty `questions` array, refuses the whole request rather
+    /// than silently dropping a question. A dropped qid would still be
+    /// answered by the caller submitting `{answers}` for the questions it
+    /// did see, so the batch would look complete to the backend while short
+    /// one answer — worse than refusing to show any of it.
     public init?(serverRequest request: ServerRequest) {
         guard request.method == "clarify" else { return nil }
         let params = request.params
@@ -321,10 +328,14 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
             params["answers"]?.objectValue?.compactMapValues(\.stringValue) ?? [:]
 
         if let rawQuestions = params["questions"]?.arrayValue {
+            let decodedQuestions = rawQuestions.compactMap(ClarifyQuestion.init(json:))
+            guard !decodedQuestions.isEmpty, decodedQuestions.count == rawQuestions.count else {
+                return nil
+            }
             self.question = ""
             self.choices = []
             self.multiSelect = false
-            self.questions = rawQuestions.compactMap(ClarifyQuestion.init(json:))
+            self.questions = decodedQuestions
         } else {
             self.question = params["question"]?.stringValue ?? ""
             self.choices =

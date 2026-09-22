@@ -241,7 +241,8 @@ extension HermesConnection {
         -> ServerRequestAnswer
     {
         let reply = try await request(
-            "request.answer", params: ["id": .string(id), "result": result])
-        return reply["status"]?.stringValue == "expired" ? .expired : .answered
+            ServerRequestAnswer.method,
+            params: ServerRequestAnswer.answerParams(id: id, result: result))
+        return ServerRequestAnswer(reply: reply)
     }
 }

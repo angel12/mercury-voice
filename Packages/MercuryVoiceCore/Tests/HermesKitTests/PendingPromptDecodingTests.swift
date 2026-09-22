@@ -185,6 +185,31 @@ struct PendingPromptDecodingTests {
         #expect(clarify.lockedAnswers == ["q1": "dev"])
     }
 
+    /// A dropped question would still let the caller submit `{answers}` for
+    /// the ones it did see — a batch that looks complete to the backend
+    /// while actually short one answer. So one undecodable entry (here,
+    /// missing `qid`) must refuse the whole request, not just that entry.
+    @Test func clarifyBatchFailsClosedOnAnUndecodableQuestion() throws {
+        let request = ServerRequest(
+            id: "srq-444444444444", method: "clarify",
+            params: try json(
+                """
+                {"session_id": "s1",
+                 "questions": [
+                   {"qid": "q1", "question": "Which env?"},
+                   {"question": "Which branch?"}
+                 ]}
+                """))
+        #expect(ClarifyRequest(serverRequest: request) == nil)
+    }
+
+    @Test func clarifyBatchFailsClosedOnAnEmptyQuestionsArray() throws {
+        let request = ServerRequest(
+            id: "srq-555555555555", method: "clarify",
+            params: try json(#"{"session_id": "s1", "questions": []}"#))
+        #expect(ClarifyRequest(serverRequest: request) == nil)
+    }
+
     @Test func clarifyRefusesANonClarifyServerRequest() throws {
         let request = ServerRequest(
             id: "srq-333333333333", method: "approval",

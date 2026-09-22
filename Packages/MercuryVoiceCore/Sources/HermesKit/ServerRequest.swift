@@ -52,6 +52,27 @@ public struct ServerRequest: Sendable, Equatable {
 public enum ServerRequestAnswer: Sendable, Equatable {
     case answered
     case expired
+
+    /// The JSON-RPC method name — a shared constant so the wire method and
+    /// the params shape below cannot drift apart from what
+    /// `SessionAPI.answerServerRequest` actually sends.
+    public static let method = "request.answer"
+
+    /// `request.answer` params: exactly `id` and `result` — the server
+    /// rejects undeclared keys with error 4000, so nothing else may be
+    /// added here.
+    public static func answerParams(id: String, result: JSONValue) -> JSONValue {
+        .object(["id": .string(id), "result": result])
+    }
+
+    /// Maps a `request.answer` reply: `status == "expired"` → `.expired`,
+    /// anything else (`"ok"`, an unknown value, or an absent/unreadable
+    /// field) → `.answered` — the server's only documented failure mode for
+    /// this call is expiry, so an unrecognised status is read as success
+    /// rather than silently swallowed.
+    public init(reply: JSONValue) {
+        self = reply["status"]?.stringValue == "expired" ? .expired : .answered
+    }
 }
 
 extension GatewayEvent {
