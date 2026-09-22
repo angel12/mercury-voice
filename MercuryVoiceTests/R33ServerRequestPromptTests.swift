@@ -384,6 +384,36 @@ struct R33ServerRequestPromptTests {
         await controller.teardown()
     }
 
+    @Test(
+        "a batch that arrives fully locked submits immediately, with no sheet and no announcement"
+    )
+    func fullyLockedBatchSubmitsImmediately() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+
+        controller.handle(
+            event: Fixtures.serverRequestEvent(
+                srqClarifyBatch(lockedAnswers: ["q1": "main", "q2": "prod"])))
+        await controller.awaitPromptResponse()
+        await controller.awaitPromptAnnouncements()
+
+        #expect(controller.clarify == nil)
+        #expect(speech.spoken.isEmpty)
+        #expect(
+            service.promptResponses == [
+                .requestAnswer(
+                    params: answerParams(
+                        id: "srq-b1",
+                        [
+                            "answers": .object([
+                                "q1": .string("main"), "q2": .string("prod"),
+                            ])
+                        ]))
+            ])
+        await controller.teardown()
+    }
+
     @Test("answering a 2-question batch sends one answers object with both qids")
     func answeringABatchSendsOneAnswersObject() async throws {
         let service = ScriptedSessionService()

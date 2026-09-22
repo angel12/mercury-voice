@@ -940,15 +940,46 @@ final class ConversationController {
         // and a contract ≥ 7 backend reports clarify only as a server
         // request (no `pending_clarify` twin).
         if clarify?.requestID == request.requestID { return }
-        clarify = request
-        promptSendError = nil
         let isBatch = !request.questions.isEmpty
         let remaining =
             isBatch
             ? request.questions.filter { request.lockedAnswers[$0.qid] == nil }.count : 1
+        // A batch that arrived with every question already locked has
+        // nothing left to ask (review round 1, issue #125): presenting it
+        // would show "Question 1 of 0" and speak "Hermes has 0 questions for
+        // you.", and its "Skip all" would send `{}` — cancel-all — discarding
+        // the locked answers instead of confirming them. Upstream resolves
+        // the request as soon as the last question locks, so this
+        // request.answer is normally just confirming a decision already
+        // settled: `.expired` is the expected reply here, not a failure.
+        if isBatch, remaining == 0 {
+            submitFullyLockedBatch(request)
+            return
+        }
+        clarify = request
+        promptSendError = nil
         announce(
             .clarify(requestID: request.requestID, remainingQuestions: remaining, isBatch: isBatch)
         )
+    }
+
+    /// Submits `request.lockedAnswers` for a batch with nothing left to ask,
+    /// without ever presenting a sheet — so there is no `clarify` sheet state
+    /// to clear on success or surface an error on. `.expired` and a genuine
+    /// failure are both silently swallowed for the same reason: no UI is
+    /// watching this request.
+    private func submitFullyLockedBatch(_ request: ClarifyRequest) {
+        guard let serverRequestID = request.serverRequestID else { return }
+        sendPromptResponse {
+            _ = try await $0.answerServerRequest(
+                id: serverRequestID,
+                result: .object([
+                    "answers": .object(request.lockedAnswers.mapValues(JSONValue.string))
+                ]))
+        } onConfirmed: {
+        } applyError: {
+            false
+        }
     }
 
     // MARK: Spoken prompt notices
