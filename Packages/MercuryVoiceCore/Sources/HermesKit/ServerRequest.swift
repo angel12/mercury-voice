@@ -44,6 +44,16 @@ public struct ServerRequest: Sendable, Equatable {
     }
 }
 
+/// Outcome of `SessionAPI.answerServerRequest`: the server acknowledges every
+/// `request.answer` with `status: ok|expired` rather than a bare reply, since
+/// the answer can arrive from a reconnected socket that never saw the
+/// request (`open_requests` replay) and the caller needs to know whether it
+/// still landed.
+public enum ServerRequestAnswer: Sendable, Equatable {
+    case answered
+    case expired
+}
+
 extension GatewayEvent {
     /// Carries a server request down the event pipeline so it inherits the
     /// controller's replay hold and prompt-family handling. Never seq-stamped.

@@ -201,12 +201,31 @@ public struct ApprovalRequest: Sendable, Equatable, Identifiable {
     public var description: String?
     /// Server-derived subset of once/session/always/deny.
     public var choices: [String]
+    /// The `srq-<hex>` id of the server→client request this came from
+    /// (contract ≥ 7), answered with `SessionAPI.answerServerRequest`. Nil
+    /// for the legacy `approval.request` event / `pending_approval` replay
+    /// field, answered instead with `respondApproval`.
+    public var serverRequestID: String?
 
     public var id: String { sessionID }
 
     public init?(event: GatewayEvent) {
         guard event.type == GatewayEvent.Kind.approvalRequest else { return nil }
         self.init(payload: event.payload, sessionID: event.sessionID)
+    }
+
+    /// Contract ≥ 7: an `approval` server→client request, routed down the
+    /// event pipeline as `GatewayEvent.Kind.serverRequest` and decoded here
+    /// from the `ServerRequest` it carries. Reuses the legacy payload
+    /// decoder on `request.params` — the field names match `approval.request`
+    /// — then stamps `serverRequestID` so the caller answers via
+    /// `request.answer` instead of `approval.respond`.
+    public init?(serverRequest request: ServerRequest) {
+        guard request.method == "approval" else { return nil }
+        guard let decoded = ApprovalRequest(payload: request.params, sessionID: request.sessionID)
+        else { return nil }
+        self = decoded
+        self.serverRequestID = request.id
     }
 
     /// Also decodes the `pending_approval` replay field of `session.resume`
@@ -245,6 +264,18 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
     /// nil/empty = free-text question.
     public var choices: [String]
     public var multiSelect: Bool
+    /// The `srq-<hex>` id of the server→client request this came from
+    /// (contract ≥ 7), answered with `SessionAPI.answerServerRequest`. Nil
+    /// for the legacy `clarify.request` event / `pending_clarify` replay
+    /// field, answered instead with `respondClarify`.
+    public var serverRequestID: String?
+    /// A batch clarify's per-question data (`params.questions`). Empty for a
+    /// single-question request, where `question`/`choices`/`multiSelect`
+    /// carry the one question instead.
+    public var questions: [ClarifyQuestion]
+    /// Already-answered questions of a batch being replayed
+    /// (`params.answers`), keyed by `qid`. Empty when nothing is locked.
+    public var lockedAnswers: [String: String]
 
     public var id: String { requestID }
 
@@ -265,5 +296,74 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
             .compactMap(\.stringValue)
             .filter { !$0.isEmpty && $0.count <= 200 && !$0.contains("\n") } ?? []
         self.multiSelect = payload["multi_select"]?.truthy ?? false
+        self.serverRequestID = nil
+        self.questions = []
+        self.lockedAnswers = [:]
+    }
+
+    /// Contract ≥ 7: a `clarify` server→client request, routed down the
+    /// event pipeline as `GatewayEvent.Kind.serverRequest` and decoded here
+    /// from the `ServerRequest` it carries. `id` doubles as `requestID` and
+    /// `serverRequestID` — a server request's id *is* the correlation id.
+    ///
+    /// `params.questions` present means a batch: the top-level
+    /// `question`/`choices` are not "the first question" (a batch has no
+    /// single question to promote), so they are left empty/blank and the
+    /// per-question data lives in `questions` instead. Its absence means a
+    /// single question, decoded the same way as the legacy payload.
+    public init?(serverRequest request: ServerRequest) {
+        guard request.method == "clarify" else { return nil }
+        let params = request.params
+        self.requestID = request.id
+        self.serverRequestID = request.id
+        self.sessionID = request.sessionID
+        self.lockedAnswers =
+            params["answers"]?.objectValue?.compactMapValues(\.stringValue) ?? [:]
+
+        if let rawQuestions = params["questions"]?.arrayValue {
+            self.question = ""
+            self.choices = []
+            self.multiSelect = false
+            self.questions = rawQuestions.compactMap(ClarifyQuestion.init(json:))
+        } else {
+            self.question = params["question"]?.stringValue ?? ""
+            self.choices =
+                params["choices"]?.arrayValue?
+                .compactMap(\.stringValue)
+                .filter { !$0.isEmpty && $0.count <= 200 && !$0.contains("\n") } ?? []
+            self.multiSelect = params["multi_select"]?.truthy ?? false
+            self.questions = []
+        }
+    }
+}
+
+/// One question of a batch `clarify` server request (`params.questions`).
+public struct ClarifyQuestion: Sendable, Equatable {
+    public var qid: String
+    public var question: String
+    /// nil/empty = free-text question.
+    public var choices: [String]
+    public var multiSelect: Bool
+
+    public init(qid: String, question: String, choices: [String], multiSelect: Bool) {
+        self.qid = qid
+        self.question = question
+        self.choices = choices
+        self.multiSelect = multiSelect
+    }
+
+    /// Decodes one entry of `params.questions`: `{qid, question, choices?,
+    /// multi_select}`. Wire shapes verbatim from `contracts/server_requests.py`.
+    init?(json: JSONValue) {
+        guard let qid = json["qid"]?.stringValue,
+            let question = json["question"]?.stringValue
+        else { return nil }
+        self.qid = qid
+        self.question = question
+        self.choices =
+            json["choices"]?.arrayValue?
+            .compactMap(\.stringValue)
+            .filter { !$0.isEmpty && $0.count <= 200 && !$0.contains("\n") } ?? []
+        self.multiSelect = json["multi_select"]?.truthy ?? false
     }
 }

@@ -117,4 +117,78 @@ struct PendingPromptDecodingTests {
         #expect(request?.multiSelect == true)
         #expect(request?.sessionID == nil)
     }
+
+    // MARK: Server requests (contract ≥ 7)
+
+    @Test func approvalDecodesFromAServerRequest() throws {
+        let request = ServerRequest(
+            id: "srq-0123456789ab", method: "approval",
+            params: try json(
+                #"{"session_id": "s1", "request_id": "a1", "command": "ls", "choices": ["once", "deny"]}"#
+            ))
+        let approval = try #require(ApprovalRequest(serverRequest: request))
+        #expect(approval.serverRequestID == "srq-0123456789ab")
+        #expect(approval.sessionID == "s1")
+        #expect(approval.requestID == "a1")
+        #expect(approval.command == "ls")
+        #expect(approval.choices == ["once", "deny"])
+    }
+
+    @Test func approvalRefusesANonApprovalServerRequest() throws {
+        let request = ServerRequest(
+            id: "srq-0123456789ab", method: "clarify",
+            params: try json(#"{"session_id": "s1"}"#))
+        #expect(ApprovalRequest(serverRequest: request) == nil)
+    }
+
+    @Test func clarifyDecodesASingleQuestionServerRequest() throws {
+        let request = ServerRequest(
+            id: "srq-111111111111", method: "clarify",
+            params: try json(
+                """
+                {"session_id": "s1", "question": "Which env?",
+                 "choices": ["dev", "prod"], "multi_select": false}
+                """))
+        let clarify = try #require(ClarifyRequest(serverRequest: request))
+        #expect(clarify.requestID == "srq-111111111111")
+        #expect(clarify.serverRequestID == "srq-111111111111")
+        #expect(clarify.sessionID == "s1")
+        #expect(clarify.question == "Which env?")
+        #expect(clarify.choices == ["dev", "prod"])
+        #expect(clarify.multiSelect == false)
+        #expect(clarify.questions.isEmpty)
+        #expect(clarify.lockedAnswers.isEmpty)
+    }
+
+    @Test func clarifyDecodesABatchServerRequest() throws {
+        let request = ServerRequest(
+            id: "srq-222222222222", method: "clarify",
+            params: try json(
+                """
+                {"session_id": "s1",
+                 "questions": [
+                   {"qid": "q1", "question": "Which env?", "choices": ["dev", "prod"]},
+                   {"qid": "q2", "question": "Which branch?", "multi_select": true}
+                 ],
+                 "answers": {"q1": "dev"}}
+                """))
+        let clarify = try #require(ClarifyRequest(serverRequest: request))
+        #expect(clarify.requestID == "srq-222222222222")
+        #expect(clarify.serverRequestID == "srq-222222222222")
+        // A batch's own question/choices are not "the first question" — the
+        // per-question data lives in `questions` instead.
+        #expect(clarify.question == "")
+        #expect(clarify.choices == [])
+        #expect(clarify.questions.count == 2)
+        #expect(clarify.questions[0] == ClarifyQuestion(qid: "q1", question: "Which env?", choices: ["dev", "prod"], multiSelect: false))
+        #expect(clarify.questions[1] == ClarifyQuestion(qid: "q2", question: "Which branch?", choices: [], multiSelect: true))
+        #expect(clarify.lockedAnswers == ["q1": "dev"])
+    }
+
+    @Test func clarifyRefusesANonClarifyServerRequest() throws {
+        let request = ServerRequest(
+            id: "srq-333333333333", method: "approval",
+            params: try json(#"{"session_id": "s1"}"#))
+        #expect(ClarifyRequest(serverRequest: request) == nil)
+    }
 }
