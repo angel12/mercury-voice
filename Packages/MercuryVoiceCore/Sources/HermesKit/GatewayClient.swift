@@ -424,6 +424,17 @@ public actor GatewayClient {
 
         if let request = ServerRequest(frame: frame) {
             if ServerRequest.answerableMethods.contains(request.method) {
+                if ApprovalRequest(serverRequest: request) == nil,
+                    ClarifyRequest(serverRequest: request) == nil
+                {
+                    // Undecodable params: no sheet will show, and nothing
+                    // answers it — for the same reason as the else branch
+                    // below — so without this log the prompt just vanishes
+                    // until the server's deadline withdraws it (#128).
+                    Self.logger.error(
+                        "server request \(request.id, privacy: .public) (\(request.method, privacy: .public)) has params this app cannot render; left for another client or the server deadline"
+                    )
+                }
                 let event = GatewayEvent(serverRequest: request)
                 for sub in subscribers.values { sub.yield(event) }
             } else {
