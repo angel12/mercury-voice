@@ -236,13 +236,8 @@ public actor HermesConnection {
                 }
                 let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
                 failedDials += 1
-                if failedDials == 10 {
-                    publish(
-                        .phase(
-                            .unreachable(
-                                reason: "Server unreachable after 10 failed connection attempts. "
-                                    + "Check your network and server, then retry. " + reason)))
-                    supervisor = nil
+                if failedDials == Self.dialBudget {
+                    publishUnreachable(reason)
                     return
                 }
                 publish(.phase(.disconnected(reason: reason)))
@@ -260,8 +255,6 @@ public actor HermesConnection {
             }
 
             gateway = client
-            failedDials = 0
-            attempt = 0
 
             // Subscribe before the capabilities round-trip below: `events()`
             // registers synchronously but `GatewayClient` does not buffer for
@@ -299,7 +292,16 @@ public actor HermesConnection {
             // immediately (or already has), and the existing close-cause
             // handling further down decides whether to redial — the same
             // path an ordinary mid-turn disconnect takes.
-            if await client.state == .ready {
+            //
+            // Only a generation that got this far resets the dial budget and
+            // the backoff attempt (#128): one that died during the
+            // capabilities await is a failed dial like any other, or a server
+            // that always dies there would redial at the minimum backoff
+            // forever and never reach `.unreachable`.
+            let reachedReady = await client.state == .ready
+            if reachedReady {
+                failedDials = 0
+                attempt = 0
                 publish(.phase(.ready(isReconnect: everConnected)))
                 everConnected = true
             }
@@ -347,10 +349,31 @@ public actor HermesConnection {
             }
             let reason = await closeReason(of: client)
             guard ownsSupervisor(lifetime) else { return }
+            if !reachedReady {
+                failedDials += 1
+                if failedDials == Self.dialBudget {
+                    publishUnreachable(reason ?? "The connection closed before it was ready.")
+                    return
+                }
+            }
             publish(.phase(.disconnected(reason: reason)))
             attempt += 1
             await backoff(attempt: attempt, lifetime: lifetime)
         }
+    }
+
+    /// Consecutive connection attempts that may fail — dial errors, or
+    /// sockets that die before they are published ready — before the
+    /// supervisor stops with `.unreachable`.
+    private static let dialBudget = 10
+
+    private func publishUnreachable(_ reason: String) {
+        publish(
+            .phase(
+                .unreachable(
+                    reason: "Server unreachable after \(Self.dialBudget) failed connection attempts. "
+                        + "Check your network and server, then retry. " + reason)))
+        supervisor = nil
     }
 
     private func closeReason(of client: GatewayClient) async -> String? {
