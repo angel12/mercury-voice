@@ -558,6 +558,100 @@ struct R33ServerRequestPromptTests {
         await controller.teardown()
     }
 
+    // MARK: Batch locks arriving later (PR #126 review)
+
+    /// Another client locks q1 (`clarify.lock`) while this phone is away;
+    /// the reconnect's `open_requests` snapshot carries it as
+    /// `params.answers`. It is the same request, so the sheet keeps its
+    /// identity and the notice is not repeated — but the lock must land.
+    @Test("a re-presented batch with a new lock merges it in place without re-announcing")
+    func rePresentedBatchMergesNewLock() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        await controller.awaitPromptAnnouncements()
+        #expect(speech.spoken == ["Hermes has 2 questions for you."])
+
+        await reconnect(
+            controller, service: service,
+            openRequests: [srqClarifyBatch(lockedAnswers: ["q1": "main"])])
+        await controller.awaitPromptAnnouncements()
+
+        #expect(controller.clarify?.serverRequestID == "srq-b1")
+        #expect(controller.clarify?.lockedAnswers == ["q1": "main"])
+        #expect(speech.spoken == ["Hermes has 2 questions for you."])
+        #expect(service.promptResponses.isEmpty)
+        await controller.teardown()
+    }
+
+    /// The in-place merge is the *same* prompt, so — like the approval srq
+    /// stamp — it must not cancel a notice that has not been spoken yet.
+    @Test("an in-place lock merge does not cancel the unspoken notice")
+    func lockMergeKeepsTheNotice() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        controller.handle(
+            event: Fixtures.serverRequestEvent(srqClarifyBatch(lockedAnswers: ["q1": "main"])))
+        await controller.awaitPromptAnnouncements()
+
+        #expect(controller.clarify?.lockedAnswers == ["q1": "main"])
+        #expect(speech.spoken == ["Hermes has 2 questions for you."])
+        await controller.teardown()
+    }
+
+    /// Upstream resolves the batch on its last lock, so a snapshot that
+    /// shows every question locked means it is already settled: the sheet
+    /// comes down and nothing is sent.
+    @Test("a re-presented batch that is now fully locked clears the sheet and sends nothing")
+    func rePresentedFullyLockedBatchClears() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        try #require(controller.clarify != nil)
+
+        await reconnect(
+            controller, service: service,
+            openRequests: [srqClarifyBatch(lockedAnswers: ["q1": "main", "q2": "prod"])])
+        await controller.awaitPromptResponse()
+
+        #expect(controller.clarify == nil)
+        #expect(service.promptResponses.isEmpty)
+        await controller.teardown()
+    }
+
+    /// Upstream merges `{answers}` over `req.locked`, so a client answer for
+    /// a locked qid would overwrite the lock another client set. The
+    /// controller overlays its known locks so the server's value wins.
+    @Test("the final submission carries a server-locked value, not the user's")
+    func submissionOverlaysServerLocks() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await openedController(service: service)
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarifyBatch()))
+        await reconnect(
+            controller, service: service,
+            openRequests: [srqClarifyBatch(lockedAnswers: ["q1": "main"])])
+        try #require(controller.clarify?.lockedAnswers == ["q1": "main"])
+
+        controller.respondClarify(answers: ["q1": "dev", "q2": "prod"])
+        await controller.awaitPromptResponse()
+
+        #expect(
+            service.promptResponses == [
+                .requestAnswer(
+                    params: answerParams(
+                        id: "srq-b1",
+                        [
+                            "answers": .object([
+                                "q1": .string("main"), "q2": .string("prod"),
+                            ])
+                        ]))
+            ])
+        await controller.teardown()
+    }
+
     @Test("a contract-6 clarify.request is answered through clarify.respond")
     func legacyClarifyUsesClarifyRespond() async throws {
         let service = ScriptedSessionService()

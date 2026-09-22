@@ -65,8 +65,15 @@ final class ConversationController {
     /// the prompt unannounced when the upgrade lands before it is spoken.
     private var stampingApprovalInPlace = false
     var clarify: ClarifyRequest? {
-        willSet { clarifyAnnouncement?.cancel() }
+        willSet {
+            guard !mergingClarifyLocksInPlace else { return }
+            clarifyAnnouncement?.cancel()
+        }
     }
+    /// True only while `present(clarify:)` merges newly locked batch answers
+    /// into the sheet already on screen — the same prompt, so its notice
+    /// must survive, as with `stampingApprovalInPlace` (PR #126 review).
+    private var mergingClarifyLocksInPlace = false
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -1139,7 +1146,30 @@ final class ConversationController {
         // its `srq-` id, which never equals a legacy `clarify.request` id,
         // and a contract ≥ 7 backend reports clarify only as a server
         // request (no `pending_clarify` twin).
-        if clarify?.requestID == request.requestID { return }
+        //
+        // The one thing a repeat can bring is a batch's new locks: another
+        // client answered a question (`clarify.lock`) while this phone was
+        // away, and the reconnect's `open_requests` snapshot carries it as
+        // `params.answers` (PR #126 review). Merge those in place — no
+        // re-announce, same sheet identity; `ClarifySheet` rebases its
+        // paging on them. If that leaves nothing unlocked, upstream already
+        // resolved the request on its last lock, so the sheet comes down and
+        // nothing is sent (see the fully-locked case below).
+        if let current = clarify, current.requestID == request.requestID {
+            guard !current.questions.isEmpty else { return }
+            let merged = current.lockedAnswers.merging(request.lockedAnswers) { _, new in new }
+            guard merged != current.lockedAnswers else { return }
+            if current.questions.allSatisfy({ merged[$0.qid] != nil }) {
+                clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+                return
+            }
+            mergingClarifyLocksInPlace = true
+            defer { mergingClarifyLocksInPlace = false }
+            clarify?.lockedAnswers = merged
+            return
+        }
         let isBatch = !request.questions.isEmpty
         let remaining =
             isBatch
@@ -1743,10 +1773,15 @@ final class ConversationController {
             !promptResponseInFlight
         else { return }
         let requestID = request.requestID
+        // Server-held locks win over anything the sheet collected for the
+        // same qid: upstream merges `{answers}` *over* `req.locked`, so a
+        // stale local answer would silently overwrite another client's lock
+        // (PR #126 review). "Skip all" stays a bare `{}` — cancel-all.
+        let submitted = answers.merging(request.lockedAnswers) { _, locked in locked }
         let result: JSONValue =
             answers.isEmpty
             ? .object([:])
-            : .object(["answers": .object(answers.mapValues(JSONValue.string))])
+            : .object(["answers": .object(submitted.mapValues(JSONValue.string))])
         sendPromptResponse {
             _ = try await $0.answerServerRequest(id: serverRequestID, result: result)
         } onConfirmed: { [weak self] in

@@ -576,6 +576,18 @@ struct ClarifySheet: View {
             PromptSendStatus(controller: controller)
         }
         .disabled(controller.promptResponseInFlight)
+        // The controller merges locks another client set into this same
+        // request in place (PR #126 review); the `@State` paging copy must
+        // follow, or it would still ask — and submit — a locked question.
+        // When the lock took the last open page, the rest are answered, so
+        // this submits exactly as answering that page would have.
+        .onChange(of: request.lockedAnswers) { _, locked in
+            guard var batch else { return }
+            if let completed = batch.rebase(lockedAnswers: locked) {
+                controller.respondClarify(answers: completed)
+            }
+            self.batch = batch
+        }
         .padding(24)
         #if os(macOS)
             .frame(minWidth: 420)
