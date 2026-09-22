@@ -2,7 +2,7 @@
 
 A native SwiftUI voice-conversation client for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — macOS 14+ and iOS 17+ from one multiplatform Xcode project. It speaks the same JSON-RPC WebSocket protocol as the Hermes desktop app (loopback token mode, or gated binds with basic-auth password login and/or native OAuth) and replicates its hands-free voice loop: listen → transcribe → submit → speak the streamed reply → re-arm, with full-duplex barge-in and spoken stop words. On iOS an active conversation also shows a lock-screen Live Activity with the current state and mute / stop / end controls.
 
-Built and verified against desktop contract **v6** (hermes-agent `main` as of 2026-08-25); a v5-or-older backend shows a "backend is older than the app was built for" notice.
+Built and verified against desktop contract **v7** (hermes-agent `main` as of 2026-09-22; contract v8 only adds the desktop Connectors page). A v6-or-older backend shows a "backend is older than the app was built for" notice, though approvals and clarify questions still work there through the legacy event path.
 
 ## Screenshots
 
@@ -47,7 +47,7 @@ Packages/MercuryVoiceCore/
 │   ├── GatewayClient       one /api/ws JSON-RPC socket: correlation + event demux
 │   ├── HermesConnection    reconnect supervisor (full-jitter backoff, stable event stream)
 │   ├── SessionAPI          session.create/resume (deferred history), prompt.submit,
-│   │                       projects.tree, approval.respond / clarify.respond
+│   │                       projects.tree, request.answer (legacy approval/clarify.respond)
 │   ├── RESTClient          /api/status, /api/profiles, sessions, transcribe, speak
 │   └── KeychainTokenStore  per-server credentials (session token or password session)
 ├── VoiceEngine    # audio + the conversation state machine
@@ -79,8 +79,9 @@ Key protocol facts honored (verified against the hermes-agent source):
 - `prompt.submit` refusals branch on the machine-readable `error.data.reason` (`SESSION_NOT_OWNED` / `MAX_CONCURRENT_SESSIONS` / `SESSION_COORDINATION_UNAVAILABLE`, backends ≥ 2026-08-31) — never on the message prose — and error 5072 (state.db unavailable, message not saved) maps by code; each gets a spoken-friendly notice, with a generic fallback for unknown reasons.
 - The speak-stream gets `{"done": true}` only when the reply is non-pending **and** the turn is no longer busy, so trailing narration isn't cut off; `{"type":"fallback"}` reroutes to whole-clip TTS.
 - Empty transcript = silence → quietly re-listen (never an error toast).
-- `approval.request` is session-keyed (no request_id); `clarify.request`/`clarify.expire` correlate by `request_id`; both pause the voice loop and speak a short notice.
-- `session.resume` replays a prompt the session is parked on (`pending_approval` / `pending_clarify`) — a question asked while the app was disconnected reappears on reconnect, and a stale local prompt (answered elsewhere or expired) is cleared.
+- **Prompts (contract ≥ 7)**: approvals and clarify questions arrive as JSON-RPC requests *from the server* (`srq-…` ids). The app advertises `client.capabilities {server_requests: true}` on every socket (without it the backend silently withdraws approvals and skips clarify questions), answers through `request.answer` (acknowledged `ok`/`expired`, so the sheet stays up until confirmed), and clears a sheet on `request.cancel` (timeout, interrupt, answered elsewhere). Batch clarify pages one question at a time and sends one `{answers}` reply; answers another client already locked are never re-asked. Requests the app can't show (sudo, secrets, vault, desktop-only tools) are ignored, not refused, so a co-attached desktop can still answer them. Both prompt kinds pause the voice loop and speak a short notice.
+- `session.resume` / `session.activate` return the prompts the session is parked on (`open_requests`; `pending_approval` / `pending_clarify` on contract 6) — a question asked while the app was disconnected reappears on reconnect, and a stale local prompt (answered elsewhere or expired) is cleared.
+- `prompt.submit` refused with 4007 (session no longer live) re-resumes and resubmits once; 4009 (disconnect interrupt settling) retries once after 500 ms. Both refusals come before the prompt is accepted, so a retry can't duplicate a turn.
 - Resumes send `defer_history: true`: the RPC answers immediately and the transcript hydrates in the background (`session.resume_progress` events; a "Loading session history…" notice while it runs). Older backends ignore the flag.
 - `session.usage` ticks (~1/s while a turn runs) drive a live context-window chip in the conversation header, settled by the authoritative `message.complete` usage; the chip hides when the backend reports no real occupancy.
 - Quiet sockets during a busy turn are healthy (server disables WS pings on loopback binds) — no read timeout. Instead, app-foreground probes a seemingly-ready socket with `gateway.ping` and force-redials on failure (half-open sockets after device wake / network switch).
