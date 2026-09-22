@@ -562,6 +562,66 @@ enum Fixtures {
             payload: .object(["text": .string(text)]))
     }
 
+    static func statusUpdate(sessionID: String, seq: Int, kind: String, text: String = "")
+        -> JSONValue
+    {
+        eventParams(
+            type: GatewayEvent.Kind.statusUpdate, sessionID: sessionID, seq: seq,
+            payload: .object(["kind": .string(kind), "text": .string(text)]))
+    }
+
+    static func notificationShow(
+        sessionID: String, seq: Int, text: String, key: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = ["text": .string(text)]
+        if let key { payload["key"] = .string(key) }
+        return eventParams(
+            type: GatewayEvent.Kind.notificationShow, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func notificationClear(sessionID: String, seq: Int, key: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.notificationClear, sessionID: sessionID, seq: seq,
+            payload: .object(["key": .string(key)]))
+    }
+
+    static func subagentStart(
+        sessionID: String, seq: Int, goal: String, taskCount: Int = 1, taskIndex: Int = 0,
+        subagentID: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "goal": .string(goal),
+            "task_count": .number(Double(taskCount)),
+            "task_index": .number(Double(taskIndex)),
+        ]
+        if let subagentID { payload["subagent_id"] = .string(subagentID) }
+        return eventParams(
+            type: GatewayEvent.Kind.subagentStart, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func subagentComplete(
+        sessionID: String, seq: Int, goal: String, taskCount: Int = 1, taskIndex: Int = 0,
+        subagentID: String? = nil
+    ) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "goal": .string(goal),
+            "task_count": .number(Double(taskCount)),
+            "task_index": .number(Double(taskIndex)),
+        ]
+        if let subagentID { payload["subagent_id"] = .string(subagentID) }
+        return eventParams(
+            type: GatewayEvent.Kind.subagentComplete, sessionID: sessionID, seq: seq,
+            payload: .object(payload))
+    }
+
+    static func toolStart(sessionID: String, seq: Int, name: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.toolStart, sessionID: sessionID, seq: seq,
+            payload: .object(["name": .string(name)]))
+    }
+
     static func event(_ params: JSONValue) -> GatewayEvent {
         guard let event = GatewayEvent(eventParams: params) else {
             fatalError("malformed event fixture")

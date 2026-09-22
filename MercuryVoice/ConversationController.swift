@@ -342,6 +342,11 @@ final class ConversationController {
     /// instead cancels the whole pump and resolves every outstanding waiter.
     func resetTracker(busy: Bool) async -> Bool {
         guard !isTornDown, !Task.isCancelled else { return false }
+        // A new session identity (fresh conversation or reconnect resume)
+        // starts with no subagents running, whatever the old runtime last
+        // reported — otherwise a dropped subagent.complete would leak a
+        // stuck "Delegating: …" ticker across the reset.
+        runningSubagents.removeAll()
         let id = UUID()
         let resets = trackerResets
         let completion = resets.register(id)
@@ -423,7 +428,9 @@ final class ConversationController {
         if let contract = handle.desktopContract,
             contract < GatewayClient.builtAgainstDesktopContract
         {
-            notice = "This Hermes backend is older than the app was built for (contract \(contract) < \(GatewayClient.builtAgainstDesktopContract)); some features may misbehave."
+            setNotice(
+                "This Hermes backend is older than the app was built for (contract \(contract) < \(GatewayClient.builtAgainstDesktopContract)); some features may misbehave."
+            )
         }
         let running = handle.raw["running"]?.truthy ?? false
         usage = nil  // new session identity; the first turn re-reports
@@ -449,7 +456,7 @@ final class ConversationController {
 
     private func noteHydration(from handle: SessionHandle) {
         if handle.raw["hydrating"]?.truthy == true {
-            notice = Self.hydrationNotice
+            setNotice(Self.hydrationNotice)
         }
     }
 
@@ -521,7 +528,7 @@ final class ConversationController {
                     Task { @MainActor in self?.setupError = message }
                 },
                 onNotice: { [weak self] message in
-                    Task { @MainActor in self?.notice = message }
+                    Task { @MainActor in self?.setNotice(message) }
                 },
                 onTurnCaptured: { [cues] in cues.playTurnCaptured() },
                 onThinkingTick: { [cues] in cues.playThinkingTick() },
@@ -743,6 +750,18 @@ final class ConversationController {
     /// whenever the runtime session identity changes.
     private var lastSeenSeq: Int?
     private var replayEpoch: String?
+    /// The `key` of the `notification.show` currently shown as `notice`, so
+    /// `notification.clear {key}` only withdraws the notice it named — not
+    /// one from an unrelated code path (reconnect banner, resume failure,
+    /// live-activity report). Every other site that writes `notice` resets
+    /// this to nil so a stale clear can never reach it.
+    private var noticeKey: String?
+    /// Subagents currently delegating, keyed by `subagent_id` (falling back
+    /// to the string task index when absent, since parallel children without
+    /// an id are otherwise indistinguishable). Drives the "Delegating: …"
+    /// ticker while non-empty; reset wherever turn state resets so a
+    /// dropped `subagent.complete` can't leak a stuck ticker forever.
+    private var runningSubagents: Set<String> = []
     /// While a reconnect-resume is deciding between event replay and a tracker
     /// reset, live events are parked here so replayed frames can't interleave
     /// out of order with them; the seq gate dedups any overlap on drain.
@@ -811,6 +830,7 @@ final class ConversationController {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")
                 toolTicker = nil
+                runningSubagents.removeAll()
                 // End-of-turn usage is authoritative; the server guarantees no
                 // stale session.usage tick lands after this event.
                 if let complete = event.payload["usage"].flatMap(SessionUsage.init(json:)) {
@@ -903,7 +923,7 @@ final class ConversationController {
         case GatewayEvent.Kind.sessionResumeProgress:
             switch event.payload["status"]?.stringValue {
             case "complete":
-                if notice == Self.hydrationNotice { notice = nil }
+                if notice == Self.hydrationNotice { setNotice(nil) }
             case "failed":
                 // The gateway discards the session on hydration failure; the
                 // setup-error alert offers the way back to the session list.
@@ -915,7 +935,36 @@ final class ConversationController {
             }
 
         case GatewayEvent.Kind.notificationShow:
-            notice = event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue
+            setNotice(
+                event.payload["text"]?.stringValue ?? event.payload["message"]?.stringValue,
+                key: event.payload["key"]?.stringValue)
+
+        case GatewayEvent.Kind.notificationClear:
+            // Withdraws the notice `notification.show` set with this key —
+            // only that one; a stale or unrelated key leaves `notice` alone,
+            // and a notice with no key was never eligible to be cleared.
+            if let key = event.payload["key"]?.stringValue, key == noticeKey {
+                setNotice(nil)
+            }
+
+        case GatewayEvent.Kind.statusUpdate:
+            if event.payload["kind"]?.stringValue == "compacting" {
+                toolTicker = "Compacting context…"
+            }
+
+        case GatewayEvent.Kind.subagentStart:
+            let goal = event.payload["goal"]?.stringValue ?? "subtask"
+            runningSubagents.insert(subagentKey(for: event))
+            toolTicker = "Delegating: \(Self.truncatedGoal(goal))…"
+
+        case GatewayEvent.Kind.subagentComplete:
+            runningSubagents.remove(subagentKey(for: event))
+            // Only retire the ticker once every child is done, and only if
+            // it's still the delegating ticker this family set — a tool
+            // ticker started since (or another family's) must survive.
+            if runningSubagents.isEmpty, toolTicker?.hasPrefix("Delegating: ") == true {
+                toolTicker = nil
+            }
 
         case GatewayEvent.Kind.sessionReclaimed:
             // Broadcast (no session_id on the frame): the server reaped a
@@ -936,6 +985,23 @@ final class ConversationController {
         default:
             break
         }
+    }
+
+    /// Identifies one child of a `subagent.start`/`subagent.complete` pair
+    /// for `runningSubagents`. `subagent_id` when the payload carries one;
+    /// otherwise `task_index`, which is stable across the pair for a given
+    /// child even when several run in parallel.
+    private func subagentKey(for event: GatewayEvent) -> String {
+        event.payload["subagent_id"]?.stringValue
+            ?? "\(event.payload["task_index"]?.intValue ?? 0)"
+    }
+
+    /// The ticker shows the goal's first line, capped at 60 characters, so a
+    /// multi-line or long delegation goal can't blow out the status line.
+    private static func truncatedGoal(_ goal: String) -> String {
+        let firstLine = goal.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? goal
+        guard firstLine.count > 60 else { return firstLine }
+        return String(firstLine.prefix(60)) + "…"
     }
 
     /// Bumped each time an approval sheet is presented. Approvals are
@@ -1380,7 +1446,7 @@ final class ConversationController {
                 guard resetApplied else { return false }
                 adoptPendingPrompts(from: handle, clearStale: true)
             }
-            if !recovering { notice = "Reconnected." }
+            if !recovering { setNotice("Reconnected.") }
             noteHydration(from: handle)
             return true
         } catch {
@@ -1630,13 +1696,21 @@ final class ConversationController {
     }
 
     func clearNotice() {
-        notice = nil
+        setNotice(nil)
     }
 
     /// Show an out-of-band notice from outside the engine (the Live
     /// Activity controller reports a failed request this way).
     func showNotice(_ message: String) {
+        setNotice(message)
+    }
+
+    /// The one place `notice` is written. `key` is the `notification.show`
+    /// key this notice can be withdrawn by (nil for every other source), so
+    /// a later `notification.clear` can only ever reach the notice it named.
+    private func setNotice(_ message: String?, key: String? = nil) {
         notice = message
+        noticeKey = key
     }
 
     /// Try the microphone again after a permission denial (the user may

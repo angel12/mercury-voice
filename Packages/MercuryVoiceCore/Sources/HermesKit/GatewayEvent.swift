@@ -48,6 +48,12 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let sessionResumeProgress = "session.resume_progress"
         public static let sessionTitle = "session.title"
         public static let notificationShow = "notification.show"
+        /// Withdraws the notice a `notification.show` with the same `key` set.
+        public static let notificationClear = "notification.clear"
+        /// A subagent delegation began/ended (`{goal, task_count, task_index,
+        /// subagent_id?}`). Several may run in parallel (task_count > 1).
+        public static let subagentStart = "subagent.start"
+        public static let subagentComplete = "subagent.complete"
         public static let sessionReclaimed = "session.reclaimed"
         public static let error = "error"
         /// Client-local: a server→client request routed as an event
