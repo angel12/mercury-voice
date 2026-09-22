@@ -93,6 +93,15 @@ final class ConversationController {
     /// nil in production: `startVoiceLoop` builds the live stack.
     private let audio: AudioStack?
     private let profile: String?
+    /// Names this controller's claim on the server-side TTS model
+    /// (`POST /api/audio/tts-lease`, issue #125). Minted once per
+    /// controller — NOT a fixed shared name — because upstream keys leases
+    /// by name only: a shared name would let one device's release drop
+    /// another's warm-up.
+    private let ttsLeaseName = "mercury:conversation:\(UUID().uuidString)"
+    /// Fire-and-forget handle for the acquire kicked off in `openSession`;
+    /// joined only by `diagnosticAwaitTTSLeaseAcquire()` in tests.
+    private var ttsLeaseAcquireTask: Task<Void, Never>?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
@@ -326,6 +335,13 @@ final class ConversationController {
         trackerEventPump?.cancel()
     }
 
+    /// Diagnostic only: join the fire-and-forget TTS-lease acquire kicked
+    /// off by `openSession`, so a test can assert on it deterministically
+    /// instead of racing the detached task.
+    func diagnosticAwaitTTSLeaseAcquire() async {
+        await ttsLeaseAcquireTask?.value
+    }
+
     /// Read the same actor that the real voice engine uses, without starting
     /// that engine or installing any process-global audio handlers.
     func diagnosticTrackerState() async -> (text: String, busy: Bool, pendingText: String?) {
@@ -423,6 +439,16 @@ final class ConversationController {
         }
         sessionBox.runtimeID = handle.runtimeID
         sessionBox.storedID = handle.storedID
+        // Acquire the TTS lease as the conversation starts. Fire-and-forget:
+        // warm-up is a nicety the backend reports failures for in its own
+        // body (never an HTTP error), and it must never delay `begin()`
+        // reaching `startVoiceLoop()` — i.e. never delay listening.
+        let leaseService = sessionService
+        let leaseName = ttsLeaseName
+        let leaseProfile = profile
+        ttsLeaseAcquireTask = Task {
+            await leaseService.ttsLease(leaseName, active: true, profile: leaseProfile)
+        }
         sessionTitle = handle.title?.isEmpty == false ? handle.title : nil
         projectName = handle.project
         if let contract = handle.desktopContract,
@@ -611,6 +637,9 @@ final class ConversationController {
     private func closeSessionIfOpen() async {
         guard let sid = sessionBox.runtimeID else { return }
         sessionBox.runtimeID = nil
+        // Paired with the acquire in `openSession`: this guard only passes
+        // once per session, so the release fires exactly once per acquire.
+        await sessionService.ttsLease(ttsLeaseName, active: false, profile: profile)
         await sessionService.closeSession(sessionID: sid)
     }
 

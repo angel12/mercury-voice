@@ -35,6 +35,14 @@ protocol SessionServicing: Sendable {
     func respondApproval(sessionID: String, choice: String) async throws
     func respondClarify(requestID: String, answer: String) async throws
     func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer
+
+    /// `POST /api/audio/tts-lease` (contract ≥ 7) — acquire/release this
+    /// conversation's claim on the server-side TTS model. Best-effort: never
+    /// throws, so the controller can fire it without gating on the result.
+    /// Part of this seam (unlike the rest of `rest`) because *whether* and
+    /// *how many times* it fires is exactly the acquire/release-once
+    /// behaviour under test here.
+    func ttsLease(_ lease: String, active: Bool, profile: String?) async
 }
 
 extension HermesConnection: SessionServicing {}

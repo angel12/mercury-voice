@@ -141,6 +141,25 @@ public struct HermesRESTClient: Sendable {
         return endpoint.webSocketURL("/api/audio/speak-stream", query: query)
     }
 
+    /// `POST /api/audio/tts-lease` — acquire (`active: true`) or release
+    /// (`active: false`) the named surface's claim on the server-side TTS
+    /// model, so the backend can warm it on acquire and unload it once no
+    /// surface holds one. Best-effort only: never gates listening, so every
+    /// failure is swallowed — a 404 from a pre-lease backend, a transport
+    /// error, a non-2xx status. Callers fire this without a try.
+    public func ttsLease(_ lease: String, active: Bool, profile: String?) async {
+        do {
+            _ = try await post(
+                "/api/audio/tts-lease",
+                query: profileQuery(profile),
+                body: ["lease": .string(lease), "active": .bool(active)])
+        } catch {
+            // Warm-up/lease bookkeeping is a nicety, not a precondition for
+            // speech; an old backend without the route, or a dropped
+            // connection, must not disturb the conversation.
+        }
+    }
+
     // MARK: Plumbing
 
     private func profileQuery(_ profile: String?) -> [URLQueryItem] {

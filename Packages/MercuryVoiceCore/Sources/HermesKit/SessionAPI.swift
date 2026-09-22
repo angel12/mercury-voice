@@ -245,4 +245,12 @@ extension HermesConnection {
             params: ServerRequestAnswer.answerParams(id: id, result: result))
         return ServerRequestAnswer(reply: reply)
     }
+
+    // MARK: TTS lease
+
+    /// `POST /api/audio/tts-lease` — plain REST, not a gateway RPC, so this
+    /// just forwards to `rest`.
+    public func ttsLease(_ lease: String, active: Bool, profile: String?) async {
+        await rest.ttsLease(lease, active: active, profile: profile)
+    }
 }
