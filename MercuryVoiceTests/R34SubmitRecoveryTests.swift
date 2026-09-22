@@ -117,6 +117,51 @@ struct R34SubmitRecoveryTests {
         await controller.teardown()
     }
 
+    /// The reverse order: a 4007 recovery's resume is already in flight when
+    /// the new socket reports ready. The socket still runs its own resume,
+    /// but only after the recovery's has finished — two overlapping resumes
+    /// would share the event hold, and the first one's drain would release
+    /// it while the second was still deciding replay vs reset.
+    @Test func socketReadyDuringRecoveryResumeWaitsForIt() async throws {
+        let service = ScriptedSessionService()
+        service.enqueueCreate(Fixtures.resumeResult(runtimeID: "runtime", storedID: "stored"))
+        service.enqueueResume(Fixtures.resumeResult(runtimeID: "runtime-2", storedID: "stored"))
+        service.enqueueResume(Fixtures.resumeResult(runtimeID: "runtime-2", storedID: "stored"))
+        let recoveryGate = CallGate()
+        service.resumeGate = recoveryGate
+        let submits = SubmitLog()
+        let controller = makeRecoveringController(
+            service: service, submits: submits, delays: DelayLog(), answers: [Self.notLive, nil])
+        try await controller.openSession(mode: .create(cwd: nil, title: nil))
+        controller.submitTextPrompt("hello")
+        await recoveryGate.waitUntilEntered()
+
+        let socketGate = CallGate()
+        service.resumeGate = socketGate
+        let reconnect = Task { await controller.connectionBecameReady(isReconnect: true) }
+        // A later main-actor job at the same priority runs after the
+        // reconnect's first one, so by here it has either started its own
+        // resume (the bug) or suspended on the recovery's.
+        await Task { @MainActor in }.value
+        await recoveryGate.release()
+        await controller.textSubmissionTask?.value
+
+        // The socket's resume starts only now, with the recovery's finished;
+        // a live event landing while it is suspended is still held.
+        await socketGate.waitUntilEntered()
+        #expect(service.resumedIDs == ["stored", "stored"])
+        #expect(await submits.calls.map(\.sid) == ["runtime", "runtime-2"])
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.statusUpdate(sessionID: "runtime-2", seq: 1, kind: "compacting")))
+        #expect(controller.toolTicker == nil)
+
+        await socketGate.release()
+        await reconnect.value
+        #expect(controller.toolTicker == "Compacting context…")
+        await controller.teardown()
+    }
+
     @Test func settlingWaitsThenResubmitsWithoutResume() async throws {
         let service = ScriptedSessionService()
         service.enqueueCreate(Fixtures.resumeResult(runtimeID: "runtime", storedID: "stored"))

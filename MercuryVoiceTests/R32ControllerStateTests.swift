@@ -107,6 +107,37 @@ struct R32ControllerStateTests {
     }
 
     @Test
+    func compactedStatusClearsCompactingTicker() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await makeOpenController(service)
+        defer { Task { await controller.teardown() } }
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.statusUpdate(sessionID: "rt", seq: 1, kind: "compacting")))
+        #expect(controller.toolTicker == "Compacting context…")
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.statusUpdate(sessionID: "rt", seq: 2, kind: "compacted")))
+        #expect(controller.toolTicker == nil)
+    }
+
+    @Test
+    func compactedStatusLeavesALaterToolTicker() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await makeOpenController(service)
+        defer { Task { await controller.teardown() } }
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.statusUpdate(sessionID: "rt", seq: 1, kind: "compacting")))
+        controller.handle(
+            event: Fixtures.event(Fixtures.toolStart(sessionID: "rt", seq: 2, name: "grep")))
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.statusUpdate(sessionID: "rt", seq: 3, kind: "compacted")))
+        #expect(controller.toolTicker == "Running: grep…")
+    }
+
+    @Test
     func subagentStartSetsDelegatingTickerAndCompleteClearsIt() async throws {
         let service = ScriptedSessionService()
         let controller = try await makeOpenController(service)

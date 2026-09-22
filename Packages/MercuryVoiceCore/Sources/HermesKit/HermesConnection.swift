@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Owns the lifecycle of a server connection: dial, stay connected, reconnect
 /// with full-jitter exponential backoff, and republish gateway events across
@@ -8,6 +9,8 @@ import Foundation
 /// the cue to re-`session.resume` by **stored** id (runtime ids are recycled
 /// across backend restarts).
 public actor HermesConnection {
+    private static let logger = Logger(subsystem: "MercuryVoice", category: "HermesKit")
+
     public enum Phase: Sendable, Equatable {
         case disconnected(reason: String?)
         case connecting(attempt: Int)
@@ -272,10 +275,20 @@ public actor HermesConnection {
             // questions skipped server-side before this client ever sees them
             // (hermes-agent f9d178f78e). Once per socket — the server forgets
             // the advertisement on disconnect. Old backends answer -32601.
-            _ = try? await client.request(
-                "client.capabilities",
-                params: .object(["server_requests": .bool(true)]),
-                timeout: 5)
+            // A failure is only logged — the socket is still usable — but on
+            // a contract ≥ 7 backend it means this socket's prompts may be
+            // auto-skipped, which is otherwise invisible from the client.
+            do {
+                _ = try await client.request(
+                    "client.capabilities",
+                    params: .object(["server_requests": .bool(true)]),
+                    timeout: 5)
+            } catch {
+                let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
+                Self.logger.error(
+                    "client.capabilities failed (\(reason, privacy: .public)); a contract ≥ 7 backend may auto-skip prompts on this socket"
+                )
+            }
             guard ownsSupervisor(lifetime) else {
                 await client.close(reason: "stopped")
                 return

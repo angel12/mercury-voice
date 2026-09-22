@@ -447,7 +447,16 @@ public actor GatewayClient {
     /// JSON-RPC "method not found" for a server request this app cannot
     /// render, so the backend's `send()` returns at once instead of parking
     /// the agent until its deadline. Fire-and-forget: a lost write is a lost
-    /// socket, and the request then reaches `open_requests` anyway.
+    /// socket, and the request simply stays open server-side.
+    ///
+    /// Only a live frame is refused. An unanswerable entry seen later in
+    /// `open_requests` (sudo, secret, vault.*, …) is deliberately left alone
+    /// — the controller ignores it rather than refusing it — because another
+    /// attached client (the desktop) may still answer it through
+    /// `request.answer` or its own response frame, and a refusal there would
+    /// take that away. Upstream fails a request fast only once every
+    /// attached client is non-advertising; until then it waits on whichever
+    /// client can render it.
     private func refuse(_ request: ServerRequest) {
         guard let task else { return }
         let frame: JSONValue = .object([

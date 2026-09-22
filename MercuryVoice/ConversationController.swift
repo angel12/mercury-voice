@@ -494,6 +494,7 @@ final class ConversationController {
     /// hydration should be visible; the resume_progress events clear or fail
     /// it.
     private static let hydrationNotice = "Loading session history…"
+    private static let compactingTicker = "Compacting context…"
 
     private func noteHydration(from handle: SessionHandle) {
         if handle.raw["hydrating"]?.truthy == true {
@@ -832,6 +833,12 @@ final class ConversationController {
     /// out of order with them; the seq gate dedups any overlap on drain.
     private var holdingEvents = false
     private var heldEvents: [GatewayEvent] = []
+    /// Server-request ids withdrawn by a `request.cancel` in the replay batch
+    /// just applied. A server request is never seq-stamped, so a held copy of
+    /// one cancelled during the outage would pass the seq gate on drain and
+    /// be presented again — while the live copy of its cancel, which *is*
+    /// stamped, is dropped there as already seen. Consumed by the drain.
+    private var replayCancelledRequestIDs: Set<String> = []
 
     /// Called by AppModel's pump for every gateway event.
     func handle(event: GatewayEvent) {
@@ -853,8 +860,17 @@ final class ConversationController {
     private func drainHeldEvents() {
         holdingEvents = false
         let held = heldEvents
+        let cancelled = replayCancelledRequestIDs
         heldEvents = []
-        for event in held { apply(event) }
+        replayCancelledRequestIDs = []
+        for event in held {
+            if event.type == GatewayEvent.Kind.serverRequest,
+                let id = event.payload["id"]?.stringValue, cancelled.contains(id)
+            {
+                continue
+            }
+            apply(event)
+        }
     }
 
     /// The event families whose state a post-batch prompt read owns.
@@ -1013,8 +1029,18 @@ final class ConversationController {
             }
 
         case GatewayEvent.Kind.statusUpdate:
-            if event.payload["kind"]?.stringValue == "compacting" {
-                toolTicker = "Compacting context…"
+            switch event.payload["kind"]?.stringValue {
+            case "compacting":
+                toolTicker = Self.compactingTicker
+            case "compacted":
+                // The terminal edge of a compaction (upstream
+                // conversation_compression.py `_emit_compaction_done`). The
+                // turn continues, so without this the ticker would stick
+                // until `message.complete`. Only our own ticker comes down:
+                // a tool or delegation that started since owns it now.
+                if toolTicker == Self.compactingTicker { toolTicker = nil }
+            default:
+                break
             }
 
         case GatewayEvent.Kind.subagentStart:
@@ -1122,38 +1148,16 @@ final class ConversationController {
         // nothing left to ask (review round 1, issue #125): presenting it
         // would show "Question 1 of 0" and speak "Hermes has 0 questions for
         // you.", and its "Skip all" would send `{}` — cancel-all — discarding
-        // the locked answers instead of confirming them. Upstream resolves
-        // the request as soon as the last question locks, so this
-        // request.answer is normally just confirming a decision already
-        // settled: `.expired` is the expected reply here, not a failure.
-        if isBatch, remaining == 0 {
-            submitFullyLockedBatch(request)
-            return
-        }
+        // the locked answers instead of confirming them. Nor is anything
+        // sent: upstream resolves the request the moment its last question
+        // locks, so it is already settled and a `request.answer` could only
+        // come back `expired`. It is simply not shown.
+        if isBatch, remaining == 0 { return }
         clarify = request
         promptSendError = nil
         announce(
             .clarify(requestID: request.requestID, remainingQuestions: remaining, isBatch: isBatch)
         )
-    }
-
-    /// Submits `request.lockedAnswers` for a batch with nothing left to ask,
-    /// without ever presenting a sheet — so there is no `clarify` sheet state
-    /// to clear on success or surface an error on. `.expired` and a genuine
-    /// failure are both silently swallowed for the same reason: no UI is
-    /// watching this request.
-    private func submitFullyLockedBatch(_ request: ClarifyRequest) {
-        guard let serverRequestID = request.serverRequestID else { return }
-        sendPromptResponse {
-            _ = try await $0.answerServerRequest(
-                id: serverRequestID,
-                result: .object([
-                    "answers": .object(request.lockedAnswers.mapValues(JSONValue.string))
-                ]))
-        } onConfirmed: {
-        } applyError: {
-            false
-        }
     }
 
     // MARK: Spoken prompt notices
@@ -1287,6 +1291,14 @@ final class ConversationController {
     /// field is the fallback only when no usable entry of that family exists
     /// — the contract-6 case. Entries are taken oldest first, as the gateway
     /// lists them, matching `pending_approval`'s oldest-unresolved choice.
+    ///
+    /// Entries of any other method (sudo, secret, vault.*, …) are ignored,
+    /// deliberately *not* refused the way `GatewayClient` refuses such a live
+    /// frame: the first response to a server request settles it for every
+    /// surface, and another attached client (the desktop) may still answer
+    /// it through `request.answer` or its own response frame. Upstream only
+    /// fails such a request fast when every attached client is
+    /// non-advertising (server_requests.py `_answerable`).
     private func adoptPendingPrompts(
         sessionID: String,
         approvalPayload: JSONValue?,
@@ -1371,26 +1383,43 @@ final class ConversationController {
     ///
     /// Reordering rather than merging is deliberate. The snapshot carries
     /// resolutions but no seq, the frames carry seq but never a resolution
-    /// (nothing is emitted when an approval or clarify is answered), so the
-    /// two cannot be placed on one axis at all; taking the last read as the
-    /// whole answer needs no ordering rule.
+    /// (on contract 6, nothing is emitted when an approval or clarify is
+    /// answered), so the two cannot be placed on one axis at all; taking the
+    /// last read as the whole answer needs no ordering rule.
     ///
     /// The batch is fetched before that read but applied only after it
     /// succeeds, so a failure leaves the watermark and every sheet exactly
     /// where the un-replayed path would have them.
     ///
-    /// **Known residual, tracked separately.** A prompt whose frame is
-    /// emitted before the read and resolved by another client before the
-    /// read still resurrects: the frame is held, drains after the sheets are
-    /// adopted, and no resolution frame exists to clear it. That is the
-    /// silent-resolution defect, and it reproduces with no reconnect at all —
-    /// a continuously connected client shows the same dead sheet from the
-    /// same server history. It needs `approval.resolved` / `clarify.resolved`
-    /// on the gateway, and no read order can substitute for them.
+    /// **Resolution frames.** Contract ≥ 7 does have one: a server request
+    /// is withdrawn by `request.cancel {id}` (answered elsewhere, timed out,
+    /// interrupted). A held srq whose cancel is in the replay batch is
+    /// dropped on drain (`replayCancelledRequestIDs`), since the srq carries
+    /// no seq and its held cancel would be gated out as already seen; a
+    /// cancel that is itself still held clears the sheet as it drains.
+    ///
+    /// **Known residual (contract 6 only).** A legacy `approval.request` /
+    /// `clarify.request` frame emitted before the read and resolved by
+    /// another client before the read still resurrects: the frame is held,
+    /// drains after the sheets are adopted, and no resolution frame exists
+    /// to clear it. That is the silent-resolution defect, and it reproduces
+    /// with no reconnect at all — a continuously connected client shows the
+    /// same dead sheet from the same server history. No read order can
+    /// substitute for a resolution frame.
     func connectionBecameReady(isReconnect: Bool) async {
         guard !isTornDown else { return }
         connectionHealthy = true
         guard isReconnect else { return }
+        // A 4007 recovery may already be resuming on the old routing. Let it
+        // finish before this socket runs its own resume: two resumes share
+        // one event hold, and the first to finish would drain it under the
+        // second while that one is still deciding replay vs reset. This
+        // socket still resumes afterwards — the recovery's attach may have
+        // gone to the socket this one replaced.
+        if let inFlight = reconnectResume {
+            _ = await inFlight.value
+            guard !isTornDown, !Task.isCancelled else { return }
+        }
         let task = startReconnectResume(recovering: false)
         await withTaskCancellationHandler {
             _ = await task.value
@@ -1431,6 +1460,7 @@ final class ConversationController {
             if isTornDown {
                 holdingEvents = false
                 heldEvents.removeAll()
+                replayCancelledRequestIDs.removeAll()
             } else {
                 drainHeldEvents()
             }
@@ -1488,7 +1518,14 @@ final class ConversationController {
             }
 
             if let batch, let prompts {
-                for event in batch { apply(event, skippingPromptFamilies: true) }
+                for event in batch {
+                    if event.type == GatewayEvent.Kind.requestCancel,
+                        let id = event.payload["id"]?.stringValue
+                    {
+                        replayCancelledRequestIDs.insert(id)
+                    }
+                    apply(event, skippingPromptFamilies: true)
+                }
                 adoptPendingPrompts(from: prompts, clearStale: true)
             } else {
                 // No usable replay: the batch (if one was fetched) is

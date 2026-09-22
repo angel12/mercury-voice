@@ -295,6 +295,71 @@ struct R33ServerRequestPromptTests {
         await controller.teardown()
     }
 
+    /// Starts a usable-replay reconnect and parks it inside
+    /// `session.events.since`, so frames handled before `release()` land in
+    /// the reconnect hold.
+    private func reconnectHeldAtReplay(
+        _ controller: ConversationController,
+        service: ScriptedSessionService,
+        batch: [JSONValue],
+        openRequests: [JSONValue]
+    ) async -> (gate: CallGate, done: Task<Void, Never>) {
+        let gate = CallGate()
+        service.eventsSinceGate = gate
+        service.enqueueResume(
+            Fixtures.resumeResult(runtimeID: Self.runtimeID, storedID: Self.storedID))
+        service.enqueueBatch(
+            Fixtures.replayBatch(batch, latestSeq: Self.watermark + batch.count))
+        service.enqueueActivation(
+            Fixtures.activateResult(
+                runtimeID: Self.runtimeID, sessionKey: Self.storedID,
+                openRequests: openRequests))
+        let done = Task { await controller.connectionBecameReady(isReconnect: true) }
+        await gate.waitUntilEntered()
+        return (gate, done)
+    }
+
+    @Test("a held srq whose request.cancel is in the replay batch is not presented on drain")
+    func heldServerRequestCancelledInReplayStaysDown() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+        let cancel = Fixtures.requestCancel(
+            sessionID: Self.runtimeID, seq: Self.watermark + 1, id: "srq-a1")
+        let (gate, done) = await reconnectHeldAtReplay(
+            controller, service: service, batch: [cancel], openRequests: [])
+
+        // The srq (never seq-stamped) and the live copy of its cancel both
+        // arrive on the new socket while the replay is in flight.
+        controller.handle(event: Fixtures.serverRequestEvent(srqApproval()))
+        controller.handle(event: Fixtures.event(cancel))
+        await gate.release()
+        await done.value
+        await controller.awaitPromptAnnouncements()
+
+        #expect(controller.approval == nil)
+        #expect(speech.spoken.isEmpty)
+        await controller.teardown()
+    }
+
+    @Test("a held srq still open in the post-batch read is presented and announced once")
+    func heldServerRequestStillOpenPresentsOnce() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+        let (gate, done) = await reconnectHeldAtReplay(
+            controller, service: service, batch: [], openRequests: [srqClarify()])
+
+        controller.handle(event: Fixtures.serverRequestEvent(srqClarify()))
+        await gate.release()
+        await done.value
+        await controller.awaitPromptAnnouncements()
+
+        #expect(controller.clarify?.serverRequestID == "srq-q1")
+        #expect(speech.spoken == [Self.clarifyNotice])
+        await controller.teardown()
+    }
+
     @Test("a legacy sheet is upgraded in place when its srq arrives, without re-announcing")
     func legacySheetIsUpgradedInPlace() async throws {
         let service = ScriptedSessionService()
@@ -384,10 +449,11 @@ struct R33ServerRequestPromptTests {
         await controller.teardown()
     }
 
-    @Test(
-        "a batch that arrives fully locked submits immediately, with no sheet and no announcement"
-    )
-    func fullyLockedBatchSubmitsImmediately() async throws {
+    /// Upstream resolves a batch the moment its last question locks, so one
+    /// that arrives fully locked is already settled: there is nothing to
+    /// show, say or send (a `request.answer` could only come back `expired`).
+    @Test("a batch that arrives fully locked shows no sheet, says nothing and sends nothing")
+    func fullyLockedBatchIsIgnored() async throws {
         let service = ScriptedSessionService()
         let speech = RecordingSpeech()
         let controller = try await openedController(service: service, speech: speech)
@@ -400,17 +466,7 @@ struct R33ServerRequestPromptTests {
 
         #expect(controller.clarify == nil)
         #expect(speech.spoken.isEmpty)
-        #expect(
-            service.promptResponses == [
-                .requestAnswer(
-                    params: answerParams(
-                        id: "srq-b1",
-                        [
-                            "answers": .object([
-                                "q1": .string("main"), "q2": .string("prod"),
-                            ])
-                        ]))
-            ])
+        #expect(service.promptResponses.isEmpty)
         await controller.teardown()
     }
 
