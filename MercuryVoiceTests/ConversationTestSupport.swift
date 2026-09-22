@@ -49,6 +49,10 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     /// `clarify.respond`, `request.answer`) suspends here after it is
     /// recorded — the window in which the sheet must still be up.
     var promptResponseGate: CallGate?
+    /// When set, the TTS-lease *acquire* (`active: true`) suspends here
+    /// after being recorded — the window in which teardown/close must be
+    /// able to complete without waiting on it (issue #125, Task 9 review).
+    var ttsLeaseAcquireGate: CallGate?
 
     /// A prompt response the controller sent, in the shape it reached the
     /// wire. `request.answer` is recorded as its full params object so a test
@@ -218,6 +222,7 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
 
     func ttsLease(_ lease: String, active: Bool, profile: String?) async {
         lock.withLock { _ttsLeaseCalls.append((lease, active, profile)) }
+        if active, let ttsLeaseAcquireGate { await ttsLeaseAcquireGate.arrive() }
     }
 }
 

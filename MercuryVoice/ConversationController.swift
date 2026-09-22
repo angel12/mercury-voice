@@ -99,9 +99,18 @@ final class ConversationController {
     /// by name only: a shared name would let one device's release drop
     /// another's warm-up.
     private let ttsLeaseName = "mercury:conversation:\(UUID().uuidString)"
-    /// Fire-and-forget handle for the acquire kicked off in `openSession`;
-    /// joined only by `diagnosticAwaitTTSLeaseAcquire()` in tests.
+    /// Fire-and-forget handle for the acquire kicked off in `openSession`.
+    /// `closeSessionIfOpen` consumes this (sets it nil) so the release task
+    /// it spawns can await this exact acquire before sending `active:
+    /// false` — the acquire is slow by design (the backend preloads the TTS
+    /// model off-loop, which can take seconds), so ordering the release
+    /// after it must never block teardown/close itself. Also joined by
+    /// `diagnosticAwaitTTSLeaseAcquire()` in tests.
     private var ttsLeaseAcquireTask: Task<Void, Never>?
+    /// Fire-and-forget handle for the release spawned by
+    /// `closeSessionIfOpen`; joined only by
+    /// `diagnosticAwaitTTSLeaseRelease()` in tests.
+    private var ttsLeaseReleaseTask: Task<Void, Never>?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
@@ -340,6 +349,12 @@ final class ConversationController {
     /// instead of racing the detached task.
     func diagnosticAwaitTTSLeaseAcquire() async {
         await ttsLeaseAcquireTask?.value
+    }
+
+    /// Diagnostic only: join the fire-and-forget TTS-lease release spawned
+    /// by `closeSessionIfOpen`.
+    func diagnosticAwaitTTSLeaseRelease() async {
+        await ttsLeaseReleaseTask?.value
     }
 
     /// Read the same actor that the real voice engine uses, without starting
@@ -638,9 +653,30 @@ final class ConversationController {
         guard let sid = sessionBox.runtimeID else { return }
         sessionBox.runtimeID = nil
         // Paired with the acquire in `openSession`: this guard only passes
-        // once per session, so the release fires exactly once per acquire.
-        await sessionService.ttsLease(ttsLeaseName, active: false, profile: profile)
+        // once per session, so the release below fires exactly once per
+        // acquire.
+        releaseTTSLease()
         await sessionService.closeSession(sessionID: sid)
+    }
+
+    /// Spawns the release (`active: false`) as its own fire-and-forget task
+    /// that first awaits the stored acquire task, then sends the release —
+    /// never the other way around, and never awaited here. The acquire can
+    /// take seconds (the backend preloads the TTS model off-loop), so
+    /// close/teardown must complete without waiting on it; ordering the
+    /// release after it, off this call's critical path, is what stops a
+    /// short conversation's release racing ahead of its acquire and leaving
+    /// this controller's uniquely-named lease held forever.
+    private func releaseTTSLease() {
+        let acquireTask = ttsLeaseAcquireTask
+        ttsLeaseAcquireTask = nil
+        let leaseService = sessionService
+        let leaseName = ttsLeaseName
+        let leaseProfile = profile
+        ttsLeaseReleaseTask = Task {
+            _ = await acquireTask?.value
+            await leaseService.ttsLease(leaseName, active: false, profile: leaseProfile)
+        }
     }
 
     /// AppModel forwards scene-active. Foregrounding is authoritative: an

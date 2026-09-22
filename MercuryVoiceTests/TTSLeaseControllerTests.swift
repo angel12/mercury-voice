@@ -71,6 +71,35 @@ struct TTSLeaseControllerTests {
         await controllerB.teardown()
     }
 
+    @Test func teardownDoesNotWaitOnASlowAcquireButOrdersTheReleaseAfterIt() async throws {
+        // Review finding: the acquire is slow by design (the backend
+        // preloads the TTS model off-loop, which can take seconds), so a
+        // short conversation must not let the release race ahead of it —
+        // but teardown/close must also not block on that slow acquire.
+        let service = ScriptedSessionService()
+        let gate = CallGate()
+        service.ttsLeaseAcquireGate = gate
+        service.enqueueResume(Fixtures.resumeResult(runtimeID: "rt1", storedID: "st1"))
+        let controller = makeController(service: service)
+
+        try await controller.openSession(mode: .resume(storedID: "st1"))
+        await gate.waitUntilEntered()  // the acquire is genuinely in flight
+
+        // Teardown must complete without ever waiting on the gate.
+        await controller.teardown()
+        #expect(service.ttsLeaseCalls.count == 1)  // only the acquire so far
+        #expect(service.closedIDs == ["rt1"])  // close itself was not held up
+
+        // Only once the acquire is let through does the release follow.
+        await gate.release()
+        await controller.diagnosticAwaitTTSLeaseRelease()
+
+        #expect(service.ttsLeaseCalls.count == 2)
+        #expect(service.ttsLeaseCalls[0].active == true)
+        #expect(service.ttsLeaseCalls[1].active == false)
+        #expect(service.ttsLeaseCalls[0].lease == service.ttsLeaseCalls[1].lease)
+    }
+
     @Test func failedOpenSessionNeverAcquires() async {
         // No scripted resume answer: `resumeSession` throws before a
         // session is ever considered open, so there is nothing to lease.
