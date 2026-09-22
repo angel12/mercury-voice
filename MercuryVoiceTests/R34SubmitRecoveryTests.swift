@@ -20,7 +20,8 @@ struct R34SubmitRecoveryTests {
         service: ScriptedSessionService,
         submits: SubmitLog,
         delays: DelayLog,
-        answers: [HermesError?]
+        answers: [HermesError?],
+        willResume: (@MainActor @Sendable (Bool) -> Void)? = nil
     ) -> ConversationController {
         ConversationController(
             connection: makeUndialedConnection(), profile: nil,
@@ -30,7 +31,8 @@ struct R34SubmitRecoveryTests {
                     sid: sid, text: text, resumesSoFar: service.resumedIDs.count)
                 if index < answers.count, let error = answers[index] { throw error }
             },
-            retryDelay: { await delays.record($0) })
+            retryDelay: { await delays.record($0) },
+            reattachRecoveryWillResume: willResume)
     }
 
     @Test func notLiveReResumesThenResubmitsOnce() async throws {
@@ -52,6 +54,66 @@ struct R34SubmitRecoveryTests {
         #expect(service.resumedIDs == ["stored"])
         #expect(controller.failedText == nil)
         #expect(controller.devMessages.map(\.text) == ["hello"])
+        // The refused prompt never ran, so the resume reports running=false;
+        // the reset must still leave the resubmitted turn busy or the engine
+        // re-arms the mic instead of awaiting the reply.
+        #expect(await controller.diagnosticTrackerState().busy)
+        // The user saw no disconnect.
+        #expect(controller.notice != "Reconnected.")
+        await controller.teardown()
+    }
+
+    @Test func failedReResumeSurfacesOneErrorWithoutResubmitting() async throws {
+        let service = ScriptedSessionService()
+        service.enqueueCreate(Fixtures.resumeResult(runtimeID: "runtime", storedID: "stored"))
+        // No scripted resume: the re-resume fails.
+        let submits = SubmitLog()
+        let controller = makeRecoveringController(
+            service: service, submits: submits, delays: DelayLog(), answers: [Self.notLive, nil])
+        try await controller.openSession(mode: .create(cwd: nil, title: nil))
+        controller.submitTextPrompt("hello")
+        await controller.textSubmissionTask?.value
+        #expect(await submits.calls.count == 1)
+        #expect(service.resumedIDs == ["stored"])
+        #expect(controller.failedText == "hello")
+        #expect(controller.setupError == nil)
+        #expect(await !controller.diagnosticTrackerState().busy)
+        await controller.teardown()
+    }
+
+    /// A 4007 while the socket-driven reconnect resume is still suspended
+    /// joins that resume: one resume, then one resubmit to its runtime.
+    @Test func notLiveDuringReconnectJoinsTheInFlightResume() async throws {
+        let service = ScriptedSessionService()
+        service.enqueueCreate(Fixtures.resumeResult(runtimeID: "runtime", storedID: "stored"))
+        service.enqueueResume(Fixtures.resumeResult(runtimeID: "runtime-2", storedID: "stored"))
+        let resumeGate = CallGate()
+        service.resumeGate = resumeGate
+        let submits = SubmitLog()
+        let joined = Signal()
+        let joinedInFlight = JoinLog()
+        let controller = makeRecoveringController(
+            service: service, submits: submits, delays: DelayLog(), answers: [Self.notLive, nil],
+            willResume: { inFlight in
+                Task {
+                    await joinedInFlight.record(inFlight)
+                    await joined.signal()
+                }
+            })
+        try await controller.openSession(mode: .create(cwd: nil, title: nil))
+        let reconnect = Task { await controller.connectionBecameReady(isReconnect: true) }
+        await resumeGate.waitUntilEntered()
+        controller.submitTextPrompt("hello")
+        await joined.wait()
+        await resumeGate.release()
+        await reconnect.value
+        await controller.textSubmissionTask?.value
+        #expect(await joinedInFlight.values == [true])
+        #expect(service.resumedIDs == ["stored"])
+        let calls = await submits.calls
+        #expect(calls.map(\.sid) == ["runtime", "runtime-2"])
+        #expect(controller.failedText == nil)
+        #expect(await controller.diagnosticTrackerState().busy)
         await controller.teardown()
     }
 
@@ -161,4 +223,9 @@ private actor SubmitLog {
 private actor DelayLog {
     private(set) var delays: [Duration] = []
     func record(_ delay: Duration) { delays.append(delay) }
+}
+
+private actor JoinLog {
+    private(set) var values: [Bool] = []
+    func record(_ value: Bool) { values.append(value) }
 }

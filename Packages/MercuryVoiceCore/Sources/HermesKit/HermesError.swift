@@ -87,6 +87,8 @@ public enum HermesError: Error, LocalizedError, Sendable {
     /// 4007 from a reattaching RPC: the live session was replaced under us
     /// ("session no longer live; retry resume"). On `prompt.submit` it is a
     /// refusal issued before the prompt is accepted — re-resume and resubmit.
+    /// Matches any 4007 (resume's "session not found" too); callers scope it
+    /// to the RPC whose 4007s are all pre-acceptance.
     public var isSessionNotLive: Bool { rpcCode == RPCCode.sessionNotFound }
 
     /// 4009 from a reattaching RPC: a client-gone interrupt is still settling.

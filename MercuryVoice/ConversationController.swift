@@ -129,6 +129,7 @@ final class ConversationController {
         private var _runtimeID: String?
         private var _storedID: String?
         private var _recover: (@Sendable (_ reResume: Bool) async -> Bool)?
+        private var _submitsInFlight = 0
 
         var runtimeID: String? {
             get {
@@ -162,6 +163,12 @@ final class ConversationController {
             get { lock.withLock { _recover } }
             set { lock.withLock { _recover = newValue } }
         }
+
+        /// prompt.submit calls (including a reattach retry) not yet returned.
+        /// A reconnect reset must not clear `busy` under one (issue #125).
+        var submitsInFlight: Int { lock.withLock { _submitsInFlight } }
+        func beginSubmit() { lock.withLock { _submitsInFlight += 1 } }
+        func endSubmit() { lock.withLock { _submitsInFlight -= 1 } }
     }
 
     /// MainActor admits both events and resets to this one FIFO. A direct
@@ -213,6 +220,9 @@ final class ConversationController {
     private let trackerPumpWillJoin: (@MainActor @Sendable () -> Void)?
     /// Backoff before a reattach-refusal retry; seamed so tests don't wait.
     private let retryDelay: @Sendable (Duration) async throws -> Void
+    /// Test hook: a 4007 recovery is about to await a reconnect resume;
+    /// true when it joins one already in flight rather than starting its own.
+    private let reattachRecoveryWillResume: (@MainActor @Sendable (Bool) -> Void)?
 
     init(
         connection: HermesConnection,
@@ -225,7 +235,8 @@ final class ConversationController {
         trackerResetRequested: (@MainActor @Sendable () -> Void)? = nil,
         trackerPumpWillJoin: (@MainActor @Sendable () -> Void)? = nil,
         submitPrompt: (@Sendable (String, String, Bool) async throws -> Void)? = nil,
-        retryDelay: (@Sendable (Duration) async throws -> Void)? = nil
+        retryDelay: (@Sendable (Duration) async throws -> Void)? = nil,
+        reattachRecoveryWillResume: (@MainActor @Sendable (Bool) -> Void)? = nil
     ) {
         self.connection = connection
         self.sessionService = sessionService ?? connection
@@ -233,6 +244,7 @@ final class ConversationController {
         self.trackerResetRequested = trackerResetRequested
         self.trackerPumpWillJoin = trackerPumpWillJoin
         self.retryDelay = retryDelay ?? { try await Task.sleep(for: $0) }
+        self.reattachRecoveryWillResume = reattachRecoveryWillResume
         self.capture = capture ?? .shared
         self.profile = profile
         self.profileName = profile
@@ -248,6 +260,8 @@ final class ConversationController {
         let box = sessionBox
         self.tracker = AgentTurnTracker(
             submit: { text, interrupted in
+                box.beginSubmit()
+                defer { box.endSubmit() }
                 @Sendable func send() async throws {
                     guard let sid = box.runtimeID else { throw HermesError.notConnected }
                     if let submitPrompt {
@@ -1246,7 +1260,38 @@ final class ConversationController {
         guard !isTornDown else { return }
         connectionHealthy = true
         guard isReconnect else { return }
-        guard let storedID = sessionBox.storedID else { return }
+        let task = startReconnectResume(recovering: false)
+        await withTaskCancellationHandler {
+            _ = await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// The reconnect resume in flight, so a 4007 recovery joins it instead of
+    /// racing a second resume on the same stored id — two would interleave
+    /// the event hold and could refuse each other (issue #125).
+    private var reconnectResume: Task<Bool, Never>?
+    private var reconnectResumeGeneration = 0
+
+    private func startReconnectResume(recovering: Bool) -> Task<Bool, Never> {
+        reconnectResumeGeneration += 1
+        let generation = reconnectResumeGeneration
+        let task = Task {
+            let resumed = await resumeAfterReconnect(recovering: recovering)
+            if reconnectResumeGeneration == generation { reconnectResume = nil }
+            return resumed
+        }
+        reconnectResume = task
+        return task
+    }
+
+    /// The reconnect resume proper; true when the session was reattached.
+    /// `recovering` is a 4007 recovery the user never saw a disconnect for:
+    /// no "Reconnected." notice, and a failure is left to the refused submit
+    /// to surface rather than also raised as a setup error.
+    private func resumeAfterReconnect(recovering: Bool) async -> Bool {
+        guard let storedID = sessionBox.storedID else { return false }
         let previousRuntimeID = sessionBox.runtimeID
         let previousEpoch = replayEpoch
         let watermark = lastSeenSeq
@@ -1268,7 +1313,7 @@ final class ConversationController {
                 // The previous socket's client-gone interrupt is still
                 // settling (issue #125): wait once rather than abandon.
                 try await retryDelay(.milliseconds(500))
-                guard !isTornDown else { return }
+                guard !isTornDown else { return false }
                 handle = try await sessionService.resumeSession(
                     storedID: storedID, profile: profile)
             }
@@ -1281,14 +1326,14 @@ final class ConversationController {
                 } else {
                     await sessionService.closeSession(sessionID: handle.runtimeID)
                 }
-                return
+                return false
             }
             sessionBox.runtimeID = handle.runtimeID
             sessionBox.storedID = handle.storedID
             let currentEpoch = await sessionService.replayEpoch
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
             replayEpoch = currentEpoch
 
@@ -1300,7 +1345,7 @@ final class ConversationController {
                 watermark: watermark)
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
             let prompts =
                 batch == nil
@@ -1308,7 +1353,7 @@ final class ConversationController {
                 : await readPromptState(handle: handle, previousEpoch: previousEpoch)
             guard !isTornDown else {
                 await closeSessionIfOpen()
-                return
+                return false
             }
 
             if let batch, let prompts {
@@ -1323,30 +1368,42 @@ final class ConversationController {
                 // would swallow every frame after it.
                 lastSeenSeq = nil
                 let running = handle.raw["running"]?.truthy ?? false
-                let resetApplied = await resetTracker(busy: running)
+                // A submit still awaiting its ACK (a 4007 recovery's retry)
+                // owns a turn the snapshot cannot show yet; clearing `busy`
+                // under it would make the engine skip the reply.
+                let resetApplied = await resetTracker(
+                    busy: running || sessionBox.submitsInFlight > 0)
                 guard !isTornDown else {
                     await closeSessionIfOpen()
-                    return
+                    return false
                 }
-                guard resetApplied else { return }
+                guard resetApplied else { return false }
                 adoptPendingPrompts(from: handle, clearStale: true)
             }
-            notice = "Reconnected."
+            if !recovering { notice = "Reconnected." }
             noteHydration(from: handle)
+            return true
         } catch {
-            guard !isTornDown else { return }
+            guard !isTornDown, !recovering else { return false }
             setupError = "Reconnected, but resuming the session failed: \(error.localizedDescription)"
+            return false
         }
     }
 
     /// One recovery step before resubmitting a reattach-refused prompt
-    /// (issue #125): 4007 re-runs the reconnect resume so the retry routes to
-    /// the live runtime, 4009 waits out the settling interrupt. False when
+    /// (issue #125): 4007 re-resumes (joining a reconnect resume already in
+    /// flight) so the retry routes to the live runtime, 4009 waits out the
+    /// settling interrupt. False when
     /// the conversation ended meanwhile — the refusal then surfaces.
     private func recoverRefusedSubmit(reResume: Bool) async -> Bool {
         guard !isTornDown else { return false }
         if reResume {
-            await connectionBecameReady(isReconnect: true)
+            // A failed re-resume leaves only the stale runtime: resubmitting
+            // there would just be refused again, so the refusal surfaces.
+            let inFlight = reconnectResume
+            reattachRecoveryWillResume?(inFlight != nil)
+            let task = inFlight ?? startReconnectResume(recovering: true)
+            guard await task.value else { return false }
         } else {
             guard (try? await retryDelay(.milliseconds(500))) != nil else { return false }
         }
