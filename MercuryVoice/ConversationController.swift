@@ -835,6 +835,12 @@ final class ConversationController {
     /// ticker while non-empty; reset wherever turn state resets so a
     /// dropped `subagent.complete` can't leak a stuck ticker forever.
     private var runningSubagents: Set<String> = []
+    /// The newest "Delegating: …" text `subagent.start` set, so a
+    /// `tool.complete` landing mid-delegation can hand the ticker back to it
+    /// instead of blanking it (PR #126 review). Only read while
+    /// `runningSubagents` is non-empty, and every insert rewrites it, so a
+    /// stale value from an earlier delegation is never shown.
+    private var delegatingTicker: String?
     /// While a reconnect-resume is deciding between event replay and a tracker
     /// reset, live events are parked here so replayed frames can't interleave
     /// out of order with them; the seq gate dedups any overlap on drain.
@@ -936,7 +942,9 @@ final class ConversationController {
             toolTicker = "Running: \(name)…"
 
         case GatewayEvent.Kind.toolComplete:
-            toolTicker = nil
+            // A delegating parent runs tools of its own; once one finishes,
+            // the delegation still in progress owns the ticker again.
+            toolTicker = runningSubagents.isEmpty ? nil : delegatingTicker
 
         case GatewayEvent.Kind.approvalRequest:
             if let request = ApprovalRequest(event: event) {
@@ -1053,7 +1061,8 @@ final class ConversationController {
         case GatewayEvent.Kind.subagentStart:
             let goal = event.payload["goal"]?.stringValue ?? "subtask"
             runningSubagents.insert(subagentKey(for: event))
-            toolTicker = "Delegating: \(Self.truncatedGoal(goal))…"
+            delegatingTicker = "Delegating: \(Self.truncatedGoal(goal))…"
+            toolTicker = delegatingTicker
 
         case GatewayEvent.Kind.subagentComplete:
             runningSubagents.remove(subagentKey(for: event))

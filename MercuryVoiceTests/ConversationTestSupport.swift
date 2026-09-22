@@ -636,6 +636,12 @@ enum Fixtures {
             payload: .object(["name": .string(name)]))
     }
 
+    static func toolComplete(sessionID: String, seq: Int, name: String) -> JSONValue {
+        eventParams(
+            type: GatewayEvent.Kind.toolComplete, sessionID: sessionID, seq: seq,
+            payload: .object(["name": .string(name)]))
+    }
+
     static func event(_ params: JSONValue) -> GatewayEvent {
         guard let event = GatewayEvent(eventParams: params) else {
             fatalError("malformed event fixture")

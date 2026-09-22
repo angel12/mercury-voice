@@ -205,6 +205,37 @@ struct R32ControllerStateTests {
         #expect(controller.toolTicker == "Running: grep…")
     }
 
+    /// A delegating parent runs tools too; their `tool.complete` must hand
+    /// the ticker back to the delegation still in progress rather than
+    /// blanking it for the rest of the subagent's run (PR #126 review).
+    @Test
+    func toolCompleteRestoresDelegatingTickerWhileSubagentsRun() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await makeOpenController(service)
+        defer { Task { await controller.teardown() } }
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.subagentStart(
+                    sessionID: "rt", seq: 1, goal: "delegated work", subagentID: "a")))
+        controller.handle(
+            event: Fixtures.event(Fixtures.toolStart(sessionID: "rt", seq: 2, name: "grep")))
+        #expect(controller.toolTicker == "Running: grep…")
+        controller.handle(
+            event: Fixtures.event(Fixtures.toolComplete(sessionID: "rt", seq: 3, name: "grep")))
+        #expect(controller.toolTicker == "Delegating: delegated work…")
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.subagentComplete(
+                    sessionID: "rt", seq: 4, goal: "delegated work", subagentID: "a")))
+        #expect(controller.toolTicker == nil)
+        // With nothing delegating, a later tool.complete clears as before.
+        controller.handle(
+            event: Fixtures.event(Fixtures.toolStart(sessionID: "rt", seq: 5, name: "ls")))
+        controller.handle(
+            event: Fixtures.event(Fixtures.toolComplete(sessionID: "rt", seq: 6, name: "ls")))
+        #expect(controller.toolTicker == nil)
+    }
+
     @Test
     func subagentIDFallsBackToTaskIndexWhenAbsent() async throws {
         let service = ScriptedSessionService()
