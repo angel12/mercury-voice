@@ -73,6 +73,63 @@ struct AgentTurnTrackerTests {
         #expect(await tracker.pendingSpeech()?.text == "Let me look.")
     }
 
+    /// hermes-agent 167f0ef5fa: `already_streamed` is an exact match now, so
+    /// `false` also arrives when only a cut-off prefix streamed — with the
+    /// full text, which must replace that prefix rather than repeat it.
+    @Test func interimNotStreamedCompletesAStreamedPrefix() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Checking the"}"#))
+        await tracker.handle(
+            event: event(
+                "message.interim",
+                #"{"text": "Checking the file.", "already_streamed": false}"#))
+
+        let pending = await tracker.pendingSpeech()
+        #expect(pending?.text == "Checking the file.")
+        #expect(pending?.pending == false)
+    }
+
+    @Test func interimNotStreamedAfterDivergentTextAppendsBubble() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Hmm"}"#))
+        await tracker.handle(
+            event: event(
+                "message.interim", #"{"text": "Let me look.", "already_streamed": false}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Hmm\n\nLet me look.")
+    }
+
+    /// hermes-agent 7c0b206cc9: text left open by a turn whose complete never
+    /// arrived must not run into the next turn's reply.
+    @Test func messageStartSealsALeftoverBubble() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Old reply"}"#))
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(event: event("message.delta", #"{"text": "New reply"}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Old reply\n\nNew reply")
+    }
+
+    /// hermes-agent 27c9d37730: a `transform_llm_output` hook may rewrite the
+    /// final text with no prefix relationship. The caption shows the rewrite;
+    /// the speech source stays append-only (what streamed was already spoken).
+    @Test func transformedCompleteRewritesTheCaptionOnly() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Hello world"}"#))
+        await tracker.handle(
+            event: event(
+                "message.complete",
+                #"{"text": "Rewritten", "status": "complete", "response_transformed": true}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Hello world")
+        #expect(await tracker.visibleAssistantText == "Rewritten")
+    }
+
+    @Test func untransformedDivergentCompleteKeepsTheStreamedCaption() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.delta", #"{"text": "Hello world"}"#))
+        await tracker.handle(
+            event: event("message.complete", #"{"text": "Different", "status": "complete"}"#))
+        #expect(await tracker.visibleAssistantText == "Hello world")
+    }
+
     @Test func watermarkPreventsDoubleSpeaking() async {
         let tracker = makeTracker()
         await tracker.handle(event: event("message.delta", #"{"text": "First reply"}"#))
