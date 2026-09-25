@@ -834,13 +834,9 @@ final class ConversationController {
     private func agentChanged() async {
         await engine?.agentStateChanged()
         let caption = await tracker.visibleAssistantText
-        assistantCaption = Self.captionSource(caption)
-    }
-
-    /// Keeps caption source preparation separate from speech processing.
-    static func captionSource(_ source: String) -> String {
-        // Bound the viewport, not the source: a suffix can discard an opening fence.
-        source
+        // Keep the full source: a suffix can discard an opening fence. The view bounds
+        // what it renders. Skip no-op writes so observers don't re-render per tick.
+        if caption != assistantCaption { assistantCaption = caption }
     }
 
     // MARK: Gateway events

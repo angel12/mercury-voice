@@ -47,9 +47,49 @@ struct AssistantMarkdownTests {
         #expect(blocks.contains { $0.components.contains(.codeBlock(languageHint: "swift")) && String($0.text.characters).contains("**literal**") })
     }
 
-    @MainActor @Test func captionPreservesCompleteMarkdownSource() {
-        let source = "```swift\n" + String(repeating: "let value = 1\n", count: 80) + "```"
-        #expect(ConversationController.captionSource(source) == source)
+    @Test func singleNewlinesStayLineBreaks() throws {
+        let block = try #require(AssistantMarkdown("Step one: open Settings\nStep two: tap Wi-Fi").blocks.first)
+        #expect(String(block.text.characters) == "Step one: open Settings\nStep two: tap Wi-Fi")
+    }
+
+    @Test func lineBreaksLeaveCodeAndExistingBreaksAlone() {
+        let source = "a\\\nb\n\n```\nx\ny\n```\n``inline``\nnext"
+        let prepared = AssistantMarkdown.preservingLineBreaks(source)
+        #expect(prepared == "a\\\nb\n\n```\nx\ny\n```\n``inline``  \nnext")
+        let blocks = AssistantMarkdown(source).blocks
+        #expect(blocks.map { String($0.text.characters) } == ["a\nb", "x\ny", "inline\nnext"])
+    }
+
+    @Test func tablesKeepRowsAndColumns() throws {
+        let blocks = AssistantMarkdown("| Name | Qty |\n|---|---|\n| **Apples** | 3 |\n| Pears | |").blocks
+        #expect(blocks.count == 1)
+        let table = try #require(blocks.first?.table)
+        #expect(table.hasHeader)
+        #expect(table.columnCount == 2)
+        #expect(table.rows.map { $0.map { String($0.characters) } } == [["Name", "Qty"], ["Apples", "3"], ["Pears"]])
+    }
+
+    @Test func quotesAndBreaksAreMarked() {
+        let blocks = AssistantMarkdown("> quoted\n\n---\n\nafter").blocks
+        #expect(blocks.map(\.isQuote) == [true, false, false])
+        #expect(blocks.map(\.isThematicBreak) == [false, true, false])
+    }
+
+    @Test func codeBlockDropsClosingNewline() throws {
+        let block = try #require(AssistantMarkdown("```\nlet x = 1\n```").blocks.first)
+        #expect(String(block.text.characters) == "let x = 1")
+    }
+
+    @MainActor @Test func nativeViewRendersTableAndBoundedCaption() throws {
+        let long = (1...200).map { "Paragraph \($0)" }.joined(separator: "\n\n")
+        let renderer = ImageRenderer(content: VStack {
+            AssistantMarkdownView(source: "| a | b |\n|---|---|\n| 1 | 2 |\n\n> quote\n\n---")
+            AssistantMarkdownView(source: long, trailingCharacterLimit: 60)
+        }.frame(width: 320).padding())
+        let image = try #require(renderer.cgImage)
+        #expect(image.height > 100)
+        // 200 paragraphs would be thousands of points tall; the bound keeps only the tail.
+        #expect(image.height < 1200)
     }
 
     @Test func inlineFormattingAndLinks() throws {
