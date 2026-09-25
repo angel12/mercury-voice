@@ -15,6 +15,9 @@ public actor AgentTurnTracker: AgentInterfacing {
         var id: Int
         var text: String
         var pending: Bool
+        /// Caption override for a `response_transformed` rewrite that does
+        /// not extend `text` — shown, never spoken.
+        var displayText: String?
     }
 
     private var bubbles: [Bubble] = []
@@ -77,6 +80,9 @@ public actor AgentTurnTracker: AgentInterfacing {
     public func handle(event: GatewayEvent) {
         switch event.type {
         case GatewayEvent.Kind.messageStart:
+            // Text a previous turn left open (its complete never arrived)
+            // must not run into this turn's reply (hermes-agent 7c0b206cc9).
+            sealOpenBubble(finalText: nil)
             busy = true
 
         case GatewayEvent.Kind.messageDelta:
@@ -90,6 +96,11 @@ public actor AgentTurnTracker: AgentInterfacing {
                 // The text already arrived via deltas — just seal the open
                 // bubble; appending the payload would speak it twice.
                 sealOpenBubble(finalText: text)
+            } else if let open = openBubbleText, !open.isEmpty, text.hasPrefix(open) {
+                // Exact-match semantics since hermes-agent 167f0ef5fa: false
+                // also means only a cut-off prefix streamed, and the payload
+                // is the whole segment — complete it rather than repeat it.
+                sealOpenBubble(finalText: text)
             } else {
                 sealOpenBubble(finalText: nil)
                 if !text.isEmpty {
@@ -99,8 +110,9 @@ public actor AgentTurnTracker: AgentInterfacing {
 
         case GatewayEvent.Kind.messageComplete:
             let text = event.payload["text"]?.stringValue ?? ""
+            let transformed = event.payload["response_transformed"]?.truthy ?? false
             if hasOpenBubble {
-                sealOpenBubble(finalText: text)
+                sealOpenBubble(finalText: text, captionOverride: transformed)
             } else if !text.isEmpty {
                 bubbles.append(Bubble(id: takeBubbleID(), text: text, pending: false))
             }
@@ -130,12 +142,14 @@ public actor AgentTurnTracker: AgentInterfacing {
 
     /// Everything the assistant has said this session view — for captions.
     public var visibleAssistantText: String {
-        bubbles.map(\.text).joined(separator: "\n\n")
+        bubbles.map { $0.displayText ?? $0.text }.joined(separator: "\n\n")
     }
 
     // MARK: Bubbles
 
     private var hasOpenBubble: Bool { bubbles.last?.pending == true }
+
+    private var openBubbleText: String? { hasOpenBubble ? bubbles.last?.text : nil }
 
     private func takeBubbleID() -> Int {
         defer { nextBubbleID += 1 }
@@ -155,10 +169,14 @@ public actor AgentTurnTracker: AgentInterfacing {
     /// when it append-extends what was streamed — the engine's spoken-length
     /// diffing requires the joined text to be strictly append-only, so a
     /// rewrite that shortens or diverges keeps the streamed text instead.
-    private func sealOpenBubble(finalText: String?) {
+    /// `captionOverride` (`message.complete.response_transformed`, whose text
+    /// the server marks authoritative) still shows such a rewrite on screen.
+    private func sealOpenBubble(finalText: String?, captionOverride: Bool = false) {
         guard hasOpenBubble, let index = bubbles.indices.last else { return }
         if let finalText, finalText.hasPrefix(bubbles[index].text) {
             bubbles[index].text = finalText
+        } else if let finalText, captionOverride {
+            bubbles[index].displayText = finalText
         }
         bubbles[index].pending = false
     }
