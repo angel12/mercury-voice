@@ -247,7 +247,7 @@ struct ConversationView: View {
             }
             if !controller.assistantCaption.isEmpty {
                 ScrollView {
-                    Text(controller.assistantCaption)
+                    AssistantMarkdownView(source: controller.assistantCaption)
                         .font(.callout)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

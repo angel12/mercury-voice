@@ -16,8 +16,14 @@ struct DevChatView: View {
                                 Text(message.role == "user" ? "You" : "Hermes")
                                     .font(.caption2.bold())
                                     .foregroundStyle(.secondary)
-                                Text(message.text)
-                                    .textSelection(.enabled)
+                                Group {
+                                    if message.role == "assistant" {
+                                        AssistantMarkdownView(source: message.text)
+                                    } else {
+                                        Text(verbatim: message.text)
+                                    }
+                                }
+                                .textSelection(.enabled)
                             }
                             .frame(
                                 maxWidth: .infinity,
@@ -26,7 +32,7 @@ struct DevChatView: View {
                         if !controller.assistantCaption.isEmpty,
                             controller.devMessages.last?.text != controller.assistantCaption
                         {
-                            Text(controller.assistantCaption)
+                            AssistantMarkdownView(source: controller.assistantCaption)
                                 .foregroundStyle(.secondary)
                         }
                     }
