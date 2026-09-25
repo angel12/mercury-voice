@@ -423,31 +423,29 @@ public actor GatewayClient {
         }
 
         if let request = ServerRequest(frame: frame) {
-            if ServerRequest.answerableMethods.contains(request.method) {
-                if ApprovalRequest(serverRequest: request) == nil,
-                    ClarifyRequest(serverRequest: request) == nil
+            if ServerRequest.routedMethods.contains(request.method) {
+                if request.method == "approval" || request.method == "clarify",
+                    UnanswerableRequest(serverRequest: request) != nil
                 {
-                    // Undecodable params: no sheet will show, and nothing
-                    // answers it — for the same reason as the else branch
-                    // below — so without this log the prompt just vanishes
-                    // until the server's deadline withdraws it (#128).
+                    // Params this app cannot render as its own sheet: it is
+                    // shown as an unanswerable prompt instead (#130), but a
+                    // decode failure is still worth a trace.
                     Self.logger.error(
-                        "server request \(request.id, privacy: .public) (\(request.method, privacy: .public)) has params this app cannot render; left for another client or the server deadline"
+                        "server request \(request.id, privacy: .public) (\(request.method, privacy: .public)) has params this app cannot render"
                     )
                 }
                 let event = GatewayEvent(serverRequest: request)
                 for sub in subscribers.values { sub.yield(event) }
             } else {
-                // Left unanswered on purpose (#125, PR #126 review): the
+                // A desktop GUI bridge or an unknown method. Left
+                // unanswered on purpose (#125, PR #126 review): the
                 // first response frame for an id settles it for every
                 // attached client (upstream `resolve_response`), and frames
                 // are fanned out to all of them, so an error reply here
-                // would take a sudo/secret/vault.* prompt away from a
-                // co-attached desktop that can render it. If the phone is
-                // the only client the request waits out its server-side
-                // deadline (upstream `_ask`); failing it fast while another
-                // advertising client may be attached would need an upstream
-                // change, since any error response settles the wait.
+                // would take the request away from a co-attached desktop
+                // that can serve it. Bridges are not user questions, so
+                // nothing is shown either (#130); with no desktop attached
+                // they wait out their short server-side deadline.
                 Self.logger.debug(
                     "left server request \(request.method, privacy: .public) for another client"
                 )

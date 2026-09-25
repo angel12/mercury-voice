@@ -11,14 +11,16 @@ public struct ServerRequest: Sendable, Equatable {
     public var sessionID: String?
     public var params: JSONValue
 
-    /// Methods this app renders. Every other request (sudo, secret, vault.*,
-    /// terminal.read, preview.*, tour, …) is dropped unanswered and left for
+    /// Methods `GatewayClient` passes down the event pipeline: the two this
+    /// app answers itself, plus the user prompts it can only show and offer
+    /// to decline (`UnanswerableRequest`, #130). Everything else — the
+    /// desktop GUI bridges (terminal.read, preview.*, window.read, tour) and
+    /// any method newer than this app — is dropped unanswered and left for
     /// another attached client: the first response settles a request for
     /// every client, so a refusal would take it from a desktop that can
-    /// answer it. If the phone is the only client, the request waits out its
-    /// server-side deadline (upstream `_ask`) — failing fast while another
-    /// advertising client may be attached would need an upstream change.
-    public static let answerableMethods: Set<String> = ["approval", "clarify"]
+    /// answer it.
+    public static let routedMethods: Set<String> =
+        Set(["approval", "clarify"]).union(UnanswerableRequest.promptMethods)
 
     /// A live frame: has `method`, and a *string* id (client ids are ints).
     public init?(frame: JSONValue) {
