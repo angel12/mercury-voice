@@ -19,9 +19,12 @@ package enum HTTPErrorDetail {
 
     /// REST/auth `detail` field, already capped and redacted. `nil` when the
     /// body is not JSON or has no string `detail` (login keeps that optional).
+    /// An object `detail` contributes only its `message` — the 503 state.db
+    /// payloads (hermes-agent 4cc4072747) also carry a server filesystem
+    /// `path` that must not reach the screen.
     package static func restJSONDetail(_ data: Data) -> String? {
-        (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?
-            .stringValue.map(displayed)
+        let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]
+        return (detail?.stringValue ?? detail?["message"]?.stringValue).map(displayed)
     }
 
     package static func load(

@@ -69,6 +69,14 @@ struct RESTHTTPErrorDetailTests {
         #expect(!detail.contains("😀"))
     }
 
+    /// hermes-agent 4cc4072747: a damaged state.db answers 503 with an
+    /// object `detail`; its message is the guidance, the path is private.
+    @Test func restJSONDetailReadsObjectMessageWithoutThePath() {
+        let body = #"{"detail":{"error":"state_db_corrupt","message":"state.db corrupt — run `hermes doctor`.","path":"/Users/someone/.hermes/state.db"}}"#
+        let detail = HTTPErrorDetail.restJSONDetail(Data(body.utf8))
+        #expect(detail == "state.db corrupt — run `hermes doctor`.")
+    }
+
     @Test func authenticatorPerformCapsJSONDetail() async throws {
         let message = String(repeating: "C", count: 400) + "AUTH-TAIL"
         let body = Data("{\"detail\":\"\(message)\"}".utf8)
