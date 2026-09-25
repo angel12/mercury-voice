@@ -319,11 +319,17 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
     /// single question, decoded the same way as the legacy payload.
     ///
     /// A batch decodes fail-closed: an entry `ClarifyQuestion(json:)` cannot
-    /// read, or an empty `questions` array, refuses the whole request rather
-    /// than silently dropping a question. A dropped qid would still be
+    /// read, or an empty `questions` array, rejects the whole request (nil)
+    /// rather than silently dropping a question. A dropped qid would still be
     /// answered by the caller submitting `{answers}` for the questions it
     /// did see, so the batch would look complete to the backend while short
-    /// one answer — worse than refusing to show any of it.
+    /// one answer — worse than showing none of it.
+    ///
+    /// Rejecting only means this app shows no sheet: nothing sends the
+    /// server a refusal, since an error reply would settle the request for
+    /// every attached client, including a desktop that may render it. It
+    /// stays open until another client answers or the server's deadline
+    /// withdraws it (`GatewayClient` logs the drop).
     public init?(serverRequest request: ServerRequest) {
         guard request.method == "clarify" else { return nil }
         let params = request.params

@@ -16,10 +16,11 @@ struct ConversationView: View {
     /// sheet/alert modifiers on the same node faults ("Invalid
     /// Configuration") when two states overlap — approval and clarify can be
     /// pending at once, and prompts arrive while the dev sheet is open.
-    /// Priority: approval > clarify > dev.
+    /// Priority: approval > clarify > unanswerable > dev.
     private enum ActiveSheet: Identifiable {
         case approval(ApprovalRequest)
         case clarify(ClarifyRequest)
+        case unanswerable(UnanswerableRequest)
         case dev
         case audio
 
@@ -27,6 +28,7 @@ struct ConversationView: View {
             switch self {
             case .approval(let request): return "approval-\(request.sessionID)"
             case .clarify(let request): return "clarify-\(request.requestID)"
+            case .unanswerable(let request): return "unanswerable-\(request.id)"
             case .dev: return "dev"
             case .audio: return "audio"
             }
@@ -38,6 +40,9 @@ struct ConversationView: View {
             get: {
                 if let approval = controller.approval { return .approval(approval) }
                 if let clarify = controller.clarify { return .clarify(clarify) }
+                if let unanswerable = controller.currentUnanswerable {
+                    return .unanswerable(unanswerable)
+                }
                 if showDevChat { return .dev }
                 #if os(iOS)
                     if showAudioDevices { return .audio }
@@ -102,6 +107,9 @@ struct ConversationView: View {
                     .interactiveDismissDisabled()
             case .clarify(let request):
                 ClarifySheet(request: request, controller: controller)
+                    .interactiveDismissDisabled()
+            case .unanswerable(let request):
+                UnanswerableSheet(request: request, controller: controller)
                     .interactiveDismissDisabled()
             case .dev:
                 DevChatView(controller: controller)
@@ -297,6 +305,7 @@ struct ConversationView: View {
             && !controller.voiceState.muted
             && controller.approval == nil
             && controller.clarify == nil
+            && controller.currentUnanswerable == nil
     }
 
     private func contextTint(percent: Int) -> some ShapeStyle {
@@ -463,6 +472,71 @@ struct ApprovalSheet: View {
             .frame(minWidth: 420)
         #else
             .presentationDetents([.medium])
+        #endif
+    }
+}
+
+/// A server request this app can't answer (issue #130): what was asked,
+/// and a choice between declining it now or leaving it for another device.
+/// Never collects the value itself.
+struct UnanswerableSheet: View {
+    let request: UnanswerableRequest
+    let controller: ConversationController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label(request.title, systemImage: "lock.shield")
+                .font(.title2.bold())
+            if !request.details.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(request.details, id: \.self) { detail in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(detail.label)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if detail.monospaced {
+                                ScrollView(.horizontal) {
+                                    Text(detail.value)
+                                        .font(.system(.callout, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .padding(8)
+                                }
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                            } else {
+                                Text(detail.value).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+            Text(
+                "This app can't answer this request. Answer it on another device where Hermes is open, or decline it so the agent can continue."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            VStack(spacing: 8) {
+                Button(role: .destructive) {
+                    controller.declineUnanswerable()
+                } label: {
+                    Text("Decline").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                Button {
+                    controller.dismissUnanswerable()
+                } label: {
+                    Text("Not now").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .disabled(controller.promptResponseInFlight)
+            PromptSendStatus(controller: controller)
+        }
+        .padding(24)
+        #if os(macOS)
+            .frame(minWidth: 420)
+        #else
+            .presentationDetents([.medium, .large])
         #endif
     }
 }

@@ -74,6 +74,25 @@ final class ConversationController {
     /// into the sheet already on screen — the same prompt, so its notice
     /// must survive, as with `stampingApprovalInPlace` (PR #126 review).
     private var mergingClarifyLocksInPlace = false
+    /// Server requests this app can only show and offer to decline (issue
+    /// #130), oldest first; the sheet shows the first. A change of the
+    /// front request retires its notice and announces the next one.
+    private(set) var unanswerable: [UnanswerableRequest] = [] {
+        didSet {
+            guard oldValue.first?.id != unanswerable.first?.id else { return }
+            if let next = unanswerable.first {
+                announce(.unanswerable(id: next.id, text: next.spokenNotice))
+            } else {
+                unanswerableAnnouncement?.cancel()
+            }
+        }
+    }
+    var currentUnanswerable: UnanswerableRequest? { unanswerable.first }
+    /// Requests the user closed with Not now. They stay open server-side, so
+    /// a reconnect's `open_requests` would otherwise put them straight back.
+    private var dismissedUnanswerableIDs: Set<String> = []
+    /// True while any prompt sheet holds the voice loop paused.
+    private var hasPrompt: Bool { approval != nil || clarify != nil || !unanswerable.isEmpty }
     /// Ends the conversation view when the user speaks a stop word.
     var didEndByStopWord = false
 
@@ -431,6 +450,7 @@ final class ConversationController {
         textSubmissionTask?.cancel()
         approvalAnnouncement?.cancel()
         clarifyAnnouncement?.cancel()
+        unanswerableAnnouncement?.cancel()
     }
 
     func begin(mode: Mode) async {
@@ -626,7 +646,7 @@ final class ConversationController {
         // A prompt replayed from the resume payload arrived before the engine
         // existed, so present() couldn't pause it — park the loop before the
         // mic ever arms; answering the prompt unpauses via resumeIfUnprompted.
-        if approval != nil || clarify != nil {
+        if hasPrompt {
             await engine.setPaused(true)
         }
         await engine.start()
@@ -637,6 +657,7 @@ final class ConversationController {
         stateTask?.cancel()
         approvalAnnouncement?.cancel()
         clarifyAnnouncement?.cancel()
+        unanswerableAnnouncement?.cancel()
         releaseLevelMeterIfOwned()
         #if os(iOS)
             stopAudioKeepalive()
@@ -965,13 +986,15 @@ final class ConversationController {
 
         case GatewayEvent.Kind.serverRequest:
             // Contract ≥ 7 (issue #125). GatewayClient only routes the
-            // methods this app renders; anything that decodes as neither
-            // sheet is ignored.
+            // methods this app renders or can show for a decline (#130);
+            // anything that decodes as none of the sheets is ignored.
             guard let request = ServerRequest(event: event) else { break }
             if let approvalRequest = ApprovalRequest(serverRequest: request) {
                 present(approval: approvalRequest)
             } else if let clarifyRequest = ClarifyRequest(serverRequest: request) {
                 present(clarify: clarifyRequest)
+            } else if let unanswerableRequest = UnanswerableRequest(serverRequest: request) {
+                present(unanswerable: unanswerableRequest)
             }
 
         case GatewayEvent.Kind.requestCancel:
@@ -990,6 +1013,11 @@ final class ConversationController {
             }
             if clarify?.serverRequestID == id {
                 clarify = nil
+                withdrew = true
+            }
+            dismissedUnanswerableIDs.remove(id)
+            if unanswerable.contains(where: { $0.id == id }) {
+                unanswerable.removeAll { $0.id == id }
                 withdrew = true
             }
             if withdrew {
@@ -1199,6 +1227,22 @@ final class ConversationController {
         )
     }
 
+    /// Queue an unanswerable request (issue #130). Idempotent by srq id —
+    /// a reconnect reports a still-open request again — and a request the
+    /// user closed with Not now is not brought back.
+    ///
+    /// Known residual: an approval srq this app cannot decode may also be
+    /// reported as a legacy `pending_approval`, which does decode, so both
+    /// sheets can show for one approval. Only the srq's `request.answer` —
+    /// this sheet's Decline — resolves it on a contract ≥ 7 backend.
+    private func present(unanswerable request: UnanswerableRequest) {
+        guard !dismissedUnanswerableIDs.contains(request.id),
+            !unanswerable.contains(where: { $0.id == request.id })
+        else { return }
+        unanswerable.append(request)
+        promptSendError = nil
+    }
+
     // MARK: Spoken prompt notices
 
     /// A queued prompt notice, identified by whatever makes its sheet the one
@@ -1213,6 +1257,8 @@ final class ConversationController {
         /// from a single legacy/srq clarify, which keeps the singular
         /// phrasing regardless. `remainingQuestions` is the unlocked count.
         case clarify(requestID: String, remainingQuestions: Int, isBatch: Bool)
+        /// The front unanswerable request (issue #130), by srq id.
+        case unanswerable(id: String, text: String)
 
         var text: String {
             switch self {
@@ -1221,6 +1267,7 @@ final class ConversationController {
                 isBatch
                     ? "Hermes has \(remaining) questions for you."
                     : "Hermes has a question for you."
+            case .unanswerable(_, let text): text
             }
         }
     }
@@ -1231,6 +1278,7 @@ final class ConversationController {
     /// at teardown reaches all of it, and so does awaiting them.
     private var approvalAnnouncement: Task<Void, Never>?
     private var clarifyAnnouncement: Task<Void, Never>?
+    private var unanswerableAnnouncement: Task<Void, Never>?
 
     /// A notice is only ever replaced by the next notice for the *same*
     /// sheet. The two sheets are independent state — a payload can carry both
@@ -1241,6 +1289,8 @@ final class ConversationController {
             approvalAnnouncement = queue(notice, replacing: approvalAnnouncement)
         case .clarify:
             clarifyAnnouncement = queue(notice, replacing: clarifyAnnouncement)
+        case .unanswerable:
+            unanswerableAnnouncement = queue(notice, replacing: unanswerableAnnouncement)
         }
     }
 
@@ -1298,6 +1348,7 @@ final class ConversationController {
         switch notice {
         case .approval(let epoch): return approval != nil && approvalEpoch == epoch
         case .clarify(let requestID, _, _): return clarify?.requestID == requestID
+        case .unanswerable(let id, _): return currentUnanswerable?.id == id
         }
     }
 
@@ -1308,6 +1359,7 @@ final class ConversationController {
     func awaitPromptAnnouncements() async {
         await approvalAnnouncement?.value
         await clarifyAnnouncement?.value
+        await unanswerableAnnouncement?.value
     }
 
     /// Adopt the `pending_approval` / `pending_clarify` fields of a
@@ -1367,6 +1419,18 @@ final class ConversationController {
         } else if clearStale, clarify != nil {
             clarify = nil
         }
+
+        // Unanswerable requests (issue #130) exist only as srq entries, so
+        // `open_requests` is their whole authority: on a re-read, anything
+        // no longer listed was answered elsewhere, withdrawn or died with
+        // the backend.
+        let openUnanswerable = openRequests.compactMap(UnanswerableRequest.init(serverRequest:))
+        if clearStale {
+            let openIDs = Set(openUnanswerable.map(\.id))
+            unanswerable.removeAll { !openIDs.contains($0.id) }
+            dismissedUnanswerableIDs.formIntersection(openIDs)
+        }
+        for request in openUnanswerable { present(unanswerable: request) }
 
         if clearStale { resumeIfUnprompted() }
     }
@@ -1708,7 +1772,7 @@ final class ConversationController {
         #endif
         Task {
             guard let engine else { return }
-            if approval == nil, clarify == nil {
+            if !hasPrompt {
                 await engine.setPaused(false)
             }
             await engine.listenNow()
@@ -1801,6 +1865,32 @@ final class ConversationController {
         }
     }
 
+    /// Decline the front unanswerable request (issue #130) with the
+    /// backend's own "skipped" answer, so the agent moves on now instead of
+    /// at the deadline. Same keep-until-confirmed and `.expired` rules as
+    /// the other prompt responses.
+    func declineUnanswerable() {
+        guard let request = currentUnanswerable, !promptResponseInFlight else { return }
+        let id = request.id
+        sendPromptResponse {
+            _ = try await $0.answerServerRequest(id: id, result: request.declineResult)
+        } onConfirmed: { [weak self] in
+            self?.unanswerable.removeAll { $0.id == id }
+        } applyError: { [weak self] in
+            self?.currentUnanswerable?.id == id
+        }
+    }
+
+    /// Not now: close the front unanswerable request without answering it,
+    /// leaving it for another client or the backend's deadline.
+    func dismissUnanswerable() {
+        guard let request = currentUnanswerable, !promptResponseInFlight else { return }
+        dismissedUnanswerableIDs.insert(request.id)
+        unanswerable.removeFirst()
+        promptSendError = nil
+        resumeIfUnprompted()
+    }
+
     /// The in-flight prompt response, kept only so a test can await it.
     private var promptResponseTask: Task<Void, Never>?
 
@@ -1835,7 +1925,7 @@ final class ConversationController {
     }
 
     private func resumeIfUnprompted() {
-        guard approval == nil, clarify == nil else { return }
+        guard !hasPrompt else { return }
         #if os(iOS)
             guard !audioInterrupted else { return }
         #endif

@@ -26,8 +26,8 @@ struct ServerRequestRoutingTests {
         await client.close(reason: "test over")
     }
 
-    /// An unsupported request (sudo, secret, vault.*, preview, tour, …) is
-    /// dropped: no error reply, no event. The first response frame settles
+    /// A desktop GUI bridge (terminal.read, preview.*, window.read, tour)
+    /// is dropped: no error reply, no event (#130). The first response frame settles
     /// a server request for every attached client (upstream
     /// `resolve_response`), so a refusal would take it away from a
     /// co-attached desktop that can render it (#125, PR #126 review).
@@ -39,7 +39,7 @@ struct ServerRequestRoutingTests {
         let (client, socket) = try await readyGatewayClient()
         let events = await client.events()
         socket.deliverText(
-            #"{"jsonrpc":"2.0","id":"srq-aaaaaaaaaaaa","method":"sudo","params":{"session_id":"s1","command":"x"}}"#
+            #"{"jsonrpc":"2.0","id":"srq-aaaaaaaaaaaa","method":"tour","params":{"session_id":"s1","action":"start"}}"#
         )
         socket.deliverText(
             #"{"jsonrpc":"2.0","id":"srq-0123456789ab","method":"approval","params":{"session_id":"s1","request_id":"a1","command":"ls","choices":["once","deny"]}}"#
@@ -49,6 +49,24 @@ struct ServerRequestRoutingTests {
         let request = try #require(ServerRequest(event: event))
         #expect(request.id == "srq-0123456789ab")
         #expect(request.method == "approval")
+        #expect(socket.sentFrames.isEmpty)
+        await client.close(reason: "test over")
+    }
+
+    /// A user prompt the app cannot answer (sudo here) is surfaced as an
+    /// event so the app can show it with a Decline (#130) — but nothing is
+    /// sent until the user decides.
+    @Test func aSudoRequestIsSurfacedUnanswered() async throws {
+        let (client, socket) = try await readyGatewayClient()
+        let events = await client.events()
+        socket.deliverText(
+            #"{"jsonrpc":"2.0","id":"srq-aaaaaaaaaaaa","method":"sudo","params":{"session_id":"s1","command":"apt install jq"}}"#
+        )
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(await iterator.next())
+        let request = try #require(ServerRequest(event: event))
+        #expect(request.method == "sudo")
+        #expect(UnanswerableRequest(serverRequest: request)?.details.first?.value == "apt install jq")
         #expect(socket.sentFrames.isEmpty)
         await client.close(reason: "test over")
     }
