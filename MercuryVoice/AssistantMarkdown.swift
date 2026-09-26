@@ -60,13 +60,22 @@ struct AssistantMarkdown {
 
     init(_ source: String) {
         // Full parsing also tolerates unfinished fences/emphasis while streaming.
-        let prepared = Self.preservingLineBreaks(source)
-        let parsed = (try? AttributedString(markdown: prepared)) ?? AttributedString(source)
+        let original = (try? AttributedString(markdown: source)) ?? AttributedString(source)
+        let prepared = (try? AttributedString(markdown: Self.preservingLineBreaks(source))) ?? original
+        // The added hard breaks only change whitespace, so both parses have the same
+        // code runs in the same order. Code must stay byte-exact, so take it from the
+        // original parse; if the runs ever disagree, render the original unchanged.
+        let originalCode = original.runs.filter(Self.isCode).map { AttributedString(original[$0.range]) }
+        let useOriginal = prepared.runs.filter(Self.isCode).count != originalCode.count
+        let parsed = useOriginal ? original : prepared
+        var nextCode = originalCode.makeIterator()
         var result: [Block] = []
         var seenItems: Set<Int> = []
         for run in parsed.runs {
             let intents = run.presentationIntent?.components ?? []
-            var text = AttributedString(parsed[run.range])
+            var text = !useOriginal && Self.isCode(run)
+                ? nextCode.next() ?? AttributedString(parsed[run.range])
+                : AttributedString(parsed[run.range])
             // Block semantics are handled below, not by Text's inline renderer.
             text.presentationIntent = nil
             // Every cell carries its own identity; group them under their table.
@@ -105,24 +114,17 @@ struct AssistantMarkdown {
         blocks = result
     }
 
+    private static func isCode(_ run: AttributedString.Runs.Run) -> Bool {
+        run.inlinePresentationIntent?.contains(.code) == true
+            || run.presentationIntent?.components.contains { if case .codeBlock = $0.kind { return true }; return false } == true
+    }
+
     /// Replies use single newlines as visible line breaks, but CommonMark folds them
-    /// into spaces. Mark each one outside code fences as a hard break instead.
+    /// into spaces. Mark each one as a hard break instead. This also touches lines
+    /// inside code, which is why `init` takes code content from an unmodified parse.
     static func preservingLineBreaks(_ source: String) -> String {
         var lines = source.components(separatedBy: "\n")
-        var fence: Character?
-        for index in lines.indices {
-            let trimmed = lines[index].drop { $0 == " " || $0 == "\t" }
-            if let marker = trimmed.first, marker == "`" || marker == "~", trimmed.hasPrefix(String(repeating: marker, count: 3)) {
-                if fence == nil {
-                    // "```code```" on one line is inline code, not an opening fence.
-                    if marker == "`", trimmed.drop(while: { $0 == "`" }).contains("`") { continue }
-                    fence = marker
-                } else if fence == marker {
-                    fence = nil
-                }
-                continue
-            }
-            guard fence == nil, index + 1 < lines.count else { continue }
+        for index in lines.indices where index + 1 < lines.count {
             let line = lines[index]
             let next = lines[index + 1]
             if line.trimmingCharacters(in: .whitespaces).isEmpty

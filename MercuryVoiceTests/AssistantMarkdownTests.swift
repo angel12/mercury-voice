@@ -54,10 +54,29 @@ struct AssistantMarkdownTests {
 
     @Test func lineBreaksLeaveCodeAndExistingBreaksAlone() {
         let source = "a\\\nb\n\n```\nx\ny\n```\n``inline``\nnext"
-        let prepared = AssistantMarkdown.preservingLineBreaks(source)
-        #expect(prepared == "a\\\nb\n\n```\nx\ny\n```\n``inline``  \nnext")
         let blocks = AssistantMarkdown(source).blocks
         #expect(blocks.map { String($0.text.characters) } == ["a\nb", "x\ny", "inline\nnext"])
+    }
+
+    /// Line-break preservation must never alter code content (copied code,
+    /// whitespace-sensitive strings), wherever the code sits.
+    @Test(arguments: [
+        ("> ```\n> let a = 1\n> let b = 2\n> ```", "let a = 1\nlet b = 2"),
+        ("Text:\n\n    let a = 1\n    let b = 2", "let a = 1\nlet b = 2"),
+        ("````\n```\nlet a = 1\nlet b = 2\n````", "```\nlet a = 1\nlet b = 2"),
+        ("```\nkeep one \nkeep two  \nlast\n```", "keep one \nkeep two  \nlast"),
+        ("- item\n\n  ```\n  let a = 1\n  let b = 2\n  ```", "let a = 1\nlet b = 2"),
+    ])
+    func codeBlockContentIsExact(source: String, code: String) throws {
+        let block = try #require(AssistantMarkdown(source).blocks.first { $0.isCode })
+        #expect(String(block.text.characters) == code)
+    }
+
+    @Test func inlineCodeAcrossLinesIsExact() throws {
+        let block = try #require(AssistantMarkdown("Use `a\nb` here\nthen more").blocks.first)
+        let code = block.text.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }
+        #expect(code.map { String(block.text[$0.range].characters) } == ["a b"])
+        #expect(String(block.text.characters) == "Use a b here\nthen more")
     }
 
     @Test func tablesKeepRowsAndColumns() throws {
