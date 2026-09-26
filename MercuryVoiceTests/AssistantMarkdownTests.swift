@@ -99,6 +99,50 @@ struct AssistantMarkdownTests {
         #expect(String(block.text.characters) == "let x = 1")
     }
 
+    /// The caption budget must count table cells; tables keep no `text` of their own.
+    @Test func largeTableFallsOutsideCaptionBudget() {
+        let rows = (1...100).map { "| row \($0) | value \($0) |" }.joined(separator: "\n")
+        let blocks = AssistantMarkdown("| Name | Value |\n|---|---|\n" + rows + "\n\nFinal paragraph").blocks
+        let visible = AssistantMarkdown.trailingBlocks(blocks, limit: 30)
+        #expect(visible.count == 1)
+        #expect(visible.allSatisfy { $0.table == nil })
+        #expect(visible.map { String($0.text.characters) } == ["Final paragraph"])
+    }
+
+    @Test func smallTableAndParagraphFitTogether() {
+        let blocks = AssistantMarkdown("| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter").blocks
+        let visible = AssistantMarkdown.trailingBlocks(blocks, limit: 30)
+        #expect(visible.count == 2)
+        #expect(visible.first?.table != nil)
+        #expect(visible.last.map { String($0.text.characters) } == "After")
+    }
+
+    @Test func finalTableStaysVisibleOverBudget() {
+        let rows = (1...100).map { "| row \($0) | value \($0) |" }.joined(separator: "\n")
+        let blocks = AssistantMarkdown("Intro\n\n| Name | Value |\n|---|---|\n" + rows).blocks
+        let visible = AssistantMarkdown.trailingBlocks(blocks, limit: 30)
+        #expect(visible.count == 1)
+        #expect(visible.first?.table?.rows.count == 101)
+    }
+
+    @MainActor @Test func nativeViewBoundsCaptionAfterLargeTable() throws {
+        let rows = (1...100).map { "| row \($0) | value \($0) |" }.joined(separator: "\n")
+        let renderer = ImageRenderer(content: AssistantMarkdownView(
+            source: "| Name | Value |\n|---|---|\n" + rows + "\n\nFinal paragraph",
+            trailingCharacterLimit: 30
+        ).frame(width: 320).padding())
+        let image = try #require(renderer.cgImage)
+        #expect(image.height < 200)
+    }
+
+    /// Block rows sit in an HStack, where a plain Divider would draw vertically.
+    @MainActor @Test func thematicBreakRendersHorizontally() throws {
+        let renderer = ImageRenderer(content: AssistantMarkdownView(source: "---").frame(width: 320))
+        let image = try #require(renderer.cgImage)
+        #expect(image.width >= 320)
+        #expect(image.height <= 4)
+    }
+
     @MainActor @Test func nativeViewRendersTableAndBoundedCaption() throws {
         let long = (1...200).map { "Paragraph \($0)" }.joined(separator: "\n\n")
         let renderer = ImageRenderer(content: VStack {

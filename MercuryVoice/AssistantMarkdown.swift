@@ -54,6 +54,11 @@ struct AssistantMarkdown {
         var listDepth: Int {
             components.filter { $0 == .orderedList || $0 == .unorderedList }.count
         }
+
+        /// Rendered text length; a table's content lives in its cells, not `text`.
+        var characterCount: Int {
+            text.characters.count + (table?.rows.joined().reduce(0) { $0 + $1.characters.count } ?? 0)
+        }
     }
 
     let blocks: [Block]
@@ -112,6 +117,19 @@ struct AssistantMarkdown {
             }
         }
         blocks = result
+    }
+
+    /// The whole trailing blocks that fit in `limit` characters. The last block is
+    /// always kept, even when it alone exceeds the limit.
+    static func trailingBlocks(_ blocks: [Block], limit: Int) -> ArraySlice<Block> {
+        var start = blocks.endIndex
+        var total = 0
+        while start > blocks.startIndex {
+            total += blocks[start - 1].characterCount
+            if total > limit, start < blocks.endIndex { break }
+            start -= 1
+        }
+        return blocks[start...]
     }
 
     private static func isCode(_ run: AttributedString.Runs.Run) -> Bool {
@@ -178,14 +196,7 @@ struct AssistantMarkdownView: View {
     private var visibleBlocks: ArraySlice<AssistantMarkdown.Block> {
         let blocks = AssistantMarkdownCache.blocks(for: source)
         guard let limit = trailingCharacterLimit else { return blocks[...] }
-        var start = blocks.endIndex
-        var total = 0
-        while start > blocks.startIndex {
-            total += blocks[start - 1].text.characters.count
-            if total > limit, start < blocks.endIndex { break }
-            start -= 1
-        }
-        return blocks[start...]
+        return AssistantMarkdown.trailingBlocks(blocks, limit: limit)
     }
 
     @ViewBuilder
@@ -201,7 +212,11 @@ struct AssistantMarkdownView: View {
             }
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
         } else if block.isThematicBreak {
-            Divider()
+            // A Divider would draw vertically inside the block row's HStack.
+            Rectangle()
+                .fill(.separator)
+                .frame(maxWidth: .infinity)
+                .frame(height: 1)
         } else if let level = block.headingLevel {
             Text(block.text)
                 .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
