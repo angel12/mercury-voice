@@ -454,16 +454,30 @@ struct NativeOAuthTests {
     }
 
     /// The timeout must not fire after a real code already arrived.
+    ///
+    /// The timeout's clock is the test's, not the wall's: a real 200ms timeout
+    /// raced the loopback round trip, and on a loaded simulator the round trip
+    /// sometimes lost — a correct `.timedOut`, not a clobbered code. Here the
+    /// timeout cannot fire on its own, so the code is delivered first by
+    /// construction, and the late fire is then driven explicitly.
     @Test func timeoutDoesNotClobberADeliveredCode() async throws {
         let listener = LoopbackRedirectListener(expectedState: "s-1")
         let port = try await listener.start()
 
-        let waiter = Task { try await listener.waitForCode(timeout: .milliseconds(200)) }
+        // Never yields or finishes: iteration returns only when the wait
+        // cancels its timeout task.
+        let (never, neverContinuation) = AsyncStream<Void>.makeStream()
+        defer { neverContinuation.finish() }
+        let waiter = Task {
+            try await listener.waitForCode(timeoutFiresAfter: { for await _ in never {} })
+        }
         let url = URL(string: "http://127.0.0.1:\(port)/oauth/callback?code=in-time&state=s-1")!
         _ = try await URLSession.shared.data(from: url)
         #expect(try await waiter.value == "in-time")
-        // Outlive the timeout to prove the late fire is harmless.
-        try await Task.sleep(for: .milliseconds(250))
+        // A timeout whose sleep ended just as the code landed has already
+        // passed its cancellation check and still reaches the actor. It must
+        // be a no-op: a second resume of the consumed continuation would trap.
+        await listener.timeOut()
     }
 
     @Test func listenerIgnoresUnrelatedPaths() async throws {
