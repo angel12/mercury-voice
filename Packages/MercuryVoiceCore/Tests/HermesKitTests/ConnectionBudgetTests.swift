@@ -36,7 +36,15 @@ import Testing
         defer { collector.cancel() }
         await connection.start()
         if successfulHandshake {
-            #expect(await eventually { await checkpoints.subscriptions == 1 })
+            // Wait for `.ready`, not `.eventsSubscribed`: the subscription
+            // precedes the `client.capabilities` round-trip, and a close that
+            // beats its reply leaves this socket unready — a tenth failed dial
+            // (#128), so the budget never resets and the run stops at 10.
+            #expect(
+                await eventually {
+                    if case .ready = await connection.phase { return true }
+                    return false
+                })
             server.close(code: 1011)
         } else {
             #expect(await eventually { await checkpoints.finishes == 1 })
@@ -148,10 +156,8 @@ import Testing
 }
 
 private actor BudgetCheckpoints {
-    var subscriptions = 0
     var finishes = 0
     func visit(_ checkpoint: HermesConnection.SupervisorCheckpoint) {
-        if checkpoint == .eventsSubscribed { subscriptions += 1 }
         if checkpoint == .finished { finishes += 1 }
     }
 }

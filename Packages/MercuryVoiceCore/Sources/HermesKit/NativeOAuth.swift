@@ -180,11 +180,20 @@ public actor LoopbackRedirectListener {
     /// park the continuation forever and leak the sign-in task with the UI
     /// stuck on the sheet.
     public func waitForCode(timeout: Duration = .seconds(180)) async throws -> String {
+        try await waitForCode(timeoutFiresAfter: { try? await Task.sleep(for: timeout) })
+    }
+
+    /// Test seam over the timeout's clock: the timeout fires when `deadline`
+    /// returns uncancelled, so a test can order it against a delivered code
+    /// instead of racing a real round trip against the wall clock.
+    func waitForCode(
+        timeoutFiresAfter deadline: @escaping @Sendable () async -> Void
+    ) async throws -> String {
         if let outcome {
             return try outcome.get()
         }
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
+            await deadline()
             guard !Task.isCancelled else { return }
             await self?.timeOut()
         }
@@ -208,7 +217,7 @@ public actor LoopbackRedirectListener {
         }
     }
 
-    private func timeOut() {
+    func timeOut() {
         finish(.failure(RedirectError.timedOut))
     }
 
