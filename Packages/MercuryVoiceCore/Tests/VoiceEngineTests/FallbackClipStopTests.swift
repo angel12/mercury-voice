@@ -90,7 +90,11 @@ private final class SynchronouslyCompletingClip: PlayableClip {
     deinit { released.set() }
 
     func startPlaying() -> Bool {
-        delegate.audioPlayerDidFinishPlaying?(carrier, successfully: succeeds)
+        // Called on the concrete player: since the 27 SDKs the
+        // `AVAudioPlayerDelegate` requirement is `@MainActor`, while
+        // `FallbackClipPlayer`'s witness is nonisolated and lock-guarded.
+        let player = delegate as? FallbackClipPlayer
+        player?.audioPlayerDidFinishPlaying(carrier, successfully: succeeds)
         return true
     }
 
