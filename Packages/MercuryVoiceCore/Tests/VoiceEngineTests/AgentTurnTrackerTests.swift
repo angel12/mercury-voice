@@ -170,6 +170,33 @@ struct AgentTurnTrackerTests {
         await tracker.handle(event: event("message.start", "{}"))
         await tracker.handle(event: event("message.delta", #"{"text": "Next reply"}"#))
         #expect(await tracker.pendingSpeech()?.text == "Next reply")
-        #expect(await tracker.visibleAssistantText == "Partial reply\n\nNext reply")
+        #expect(
+            await tracker.visibleAssistantText
+                == "Partial reply\n\n\(AgentErrorCopy.genericSpoken)\n\nNext reply")
+    }
+
+    /// Issue #146 item 3: an `error` that ends a turn in flight is spoken as
+    /// that turn's reply — safe copy, not the server's raw sentence —
+    /// instead of the turn just going quiet.
+    @Test func anErrorDuringATurnIsSpokenAsItsReply() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event(
+                "error", #"{"message": "No LLM provider configured.", "code": "provider_not_configured"}"#))
+        let pending = await tracker.pendingSpeech()
+        #expect(pending?.text == AgentErrorCopy.providerSetupHint)
+        #expect(pending?.pending == false)
+        #expect(await !tracker.isBusy)
+    }
+
+    /// Outside a turn (a background agent build failing at session open)
+    /// nothing is queued to speak: the mic may be open, and an unprompted
+    /// reply would be transcribed as the user's words. The controller shows
+    /// it on screen instead.
+    @Test func anErrorOutsideATurnSpeaksNothing() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("error", #"{"message": "boom"}"#))
+        #expect(await tracker.pendingSpeech() == nil)
     }
 }

@@ -222,6 +222,10 @@ public struct ConversationCallbacks: Sendable {
     /// `ConversationUIState.microphoneDenied`; the owner shows the way to
     /// the privacy settings and restarts with `start()` once fixed.
     public var onMicrophoneDenied: @Sendable () -> Void
+    /// The line to speak when `submit` fails, or nil to only show the
+    /// "Send failed" notice. Spoken before the mic re-opens, so it is never
+    /// heard by the next listen (issue #146).
+    public var spokenSubmitFailure: @Sendable (any Error) -> String?
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
@@ -231,7 +235,8 @@ public struct ConversationCallbacks: Sendable {
         onThinkingTick: @escaping @Sendable () -> Void = {},
         micFailureIsFatal: @escaping @Sendable () async -> Bool = { true },
         onMicParked: @escaping @Sendable () -> Void = {},
-        onMicrophoneDenied: @escaping @Sendable () -> Void = {}
+        onMicrophoneDenied: @escaping @Sendable () -> Void = {},
+        spokenSubmitFailure: @escaping @Sendable (any Error) -> String? = { _ in nil }
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
@@ -241,6 +246,7 @@ public struct ConversationCallbacks: Sendable {
         self.micFailureIsFatal = micFailureIsFatal
         self.onMicParked = onMicParked
         self.onMicrophoneDenied = onMicrophoneDenied
+        self.spokenSubmitFailure = spokenSubmitFailure
     }
 }
 

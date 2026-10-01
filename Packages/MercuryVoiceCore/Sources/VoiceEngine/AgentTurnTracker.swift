@@ -122,8 +122,18 @@ public actor AgentTurnTracker: AgentInterfacing {
             // Defensive unwedge: a dead turn must not leave the loop stuck
             // in thinking forever. Seal partial text too, so speech can
             // finish and the next turn cannot extend a consumed bubble.
+            let turnInFlight = busy || hasOpenBubble
             sealOpenBubble(finalText: nil)
             busy = false
+            // A turn the user is waiting on ends with something said, not
+            // silence (issue #146). Outside a turn nothing is queued: the mic
+            // may be open, and the controller shows the notice instead.
+            if turnInFlight {
+                let copy = AgentErrorCopy.errorEvent(
+                    message: event.payload["message"]?.stringValue,
+                    code: event.payload["code"]?.stringValue)
+                bubbles.append(Bubble(id: takeBubbleID(), text: copy.spoken, pending: false))
+            }
 
         default:
             return

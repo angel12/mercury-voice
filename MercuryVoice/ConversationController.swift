@@ -628,7 +628,8 @@ final class ConversationController {
                         if UIApplication.shared.applicationState != .active { return false }
                     #endif
                     return true
-                }),
+                },
+                spokenSubmitFailure: AgentErrorCopy.spokenSubmitFailure),
             clock: ContinuousClock())
         self.engine = engine
 
@@ -972,6 +973,16 @@ final class ConversationController {
             GatewayEvent.Kind.messageComplete,
             GatewayEvent.Kind.error:
             trackerEventContinuation?.yield(.event(event))
+            if event.type == GatewayEvent.Kind.error {
+                // The tracker speaks it when it ended a turn; on screen it
+                // always shows, since most of these arrive outside a turn
+                // (a background agent build failing at session open).
+                setNotice(
+                    AgentErrorCopy.errorEvent(
+                        message: event.payload["message"]?.stringValue,
+                        code: event.payload["code"]?.stringValue
+                    ).display)
+            }
             if event.type == GatewayEvent.Kind.messageComplete {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")

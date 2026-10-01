@@ -477,6 +477,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             guard epoch == lifetimeEpoch else { return }
             callbacks.onNotice("Send failed: \(error.localizedDescription)")
             awaitingSpokenResponse = false
+            await speakSubmitFailure(error)
+            guard epoch == lifetimeEpoch else { return }
             if enabled, !micBlocked { pendingStart = true }
             setStatus(.idle)
             await drive()
@@ -897,6 +899,8 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             guard epoch == lifetimeEpoch else { return }
             callbacks.onNotice("Send failed: \(error.localizedDescription)")
             awaitingSpokenResponse = false
+            await speakSubmitFailure(error)
+            guard epoch == lifetimeEpoch else { return }
             resumeListening()
             await drive()
             return
@@ -904,6 +908,16 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         guard epoch == lifetimeEpoch else { return }
         setStatus(.thinking)
         await drive()
+    }
+
+    /// Say why a send failed, when the owner has a line for it (issue
+    /// #146). Runs with the mic closed — before the caller re-arms it — so
+    /// the line is never transcribed as the user's next turn. A Stop or mute
+    /// meanwhile cuts it off like any other speech; nothing plays while paused.
+    private func speakSubmitFailure(_ error: any Error) async {
+        guard let line = callbacks.spokenSubmitFailure(error), !paused else { return }
+        let sequence = await speech.sequence
+        _ = await speech.playAnnouncement(text: line, expectedSequence: sequence)
     }
 
     private func consumeStopRequest() -> Bool {

@@ -100,7 +100,7 @@ private struct RecoveryHarness {
     let agent: FakeAgent
     let notices: NoticeBox
 
-    init() {
+    init(spokenSubmitFailure: @escaping @Sendable (any Error) -> String? = { _ in nil }) {
         let clock = TestClock()
         let recorder = FakeRecorder()
         let barge = FakeBargeMonitor()
@@ -121,7 +121,8 @@ private struct RecoveryHarness {
             transcriber: transcriber,
             speech: speech,
             agent: agent,
-            callbacks: ConversationCallbacks(onNotice: { notices.append($0) }),
+            callbacks: ConversationCallbacks(
+                onNotice: { notices.append($0) }, spokenSubmitFailure: spokenSubmitFailure),
             clock: clock)
     }
 
@@ -159,6 +160,36 @@ struct EngineRecoveryTests {
         // Send failures re-arm: the user should get to just say it again.
         #expect(await h.status(is: .listening))
         #expect(await eventually { h.recorder.startCount == 2 })
+    }
+
+    /// Issue #146 item 3: a submit the backend refused for a reason worth
+    /// hearing is spoken before the mic re-opens, so a voice-only user is
+    /// not left in silence — and never over an open mic.
+    @Test func aSpeakableSubmitFailureIsSpokenBeforeTheMicReopens() async {
+        let h = RecoveryHarness(spokenSubmitFailure: { _ in "No provider is set up." })
+        h.agent.submitError = TestError.boom
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.queue("hello there")
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        h.recorder.fireAutoStop()
+
+        #expect(await eventually { h.speech.fallbackTexts == ["No provider is set up."] })
+        #expect(await eventually { h.recorder.startCount == 2 })
+        #expect(h.notices.list.contains { $0.hasPrefix("Send failed") })
+    }
+
+    @Test func anUnspeakableSubmitFailureStaysOnScreenOnly() async {
+        let h = RecoveryHarness(spokenSubmitFailure: { _ in nil })
+        h.agent.submitError = TestError.boom
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.queue("hello there")
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        h.recorder.fireAutoStop()
+
+        #expect(await eventually { h.recorder.startCount == 2 })
+        #expect(h.speech.fallbackTexts.isEmpty)
     }
 
     @Test func transcriptionFailureNoticesAndRearms() async {
