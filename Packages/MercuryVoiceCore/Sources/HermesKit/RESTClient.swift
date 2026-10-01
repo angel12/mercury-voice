@@ -17,6 +17,11 @@ public struct HermesRESTClient: Sendable {
     /// `GET /api/profiles` walks skill trees and can take tens of seconds.
     public static let profilesTimeout: TimeInterval = 60
 
+    /// `POST /api/audio/stt-lease` blocks until the local model is warm — a
+    /// cold faster-whisper download + load can take minutes (upstream's
+    /// desktop allows the same 180 s).
+    public static let sttLeaseTimeout: TimeInterval = 180
+
     /// Relay audio timeouts scale with the payload, as upstream's desktop
     /// client does (`apps/desktop/src/api/system.ts`): a 180 s floor covers
     /// a cold local model load, a 600 s cap bounds a wedged request.
@@ -180,6 +185,27 @@ public struct HermesRESTClient: Sendable {
             // Warm-up/lease bookkeeping is a nicety, not a precondition for
             // speech; an old backend without the route, or a dropped
             // connection, must not disturb the conversation.
+        }
+    }
+
+    /// `POST /api/audio/stt-lease` — acquire (`active: true`) or release
+    /// (`active: false`) the named surface's claim on the backend's local
+    /// STT model. Acquire pre-loads faster-whisper (first-use download, or a
+    /// reload after idle eviction) and answers once it is warm; release only
+    /// drops the claim and never unloads. Cloud providers answer `noop`.
+    /// Best-effort like `ttsLease`: warm-up failures come back in the body,
+    /// and every HTTP/transport failure — including 404/405 from a backend
+    /// that predates the route — is swallowed.
+    public func sttLease(_ lease: String, active: Bool, profile: String?) async {
+        do {
+            _ = try await post(
+                "/api/audio/stt-lease",
+                query: profileQuery(profile),
+                body: ["lease": .string(lease), "active": .bool(active)],
+                timeout: Self.sttLeaseTimeout)
+        } catch {
+            // Transcription works without a lease; it just pays any cold
+            // load inside its own (size-scaled) timeout.
         }
     }
 

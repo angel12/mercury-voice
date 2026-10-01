@@ -43,6 +43,11 @@ protocol SessionServicing: Sendable {
     /// *how many times* it fires is exactly the acquire/release-once
     /// behaviour under test here.
     func ttsLease(_ lease: String, active: Bool, profile: String?) async
+    /// `POST /api/audio/stt-lease` (issue #146) — release this
+    /// conversation's claim on the backend's local STT model. The acquire
+    /// happens per listen start inside `RestTranscriber`; only the release
+    /// is the controller's, so only it goes through this seam.
+    func sttLease(_ lease: String, active: Bool, profile: String?) async
 }
 
 extension HermesConnection: SessionServicing {}

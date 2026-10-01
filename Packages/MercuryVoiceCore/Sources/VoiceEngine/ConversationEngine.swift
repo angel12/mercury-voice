@@ -316,6 +316,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             return
         }
         setStatus(.listening)
+        await transcriber.prepare()
 
         // A stale hard-cap timer from an earlier cycle must never fire
         // mid-listen — clear before arming (desktop does the same).
@@ -793,6 +794,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         bargeCapturePending = true
         barged = true
         interruptedLatchAt = clock.now
+        await transcriber.prepare()
         await speech.stopPlayback()
         if await agent.isBusy {
             await agent.interrupt()

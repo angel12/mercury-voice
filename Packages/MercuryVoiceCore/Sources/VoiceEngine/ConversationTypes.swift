@@ -97,6 +97,14 @@ extension BargeMonitoring {
 public protocol Transcribing: Sendable {
     /// Returns the transcript; empty string means silence (re-listen quietly).
     func transcribe(_ utterance: RecordedUtterance) async throws -> String
+    /// A transcription is coming: the mic just opened (or a barge-in started
+    /// capturing). Must return promptly — it runs on the listen path; any
+    /// real work belongs in a task `transcribe` can wait for.
+    func prepare() async
+}
+
+extension Transcribing {
+    public func prepare() async {}
 }
 
 public enum SpeechStreamOutcome: Sendable, Equatable {
