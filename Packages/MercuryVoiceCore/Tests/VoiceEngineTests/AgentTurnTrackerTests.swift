@@ -152,6 +152,67 @@ struct AgentTurnTrackerTests {
         #expect(await !tracker.isBusy)
     }
 
+    // MARK: response_previewed (issue #146 item 6, upstream 1bb66fc892)
+
+    /// The Codex app-server bridge delivers its final message as an interim
+    /// and the complete repeats it with `response_previewed: true`. That is
+    /// one reply, already spoken — not a second one.
+    @Test func aPreviewedFinalIsNotSpokenAgain() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Here is the answer.", "already_streamed": false}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Here is the answer.")
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(
+            event: event(
+                "message.complete", #"{"text": "Here is the answer.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech() == nil)
+        #expect(await tracker.visibleAssistantText == "Here is the answer.")
+        #expect(await !tracker.isBusy)
+    }
+
+    /// A previewed final may be a rewrite sharing no prefix with the interim
+    /// (verify-on-stop): it settles onto the interim's caption, unspoken.
+    @Test func aPreviewedRewriteReplacesTheCaptionOnly() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Draft answer.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(
+            event: event("message.complete", #"{"text": "Final answer.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech() == nil)
+        #expect(await tracker.visibleAssistantText == "Final answer.")
+    }
+
+    /// After a new `message.start`, a previewed final is a distinct reply:
+    /// it must be spoken, never folded into the earlier interim.
+    @Test func aPreviewedFinalAfterANewStartIsItsOwnReply() async {
+        let tracker = makeTracker()
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Old segment.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+        await tracker.handle(event: event("message.start", "{}"))
+
+        await tracker.handle(
+            event: event("message.complete", #"{"text": "New reply.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech()?.text == "New reply.")
+    }
+
+    @Test func anUnflaggedFinalAfterAnInterimIsStillSpoken() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Checking the logs.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(event: event("message.complete", #"{"text": "All clear."}"#))
+        #expect(await tracker.pendingSpeech()?.text == "All clear.")
+    }
+
     @Test func errorEventUnwedgesBusy() async {
         let tracker = makeTracker()
         await tracker.handle(event: event("message.start", "{}"))
@@ -170,6 +231,33 @@ struct AgentTurnTrackerTests {
         await tracker.handle(event: event("message.start", "{}"))
         await tracker.handle(event: event("message.delta", #"{"text": "Next reply"}"#))
         #expect(await tracker.pendingSpeech()?.text == "Next reply")
-        #expect(await tracker.visibleAssistantText == "Partial reply\n\nNext reply")
+        #expect(
+            await tracker.visibleAssistantText
+                == "Partial reply\n\n\(AgentErrorCopy.genericSpoken)\n\nNext reply")
+    }
+
+    /// Issue #146 item 3: an `error` that ends a turn in flight is spoken as
+    /// that turn's reply — safe copy, not the server's raw sentence —
+    /// instead of the turn just going quiet.
+    @Test func anErrorDuringATurnIsSpokenAsItsReply() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event(
+                "error", #"{"message": "No LLM provider configured.", "code": "provider_not_configured"}"#))
+        let pending = await tracker.pendingSpeech()
+        #expect(pending?.text == AgentErrorCopy.providerSetupHint)
+        #expect(pending?.pending == false)
+        #expect(await !tracker.isBusy)
+    }
+
+    /// Outside a turn (a background agent build failing at session open)
+    /// nothing is queued to speak: the mic may be open, and an unprompted
+    /// reply would be transcribed as the user's words. The controller shows
+    /// it on screen instead.
+    @Test func anErrorOutsideATurnSpeaksNothing() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("error", #"{"message": "boom"}"#))
+        #expect(await tracker.pendingSpeech() == nil)
     }
 }

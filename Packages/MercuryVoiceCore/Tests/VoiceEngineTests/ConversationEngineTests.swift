@@ -37,7 +37,8 @@ struct ConversationEngineTests {
 
         init(
             micFailureIsFatal: Bool = true,
-            detachBargeCaptureWhileMuted: Bool = false
+            detachBargeCaptureWhileMuted: Bool = false,
+            bargeInEnabled: @escaping @Sendable () -> Bool = { true }
         ) {
             let clock = TestClock()
             let recorder = FakeRecorder()
@@ -70,7 +71,8 @@ struct ConversationEngineTests {
                     onTurnCaptured: { turnCues.bump() },
                     onThinkingTick: { thinkingTicks.bump() },
                     micFailureIsFatal: { micFailureIsFatal },
-                    onMicParked: { micParks.bump() }),
+                    onMicParked: { micParks.bump() },
+                    bargeInEnabled: bargeInEnabled),
                 clock: clock,
                 detachBargeCaptureWhileMuted: detachBargeCaptureWhileMuted)
         }
@@ -130,6 +132,33 @@ struct ConversationEngineTests {
         #expect(await eventually { h.recorder.startCount == 2 })
         #expect(await h.status(is: .listening))
         #expect(h.agent.submissions.isEmpty)
+    }
+
+    /// Issue #146: every mic open announces an upcoming transcription, so
+    /// the relay transcriber can warm the backend's local STT model while the
+    /// user is still talking — again on each re-listen, since the model can
+    /// be idle-evicted between turns.
+    @Test func everyListenStartPreparesTheTranscriber() async {
+        let h = Harness()
+        h.recorder.nextResult = makeUtterance()
+        h.transcriber.queue("")
+        await h.engine.start()
+        #expect(await h.status(is: .listening))
+        #expect(h.transcriber.prepareCount == 1)
+
+        h.recorder.fireAutoStop()
+        #expect(await eventually { h.recorder.startCount == 2 })
+        #expect(await eventually { h.transcriber.prepareCount == 2 })
+    }
+
+    @Test func aBargeInPreparesTheTranscriber() async {
+        let h = Harness()
+        await h.enterThinking()
+        _ = await eventually { h.barge.isActive }
+        let before = h.transcriber.prepareCount
+
+        h.barge.trip()
+        #expect(await eventually { h.transcriber.prepareCount == before + 1 })
     }
 
     @Test func noSpeechHeardRelistensWithoutTranscribing() async {

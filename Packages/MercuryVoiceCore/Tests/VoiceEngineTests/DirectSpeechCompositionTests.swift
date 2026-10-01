@@ -88,7 +88,7 @@ struct SpeechSegmenterTests {
             #expect(!all.contains("print"), "delta size \(String(describing: size))")
             #expect(!all.contains("let x"), "delta size \(String(describing: size))")
             #expect(all.contains("And then the prose continues after the block."))
-            #expect(all.contains(SpeechText.codeBlockSummary.trimmingCharacters(in: .whitespaces)))
+            #expect(all.hasPrefix("Here is the code you asked for."))
             // Where the deltas fall never changes what is spoken.
             #expect(out == spoken(reply), "delta size \(String(describing: size))")
         }
@@ -111,7 +111,10 @@ struct SpeechSegmenterTests {
 
         #expect(
             spoken(reply, deltaSize: 7) == [
-                "Here is how you do it:. code block omitted . That prints one.",
+                // The stray ". " is upstream's too: the paragraph break after
+                // the closing fence becomes ". " before the fence is removed.
+                // Silent in TTS; kept for parity with speech-text.ts.
+                "Here is how you do it. . That prints one.",
                 "Anything else?",
             ])
     }
@@ -140,8 +143,7 @@ struct SpeechSegmenterTests {
 
         let released = segmenter.accept("```\nAnd the tail sentence follows. ", flush: false)
         try #require(released.count == 1)
-        #expect(released[0].contains("code block omitted"))
-        #expect(released[0].hasSuffix("And the tail sentence follows."))
+        #expect(released[0] == "And the tail sentence follows.")
         #expect(!released[0].contains("More code here"))
     }
 
@@ -155,11 +157,11 @@ struct SpeechSegmenterTests {
                 == ["Here is the thing you wanted."])
     }
 
-    /// A fence that never closes is summarised at flush, matching
+    /// A fence that never closes is still dropped at flush, matching
     /// `SpeechText.unterminatedFenceIsStripped` for whole text.
-    @Test func anUnclosedFenceAtFlushIsStillSummarised() {
+    @Test func anUnclosedFenceAtFlushIsStillDropped() {
         let out = spoken("Look at this:\n```python\nprint('hi')", deltaSize: 5)
-        #expect(out == ["Look at this: code block omitted"])
+        #expect(out == ["Look at this."])
     }
 
     /// The subtle one. A boundary at the very end of the buffer sits inside a
@@ -200,10 +202,10 @@ struct SpeechSegmenterTests {
 
     /// A sentence the sanitizer empties out is dropped rather than queued as
     /// an empty synthesis request. `###` is markdown furniture with no text
-    /// behind it; a code block is not this case, it speaks its summary.
+    /// behind it; a code block is silence too since upstream 9b761903b9.
     @Test func aSentenceThatSanitizesToNothingIsNotSpoken() {
         #expect(spoken("###", deltaSize: 1) == [])
-        #expect(spoken("```\njust code\n```", deltaSize: 3) == ["code block omitted"])
+        #expect(spoken("```\njust code\n```", deltaSize: 3) == [])
     }
 }
 
@@ -269,7 +271,7 @@ struct DirectSpeechSessionCompositionTests {
 
     /// Nothing speakable means nothing was ever played, which is the
     /// `.fallback` contract — preserved, not introduced. A code-only reply is
-    /// not this case: it still speaks the summary and settles `.done`.
+    /// now this case too: code is silence, not a spoken summary.
     @Test func aReplyWithNothingSpeakableFallsBack() async {
         let empty = await run("😀 😀 😀", deltaSize: 2)
         #expect(empty.texts.isEmpty)
@@ -277,8 +279,8 @@ struct DirectSpeechSessionCompositionTests {
         #expect(empty.outcome == .fallback)
 
         let codeOnly = await run("```\njust code\n```", deltaSize: 3)
-        #expect(codeOnly.texts == ["code block omitted"])
-        #expect(codeOnly.outcome == .done)
+        #expect(codeOnly.texts.isEmpty)
+        #expect(codeOnly.outcome == .fallback)
     }
 
     /// `tts.streaming.min_len` on the resolved config drives the cutter the

@@ -125,6 +125,14 @@ final class ConversationController {
     /// by name only: a shared name would let one device's release drop
     /// another's warm-up.
     private let ttsLeaseName = "mercury:conversation:\(UUID().uuidString)"
+    /// This controller's claim on the backend's local STT model
+    /// (`POST /api/audio/stt-lease`, issue #146), per controller for the same
+    /// reason. `RestTranscriber` acquires it at every listen start; the
+    /// release in `closeSessionIfOpen` is unordered against a late acquire
+    /// on purpose — releasing never unloads the model (only the holder count
+    /// moves), so a lost race costs nothing and close never waits on a
+    /// minutes-long cold load.
+    let sttLeaseName = "mercury:voice-input:\(UUID().uuidString)"
     /// Fire-and-forget handle for the acquire kicked off in `openSession`.
     /// `closeSessionIfOpen` consumes this (sets it nil) so the release task
     /// it spawns can await this exact acquire before sending `active:
@@ -137,6 +145,9 @@ final class ConversationController {
     /// `closeSessionIfOpen`; joined only by
     /// `diagnosticAwaitTTSLeaseRelease()` in tests.
     private var ttsLeaseReleaseTask: Task<Void, Never>?
+    /// The STT release spawned by `closeSessionIfOpen`; joined only by
+    /// `diagnosticAwaitSTTLeaseRelease()` in tests.
+    private var sttLeaseReleaseTask: Task<Void, Never>?
 
     private let tracker: AgentTurnTracker
     private var engine: ConversationEngine<ContinuousClock>?
@@ -383,6 +394,11 @@ final class ConversationController {
         await ttsLeaseReleaseTask?.value
     }
 
+    /// Diagnostic only: join the STT-lease release.
+    func diagnosticAwaitSTTLeaseRelease() async {
+        await sttLeaseReleaseTask?.value
+    }
+
     /// Read the same actor that the real voice engine uses, without starting
     /// that engine or installing any process-global audio handlers.
     func diagnosticTrackerState() async -> (text: String, busy: Bool, pendingText: String?) {
@@ -576,7 +592,8 @@ final class ConversationController {
             recorder: MicRecorder(capture: capture),
             bargeMonitor: BargeInMonitor(capture: capture),
             transcriber: RestTranscriber(
-                rest: connection.rest, profile: profile, voiceConfig: voiceStore),
+                rest: connection.rest, profile: profile, voiceConfig: voiceStore,
+                sttLease: sttLeaseName),
             microphone: SystemMicrophoneAuthorization())
     }
 
@@ -611,7 +628,9 @@ final class ConversationController {
                         if UIApplication.shared.applicationState != .active { return false }
                     #endif
                     return true
-                }),
+                },
+                spokenSubmitFailure: AgentErrorCopy.spokenSubmitFailure,
+                bargeInEnabled: { BargeInPreference.isEnabled }),
             clock: ContinuousClock())
         self.engine = engine
 
@@ -685,6 +704,7 @@ final class ConversationController {
         // once per session, so the release below fires exactly once per
         // acquire.
         releaseTTSLease()
+        releaseSTTLease()
         await sessionService.closeSession(sessionID: sid)
     }
 
@@ -705,6 +725,17 @@ final class ConversationController {
         ttsLeaseReleaseTask = Task {
             _ = await acquireTask?.value
             await leaseService.ttsLease(leaseName, active: false, profile: leaseProfile)
+        }
+    }
+
+    /// Fire-and-forget like the TTS release; upstream treats releasing a
+    /// never-acquired lease as a no-op, so this is unconditional.
+    private func releaseSTTLease() {
+        let leaseService = sessionService
+        let leaseName = sttLeaseName
+        let leaseProfile = profile
+        sttLeaseReleaseTask = Task {
+            await leaseService.sttLease(leaseName, active: false, profile: leaseProfile)
         }
     }
 
@@ -943,6 +974,16 @@ final class ConversationController {
             GatewayEvent.Kind.messageComplete,
             GatewayEvent.Kind.error:
             trackerEventContinuation?.yield(.event(event))
+            if event.type == GatewayEvent.Kind.error {
+                // The tracker speaks it when it ended a turn; on screen it
+                // always shows, since most of these arrive outside a turn
+                // (a background agent build failing at session open).
+                setNotice(
+                    AgentErrorCopy.errorEvent(
+                        message: event.payload["message"]?.stringValue,
+                        code: event.payload["code"]?.stringValue
+                    ).display)
+            }
             if event.type == GatewayEvent.Kind.messageComplete {
                 appendDevMessage(
                     role: "assistant", text: event.payload["text"]?.stringValue ?? "")
@@ -1102,6 +1143,29 @@ final class ConversationController {
             if runningSubagents.isEmpty, toolTicker?.hasPrefix("Delegating: ") == true {
                 toolTicker = nil
             }
+
+        case GatewayEvent.Kind.approvalCancelled:
+            // Broadcast: the backend deny-resolved pending approvals on an
+            // interrupt, reap or teardown (issue #146). `request.cancel`
+            // usually took an srq sheet down already; this catches a legacy
+            // `approval.request` sheet, which has no srq id to match. The
+            // ids are the approval queue's own `request_id`s, so a cancelled
+            // id never clears a newer approval; no ids at all clears the
+            // session's approval wholesale, as the desktop does.
+            let runtime = event.payload["session_id"]?.stringValue
+            let stored = event.payload["stored_session_id"]?.stringValue
+            let isOurs =
+                (runtime != nil && runtime == sessionBox.runtimeID)
+                || (stored != nil && stored == sessionBox.storedID)
+            guard isOurs, let current = approval else { break }
+            let ids = (event.payload["request_ids"]?.arrayValue ?? [])
+                .compactMap(\.stringValue).filter { !$0.isEmpty }
+            let matches = ids.isEmpty || current.requestID.map(ids.contains) == true
+            guard matches else { break }
+            approval = nil
+            approvalEpoch += 1
+            promptSendError = nil
+            resumeIfUnprompted()
 
         case GatewayEvent.Kind.sessionReclaimed:
             // Broadcast (no session_id on the frame): the server reaped a

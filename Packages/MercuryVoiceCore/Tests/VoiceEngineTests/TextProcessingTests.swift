@@ -73,22 +73,18 @@ struct SpeechTextTests {
     @Test func stripsFencedCode() {
         let out = SpeechText.sanitizeForSpeech(
             "Here you go:\n```swift\nlet x = 1\n```\nDone.")
-        #expect(out.contains("code block omitted"))
-        #expect(!out.contains("let x"))
+        #expect(out == "Here you go. Done.")
     }
 
     @Test func unterminatedFenceIsStripped() {
         let out = SpeechText.sanitizeForSpeech("Look:\n```python\nprint('hi')")
-        #expect(out.contains("code block omitted"))
-        #expect(!out.contains("print"))
+        #expect(out == "Look.")
     }
 
-    @Test func linksKeepTextURLsBecomeLink() {
+    @Test func linksKeepTextURLsAreSilence() {
         let out = SpeechText.sanitizeForSpeech(
             "See [the docs](https://example.com/a) or https://raw.example.com/x?q=1 now")
-        #expect(out.contains("the docs"))
-        #expect(!out.contains("example.com"))
-        #expect(out.contains("link"))
+        #expect(out == "See the docs or now")
     }
 
     @Test func inlineCodeKeepsContent() {
@@ -103,7 +99,7 @@ struct SpeechTextTests {
         #expect(out.contains("bold"))
     }
 
-    @Test func stripsMarkdownTables() {
+    @Test func tablesSpeakOnlyTheirHeader() {
         let text = """
             Results:
 
@@ -114,10 +110,8 @@ struct SpeechTextTests {
 
             That's the summary.
             """
-        let out = SpeechText.sanitizeForSpeech(text)
-        #expect(!out.contains("Value"))
-        #expect(out.contains("Results"))
-        #expect(out.contains("summary"))
+        #expect(
+            SpeechText.sanitizeForSpeech(text) == "Results. Name, Value. That's the summary.")
     }
 
     @Test func doesNotTreatPlainPipesAsTable() {

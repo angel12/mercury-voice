@@ -269,4 +269,9 @@ extension HermesConnection {
     public func ttsLease(_ lease: String, active: Bool, profile: String?) async {
         await rest.ttsLease(lease, active: active, profile: profile)
     }
+
+    /// `POST /api/audio/stt-lease` — see `HermesRESTClient.sttLease`.
+    public func sttLease(_ lease: String, active: Bool, profile: String?) async {
+        await rest.sttLease(lease, active: active, profile: profile)
+    }
 }

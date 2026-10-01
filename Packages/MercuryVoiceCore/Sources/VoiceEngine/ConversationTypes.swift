@@ -97,6 +97,14 @@ extension BargeMonitoring {
 public protocol Transcribing: Sendable {
     /// Returns the transcript; empty string means silence (re-listen quietly).
     func transcribe(_ utterance: RecordedUtterance) async throws -> String
+    /// A transcription is coming: the mic just opened (or a barge-in started
+    /// capturing). Must return promptly — it runs on the listen path; any
+    /// real work belongs in a task `transcribe` can wait for.
+    func prepare() async
+}
+
+extension Transcribing {
+    public func prepare() async {}
 }
 
 public enum SpeechStreamOutcome: Sendable, Equatable {
@@ -214,6 +222,14 @@ public struct ConversationCallbacks: Sendable {
     /// `ConversationUIState.microphoneDenied`; the owner shows the way to
     /// the privacy settings and restarts with `start()` once fixed.
     public var onMicrophoneDenied: @Sendable () -> Void
+    /// The line to speak when `submit` fails, or nil to only show the
+    /// "Send failed" notice. Spoken before the mic re-opens, so it is never
+    /// heard by the next listen (issue #146).
+    public var spokenSubmitFailure: @Sendable (any Error) -> String?
+    /// Whether talking over the agent interrupts it, read each time the
+    /// barge-in monitor would arm, so a change applies from the next reply
+    /// (`BargeInPreference` in the app; issue #146).
+    public var bargeInEnabled: @Sendable () -> Bool
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
@@ -223,7 +239,9 @@ public struct ConversationCallbacks: Sendable {
         onThinkingTick: @escaping @Sendable () -> Void = {},
         micFailureIsFatal: @escaping @Sendable () async -> Bool = { true },
         onMicParked: @escaping @Sendable () -> Void = {},
-        onMicrophoneDenied: @escaping @Sendable () -> Void = {}
+        onMicrophoneDenied: @escaping @Sendable () -> Void = {},
+        spokenSubmitFailure: @escaping @Sendable (any Error) -> String? = { _ in nil },
+        bargeInEnabled: @escaping @Sendable () -> Bool = { true }
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
@@ -233,6 +251,8 @@ public struct ConversationCallbacks: Sendable {
         self.micFailureIsFatal = micFailureIsFatal
         self.onMicParked = onMicParked
         self.onMicrophoneDenied = onMicrophoneDenied
+        self.spokenSubmitFailure = spokenSubmitFailure
+        self.bargeInEnabled = bargeInEnabled
     }
 }
 

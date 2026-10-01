@@ -152,11 +152,29 @@ public struct RestTranscriber: Transcribing {
     private let profile: String?
     private let voiceConfig: VoiceConfigStore?
     private let direct = DirectVoiceClient()
+    /// nil without a lease name: no warm-up, as before issue #146.
+    private let warmup: STTWarmup?
 
-    public init(rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil) {
+    /// `sttLease` names this surface's `POST /api/audio/stt-lease` claim
+    /// (one per conversation); the owner releases it when the conversation
+    /// ends.
+    public init(
+        rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil,
+        sttLease: String? = nil
+    ) {
         self.rest = rest
         self.profile = profile
         self.voiceConfig = voiceConfig
+        self.warmup = sttLease.map { lease in
+            STTWarmup(
+                // Client-direct STT never touches the backend's model.
+                shouldWarm: { await voiceConfig?.stt() == nil },
+                acquire: { await rest.sttLease(lease, active: true, profile: profile) })
+        }
+    }
+
+    public func prepare() async {
+        await warmup?.start()
     }
 
     public func transcribe(_ utterance: RecordedUtterance) async throws -> String {
@@ -164,8 +182,52 @@ public struct RestTranscriber: Transcribing {
             return try await direct.transcribe(
                 config: config, audio: utterance.audio, mimeType: utterance.mimeType)
         }
+        // Send the audio only once the model is warm, so a cold load is not
+        // charged to the transcribe request's timeout. Bounded by the
+        // acquire's own 180 s budget; a failed or unsupported acquire simply
+        // settles and transcription proceeds.
+        await warmup?.ready()
         return try await rest.transcribe(
             audio: utterance.audio, mimeType: utterance.mimeType, profile: profile
         ).transcript
+    }
+}
+
+/// Warm-up for the backend's local STT model (issue #146, upstream
+/// `tools/stt_lease.py`). `start` runs at every listen start — idle-unload
+/// can evict the model between turns — and joins a warm-up still in flight
+/// rather than stacking another; `ready` waits for the current one to settle.
+actor STTWarmup {
+    private let shouldWarm: @Sendable () async -> Bool
+    private let acquire: @Sendable () async -> Void
+    private var inFlight: Task<Void, Never>?
+    private var generation = 0
+
+    init(
+        shouldWarm: @escaping @Sendable () async -> Bool,
+        acquire: @escaping @Sendable () async -> Void
+    ) {
+        self.shouldWarm = shouldWarm
+        self.acquire = acquire
+    }
+
+    func start() {
+        guard inFlight == nil else { return }
+        generation += 1
+        let generation = generation
+        let shouldWarm = shouldWarm
+        let acquire = acquire
+        inFlight = Task {
+            if await shouldWarm() { await acquire() }
+            self.settled(generation)
+        }
+    }
+
+    func ready() async {
+        await inFlight?.value
+    }
+
+    private func settled(_ generation: Int) {
+        if generation == self.generation { inFlight = nil }
     }
 }

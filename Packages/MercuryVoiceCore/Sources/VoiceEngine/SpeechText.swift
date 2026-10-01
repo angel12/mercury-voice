@@ -1,14 +1,17 @@
 import Foundation
 
 /// Text sanitization for TTS — a faithful port of the desktop's
-/// `lib/speech-text.ts`.
+/// `lib/speech-text.ts` (upstream as of 9b761903b9).
 ///
-/// Pipeline order (must match): markdown tables → line breaks → fenced code →
-/// thinking prefix → links → inline code → URLs → emoji → headings → emphasis
-/// chars → list bullets → whitespace collapse → trim.
+/// Pipeline order (must match): markdown tables → line-final colons → line
+/// breaks → fenced code → thinking prefix → links → inline code → URLs →
+/// MEDIA: tokens → emoji → identifier-dense tokens → headings → emphasis
+/// chars → list bullets → trailing colon → whitespace collapse → trim.
+///
+/// Unspeakable tokens are silence, never a placeholder word: an English
+/// "code block omitted" / "link" is wrong for every non-English voice
+/// (#86602 upstream).
 public enum SpeechText {
-    static let codeBlockSummary = " code block omitted "
-
     private static func regex(_ pattern: String, options: NSRegularExpression.Options = [])
         -> NSRegularExpression
     {
@@ -23,11 +26,20 @@ public enum SpeechText {
     private static let markdownLink = regex(#"\[([^\]]+)\]\(([^)]+)\)"#)
     private static let inlineCode = regex(#"`([^`]+)`"#)
     private static let url = regex(#"\bhttps?://\S+"#, options: [.caseInsensitive])
+    /// A file-link token ("MEDIA:/path/to/report.xlsx") renders as a chip on
+    /// screen; spoken, its slug makes voices loop. Silence, but a
+    /// sentence-final period/comma after it is kept ("see MEDIA:/x.py. Then").
+    private static let mediaPath = regex(#"[ \t]*MEDIA:\S+?(?=[.,;:!?)\]]*(?:\s|$))"#)
     private static let emoji = regex(
         #"(?:[\x{1F000}-\x{1FAFF}\x{2600}-\x{27BF}]|[\x{FE0F}\x{200D}]|[\x{E0020}-\x{E007F}])+"#)
     private static let heading = regex(#"^#{1,6}\s+"#, options: [.anchorsMatchLines])
     private static let emphasisChars = regex(#"[*_~>#]"#)
     private static let listBullet = regex(#"^\s*[-+*]\s+"#, options: [.anchorsMatchLines])
+    /// Closed before newlines are flattened, so "the regex list:" followed by
+    /// a code block reads "the regex list." and the voice never hangs on it.
+    private static let lineFinalColon = regex(#":\s*$"#, options: [.anchorsMatchLines])
+    /// A colon orphaned at the very end once its link/code was stripped.
+    private static let trailingColon = regex(#":\s*$"#)
     private static let whitespaceRun = regex(#"\s+"#)
 
     // normalizeLineBreaks
@@ -39,16 +51,24 @@ public enum SpeechText {
     private static let softBreak = regex(#"[ \t]*\n[ \t]*"#)
 
     public static func sanitizeForSpeech(_ text: String) -> String {
-        var out = normalizeLineBreaks(stripMarkdownTables(text))
-        out = replace(out, fencedCode, with: codeBlockSummary)
+        // Tables first: their right-align marker is a trailing colon (":-"),
+        // which the colon pass below would otherwise mangle.
+        var out = replace(summarizeMarkdownTables(text), lineFinalColon, with: ".")
+        out = normalizeLineBreaks(out)
+        out = replace(out, fencedCode, with: "")
         out = replace(out, thinkingPrefix, with: " ")
         out = replace(out, markdownLink, with: "$1")
         out = replace(out, inlineCode, with: "$1")
-        out = replace(out, url, with: " link ")
+        out = replace(out, url, with: "")
+        out = replace(out, mediaPath, with: "")
         out = replace(out, emoji, with: " ")
+        // After fences/links/URLs/MEDIA: are consumed, so their contents are
+        // not double-processed.
+        out = pruneIdentifierTokens(out)
         out = replace(out, heading, with: "")
         out = replace(out, emphasisChars, with: "")
         out = replace(out, listBullet, with: "")
+        out = replace(out, trailingColon, with: ".")
         out = replace(out, whitespaceRun, with: " ")
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -69,43 +89,121 @@ public enum SpeechText {
         return out
     }
 
+    // MARK: Identifier-dense tokens
+
+    // Filenames with extensions, hashes, UUIDs, dense model/version IDs and
+    // paths are read character by character ("peyton-sample-20260922.wav" →
+    // "peyton dash sample dash two zero two six…"). They become silence.
+    // Mirrors upstream's `pruneIdentifierTokens` token for token; its shared
+    // corpus is `SpeechTextIdentifierCorpusTests`.
+    private static let filenameExtension = regex(
+        #"[\w.-]{0,60}\.(?:wav|ogg|mp3|flac|m4a|aac|py|pyc|ts|tsx|js|jsx|mjs|cjs|json|yaml|yml|toml|md|mdx|txt|csv|xlsx|xls|pdf|png|jpg|jpeg|gif|webp|svg|log|sql|sh|bash|zsh|rs|go|java|rb|php|html|css|lock|tar|gz|zip|db|sqlite|sqlite3|onnx|pt|bin|env|ini|conf|cfg|xml)\b"#,
+        options: [.caseInsensitive])
+    private static let uuid = regex(
+        #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#)
+    private static let hashPrefixHex = regex(
+        #"\b(?:sha(?:-?256|-?512|-?1|3)?|blake2[ab]?|md5|crc32?)[:\s]+[0-9a-fA-F]{7,64}"#,
+        options: [.caseInsensitive])
+    private static let hexRun = regex(#"[0-9a-fA-F]{7,64}"#)
+    private static let identifierToken = regex(#"[A-Za-z0-9_./~@-]+"#)
+    private static let dateToken = regex(#"^\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?$"#)
+    private static let pathPrefix = regex(#"^(?:~/|\.\.?/|/)"#)
+    private static let digit = regex(#"\d"#)
+
+    private static func matches(_ regex: NSRegularExpression, _ text: String) -> Bool {
+        regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    static func isDenseIdentifier(_ token: String) -> Bool {
+        // Email addresses and dates ("2026-09-28", "2026/06/02") stay.
+        if token.contains("@") || matches(dateToken, token) { return false }
+        if matches(pathPrefix, token) { return true }  // filesystem paths
+        let hasDigit = matches(digit, token)
+        // Paths and dense model IDs ("meta-llama/Llama-3.3-70B-Instruct").
+        if token.contains("/"), matches(filenameExtension, token) || hasDigit { return true }
+        if matches(filenameExtension, token) || matches(uuid, token) { return true }
+        // Hex-hash runs ("73688014f78"); digit-free runs ("defaced") are words.
+        if matches(hexRun, token), hasDigit { return true }
+        if !hasDigit { return false }
+        let separators = ["_", ".", "/"].filter { token.contains($0) }.count
+        let hyphens = token.filter { $0 == "-" }.count
+        // v2.1.0-beta.3, Llama-3.3-70B, dated filename slugs.
+        if separators >= 2 || hyphens >= 2 { return true }
+        return token.contains("/") || (hyphens >= 1 && separators >= 1)
+    }
+
+    static func pruneIdentifierTokens(_ text: String) -> String {
+        let withoutHashes = replace(text, hashPrefixHex, with: " ")
+        let ns = withoutHashes as NSString
+        var out = ""
+        var cursor = 0
+        for match in identifierToken.matches(
+            in: withoutHashes, range: NSRange(location: 0, length: ns.length))
+        {
+            out += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            let token = ns.substring(with: match.range)
+            out += isDenseIdentifier(token) ? " " : token
+            cursor = match.range.location + match.range.length
+        }
+        out += ns.substring(from: cursor)
+        return out
+    }
+
     // MARK: Markdown tables
 
     /// Runs first, on raw text (a pipe table inside a fenced code block is
-    /// deleted as a table — matches the desktop).
-    static func stripMarkdownTables(_ text: String) -> String {
-        let lines = text.components(separatedBy: "\n")
-        var removed = Set<Int>()
+    /// treated as a table — matches the desktop). The header row is spoken in
+    /// place of the table ("Model, Price, Context."): the listener learns a
+    /// table is on screen and what it compares, in the reply's own language,
+    /// without the body being read cell by cell. An all-empty header is
+    /// silence.
+    static func summarizeMarkdownTables(_ text: String) -> String {
+        let lines = replace(text, crlf, with: "\n").components(separatedBy: "\n")
+        var tableLines = Set<Int>()
+        var headers: [Int: String] = [:]
 
         var index = 1
         while index < lines.count {
             guard let delimiter = parseTableRow(lines[index]),
-                delimiter.cells.allSatisfy(isDelimiterCell),
                 let header = parseTableRow(lines[index - 1]),
+                delimiter.cells.allSatisfy(isDelimiterCell),
                 header.cells.count == delimiter.cells.count,
                 header.blockquoteDepth == delimiter.blockquoteDepth
             else {
                 index += 1
                 continue
             }
-            removed.insert(index - 1)
-            removed.insert(index)
+            tableLines.insert(index - 1)
+            tableLines.insert(index)
+            headers[index - 1] = speakableTableHeader(header.cells)
             var body = index + 1
             while body < lines.count,
                 let row = parseTableRow(lines[body]),
                 row.blockquoteDepth == delimiter.blockquoteDepth
             {
-                removed.insert(body)
+                tableLines.insert(body)
                 body += 1
             }
-            index = body + 1
+            index = body
         }
 
-        guard !removed.isEmpty else { return text }
+        guard !tableLines.isEmpty else { return lines.joined(separator: "\n") }
         return lines.enumerated()
-            .filter { !removed.contains($0.offset) }
-            .map(\.element)
+            .compactMap { offset, line in
+                guard tableLines.contains(offset) else { return line }
+                guard let header = headers[offset], !header.isEmpty else { return nil }
+                return header
+            }
             .joined(separator: "\n")
+    }
+
+    private static func speakableTableHeader(_ cells: [String]) -> String {
+        let header = cells
+            .map { $0.replacingOccurrences(of: "\\|", with: " ").trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+        guard let last = header.last, !".!?:".contains(last) else { return header }
+        return header + "."
     }
 
     private static func isDelimiterCell(_ cell: String) -> Bool {
@@ -123,71 +221,65 @@ public enum SpeechText {
     static func parseTableRow(_ line: String) -> TableRow? {
         var rest = Substring(line)
 
-        // Reject indentation with tabs or more than 3 spaces (indented code).
-        var indent = 0
-        while let first = rest.first, first == " " || first == "\t" {
-            if first == "\t" { return nil }
-            indent += 1
-            if indent > 3 { return nil }
-            rest = rest.dropFirst()
-        }
-
-        // Peel blockquote markers ('>' plus one optional following space).
+        // Indentation, then blockquote markers ('>' plus one optional space),
+        // repeatedly: tabs or more than 3 spaces at any level is indented code.
         var depth = 0
-        while rest.first == ">" {
+        while true {
+            var indent = 0
+            while let first = rest.first, first == " " || first == "\t" {
+                if first == "\t" { return nil }
+                indent += 1
+                if indent > 3 { return nil }
+                rest = rest.dropFirst()
+            }
+            guard rest.first == ">" else { break }
             depth += 1
             rest = rest.dropFirst()
             if rest.first == " " { rest = rest.dropFirst() }
         }
 
         // trimEnd
-        while let last = rest.last, last == " " || last == "\t" { rest = rest.dropLast() }
-        guard rest.contains("|") else { return nil }
+        while let last = rest.last, last.isWhitespace { rest = rest.dropLast() }
 
-        // Unescaped pipe positions (backslash-parity).
+        // Unescaped pipe positions (backslash parity).
         let chars = Array(rest)
-        var pipeIndexes: [Int] = []
-        for (i, char) in chars.enumerated() where char == "|" {
+        func isUnescapedPipe(_ i: Int) -> Bool {
             var backslashes = 0
             var j = i - 1
             while j >= 0, chars[j] == "\\" {
                 backslashes += 1
                 j -= 1
             }
-            if backslashes % 2 == 0 { pipeIndexes.append(i) }
+            return backslashes % 2 == 0
         }
-        guard !pipeIndexes.isEmpty else { return nil }
-
-        let hasLeading = pipeIndexes.first == 0
-        let hasTrailing = pipeIndexes.last == chars.count - 1
-
-        var boundaries = pipeIndexes
-        var start = 0
-        var end = chars.count
-        if hasLeading {
-            start = 1
-            boundaries.removeFirst()
-        }
-        if hasTrailing, !boundaries.isEmpty {
-            end = chars.count - 1
-            boundaries.removeLast()
+        let pipeIndexes = chars.indices.filter { chars[$0] == "|" && isUnescapedPipe($0) }
+        guard let firstPipe = pipeIndexes.first, let lastPipe = pipeIndexes.last else {
+            return nil
         }
 
+        let hasLeading = firstPipe == 0
+        let hasTrailing = lastPipe == chars.count - 1
+        var row = chars
+        if hasLeading { row.removeFirst() }
+        if hasTrailing, !row.isEmpty { row.removeLast() }
+
+        // splitMarkdownTableCells, re-scanning the trimmed row.
         var cells: [String] = []
-        var cursor = start
-        for boundary in boundaries {
-            cells.append(
-                String(chars[cursor..<boundary]).trimmingCharacters(in: .whitespaces))
-            cursor = boundary + 1
+        var cellStart = 0
+        for i in row.indices where row[i] == "|" {
+            var backslashes = 0
+            var j = i - 1
+            while j >= 0, row[j] == "\\" {
+                backslashes += 1
+                j -= 1
+            }
+            guard backslashes % 2 == 0 else { continue }
+            cells.append(String(row[cellStart..<i]).trimmingCharacters(in: .whitespaces))
+            cellStart = i + 1
         }
-        if cursor <= end {
-            cells.append(String(chars[cursor..<end]).trimmingCharacters(in: .whitespaces))
-        }
+        cells.append(String(row[cellStart...]).trimmingCharacters(in: .whitespaces))
 
-        if cells.count < 2 {
-            // Explicit single-column row needs both a leading and trailing pipe.
-            guard hasLeading, hasTrailing, cells.count == 1 else { return nil }
-        }
+        if cells.count < 2, !(hasLeading && hasTrailing && cells.count == 1) { return nil }
         return TableRow(cells: cells, blockquoteDepth: depth)
     }
 }

@@ -320,6 +320,14 @@ final class FakeTranscriber: Transcribing, @unchecked Sendable {
         locked { results.append(.failure(error)) }
     }
 
+    private var _prepareCount = 0
+    /// How many times the engine announced an upcoming transcription.
+    var prepareCount: Int { locked { _prepareCount } }
+
+    func prepare() async {
+        locked { _prepareCount += 1 }
+    }
+
     func transcribe(_ utterance: RecordedUtterance) async throws -> String {
         let next: Result<String, any Error> = locked {
             results.isEmpty ? .success("") : results.removeFirst()

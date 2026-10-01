@@ -55,6 +55,9 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let subagentStart = "subagent.start"
         public static let subagentComplete = "subagent.complete"
         public static let sessionReclaimed = "session.reclaimed"
+        /// Broadcast: an interrupt, reap or teardown deny-resolved pending
+        /// approvals (upstream 591e3a7ce1).
+        public static let approvalCancelled = "approval.cancelled"
         public static let error = "error"
         /// Client-local: a server→client request routed as an event
         /// (`GatewayEvent(serverRequest:)`). Never appears on the wire.
@@ -138,12 +141,13 @@ public struct EventReplayBatch: Sendable, Equatable {
     ///   caller with no epoch at all and never reaches this check.
     /// - `latest_seq` is the session's current highest stamp, read straight
     ///   after the frames, so it is never below the watermark the client
-    ///   reached — *unless* the ring was evicted, which drops the counter
-    ///   with it (`_replay_next_seq.pop`) and restarts the session at 1 while
-    ///   `truncated` reads False because the ring is simply gone. A
-    ///   `latest_seq` below the watermark (0 for an evicted session), or one
-    ///   that is absent or unreadable, is the only trace that renumbering
-    ///   leaves, so it is refused.
+    ///   reached. Backends before upstream 12c3d5c968 dropped the counter
+    ///   with an evicted ring (`_replay_next_seq.pop`), restarting the
+    ///   session at 1 while `truncated` read False; a `latest_seq` below the
+    ///   watermark, or one absent or unreadable, is the trace that leaves, so
+    ///   it is refused. Since 12c3d5c968 eviction keeps the counter and
+    ///   raises the truncation watermark instead, so an old watermark gets
+    ///   `truncated: true` and never reaches this check.
     /// - Every replayed frame is stamped with an integer `seq` and carries
     ///   the session id it was requested for (`_stamp_event` only records
     ///   frames with a session id, and `events_since` reads that session's
@@ -158,11 +162,10 @@ public struct EventReplayBatch: Sendable, Equatable {
     /// lexical JSON numbers: rounded fractions and large counters cannot be
     /// recovered here. Int(exactly:) checks the represented value only.
     ///
-    /// Residual, and a backend limitation rather than something a client can
-    /// see: an evicted session whose new counter catches up to `watermark`
-    /// can answer exactly like a real continuation. Only
-    /// a per-session epoch (or an `is_truncated` that reported a missing
-    /// ring) could distinguish it.
+    /// Residual, on backends before 12c3d5c968 only: an evicted session whose
+    /// restarted counter catches up to `watermark` can answer exactly like a
+    /// real continuation. Current backends keep seq monotonic across eviction
+    /// and report the lost ring as `truncated`, which closes it.
     public func isLossless(
         under expected: String, forSession sessionID: String, after watermark: Int
     ) -> Bool {

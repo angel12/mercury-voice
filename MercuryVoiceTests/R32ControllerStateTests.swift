@@ -1,3 +1,4 @@
+import HermesKit
 import Testing
 
 @testable import MercuryVoice
@@ -259,6 +260,31 @@ struct R32ControllerStateTests {
                 Fixtures.subagentComplete(
                     sessionID: "rt", seq: 4, goal: "task one", taskCount: 2, taskIndex: 1)))
         #expect(controller.toolTicker == nil)
+    }
+
+    /// Issue #146 item 3: an `error` event used to reach only the turn
+    /// tracker, so the failure never reached the user.
+    @Test
+    func anErrorEventIsShownAsANotice() async throws {
+        let service = ScriptedSessionService()
+        let controller = try await makeOpenController(service)
+        defer { Task { await controller.teardown() } }
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.eventParams(
+                    type: GatewayEvent.Kind.error, sessionID: "rt", seq: 1,
+                    payload: ["message": "Compression failed: context window exceeded"])))
+        #expect(controller.notice == "Compression failed: context window exceeded")
+
+        controller.handle(
+            event: Fixtures.event(
+                Fixtures.eventParams(
+                    type: GatewayEvent.Kind.error, sessionID: "rt", seq: 2,
+                    payload: [
+                        "message": "Agent initialization failed: No LLM provider configured.",
+                        "code": "provider_not_configured",
+                    ])))
+        #expect(controller.notice == AgentErrorCopy.providerSetupHint)
     }
 
     @Test

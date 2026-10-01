@@ -76,6 +76,18 @@ public actor GatewayClient {
     public private(set) var closeCause: CloseCause = .other
     /// `replay_epoch` from this socket's `gateway.ready` (nil on old backends).
     public private(set) var replayEpoch: String?
+    /// This socket's backend counts a 4404 as one client abstaining rather
+    /// than as the answer (`client.capabilities` → `declines_not_shown`,
+    /// upstream e33f1a0faf). Only then is a window-owned bridge declined.
+    public private(set) var backendCountsDeclines = false
+
+    /// Desktop GUI bridges answered only by a window showing the session.
+    /// This app has no such window, ever.
+    static let windowOwnedMethods: Set<String> = [
+        "preview.read", "preview.act", "terminal.read", "window.read", "tour",
+    ]
+    /// `tui_gateway/server_requests.py::NOT_SHOWN_CODE`.
+    static let notShownCode = 4404
     private var readyWaiters: [CheckedContinuation<Void, Error>] = []
 
     /// Request-lifecycle probes for tests: whatever ends a request — reply,
@@ -276,6 +288,25 @@ public actor GatewayClient {
         }
     }
 
+    public func setBackendCountsDeclines(_ counts: Bool) {
+        backendCountsDeclines = counts
+    }
+
+    /// The JSON-RPC error response "no window here shows this session".
+    /// Fire-and-forget: a lost decline only means the request waits for its
+    /// deadline, as it did before declines existed.
+    private func declineNotShown(id: String) {
+        let frame: JSONValue = [
+            "jsonrpc": "2.0", "id": .string(id),
+            "error": [
+                "code": .number(Double(Self.notShownCode)),
+                "message": "Mercury Voice has no window that shows this session.",
+            ],
+        ]
+        guard let task, let data = try? JSONEncoder().encode(frame) else { return }
+        task.sendText(String(decoding: data, as: UTF8.self)) { _ in }
+    }
+
     /// Cancellation seen after the request registered: forget it and release
     /// the caller. The frame stays sent — see `request(_:params:timeout:)`.
     private func cancelRequest(id: Int) {
@@ -436,6 +467,13 @@ public actor GatewayClient {
                 }
                 let event = GatewayEvent(serverRequest: request)
                 for sub in subscribers.values { sub.yield(event) }
+            } else if backendCountsDeclines, Self.windowOwnedMethods.contains(request.method) {
+                // A window-owned bridge against a backend that counts
+                // declines: abstain at once. The request stays open for a
+                // desktop window showing the session and settles with a
+                // refusal only once every attached client declined, so the
+                // agent is told now instead of after its deadline (#146).
+                declineNotShown(id: request.id)
             } else {
                 // A desktop GUI bridge or an unknown method. Left
                 // unanswered on purpose (#125, PR #126 review): the

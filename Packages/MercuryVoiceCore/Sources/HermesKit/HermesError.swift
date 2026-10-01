@@ -41,6 +41,11 @@ public enum HermesError: Error, LocalizedError, Sendable {
                     break
                 }
             }
+            if code == RPCCode.agentUnavailable {
+                return AgentErrorCopy.isProviderSetup(code: nil, message: message)
+                    ? AgentErrorCopy.providerSetupHint
+                    : "Hermes couldn't start the agent for this session: \(message)"
+            }
             if code == RPCCode.sessionStorageUnavailable {
                 return
                     "The server couldn't save your message — its session storage needs repair."
@@ -67,6 +72,9 @@ public enum HermesError: Error, LocalizedError, Sendable {
         /// prompt.submit failed: state.db could not be opened; the message
         /// was NOT saved.
         public static let sessionStorageUnavailable = 5072
+        /// The session's agent never built (`agent_error`: no provider set
+        /// up, bad credentials, a crashed build); the message is the reason.
+        public static let agentUnavailable = 5032
     }
 
     /// Machine-readable `error.data.reason` values attached to 4090 refusals

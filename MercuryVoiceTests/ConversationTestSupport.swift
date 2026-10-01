@@ -30,6 +30,7 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     private var _promptResponses: [PromptResponse] = []
     private var answerReplies: [Result<ServerRequestAnswer, any Error>] = []
     private var _ttsLeaseCalls: [(lease: String, active: Bool, profile: String?)] = []
+    private var _sttLeaseCalls: [(lease: String, active: Bool, profile: String?)] = []
 
     /// When set, `createSession` suspends here until the test releases it —
     /// the window a second launch has to overlap the first (issue #77).
@@ -119,6 +120,10 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     var closedIDs: [String] { lock.withLock { _closedIDs } }
     var promptResponses: [PromptResponse] { lock.withLock { _promptResponses } }
     /// Every `ttsLease` call, in call order (issue #125, Task 9).
+    var sttLeaseCalls: [(lease: String, active: Bool, profile: String?)] {
+        lock.withLock { _sttLeaseCalls }
+    }
+
     var ttsLeaseCalls: [(lease: String, active: Bool, profile: String?)] {
         lock.withLock { _ttsLeaseCalls }
     }
@@ -223,6 +228,10 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
     func ttsLease(_ lease: String, active: Bool, profile: String?) async {
         lock.withLock { _ttsLeaseCalls.append((lease, active, profile)) }
         if active, let ttsLeaseAcquireGate { await ttsLeaseAcquireGate.arrive() }
+    }
+
+    func sttLease(_ lease: String, active: Bool, profile: String?) async {
+        lock.withLock { _sttLeaseCalls.append((lease, active, profile)) }
     }
 }
 
