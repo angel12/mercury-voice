@@ -272,10 +272,12 @@ public actor HermesConnection {
             // a contract ≥ 7 backend it means this socket's prompts may be
             // auto-skipped, which is otherwise invisible from the client.
             do {
-                _ = try await client.request(
+                let capabilities = try await client.request(
                     "client.capabilities",
                     params: .object(["server_requests": .bool(true)]),
                     timeout: 5)
+                await client.setBackendCountsDeclines(
+                    capabilities["declines_not_shown"]?.boolValue == true)
             } catch {
                 let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
                 Self.logger.error(
