@@ -24,6 +24,11 @@ public actor AgentTurnTracker: AgentInterfacing {
     private var nextBubbleID = 0
     private var lastSpokenBubbleID = -1
     private var busy = false
+    /// The last bubble was sealed by a `message.interim` and no
+    /// `message.start` has come since — the window in which a
+    /// `response_previewed` complete is that same reply (the desktop's
+    /// `interimBoundaryPending`).
+    private var interimBoundaryPending = false
 
     private let submitAction: @Sendable (String, Bool) async throws -> Void
     private let interruptAction: @Sendable () async -> Void
@@ -83,10 +88,13 @@ public actor AgentTurnTracker: AgentInterfacing {
             // Text a previous turn left open (its complete never arrived)
             // must not run into this turn's reply (hermes-agent 7c0b206cc9).
             sealOpenBubble(finalText: nil)
+            interimBoundaryPending = false
             busy = true
 
         case GatewayEvent.Kind.messageDelta:
             busy = true
+            // New text after the interim is a new segment, not the interim.
+            interimBoundaryPending = false
             appendDelta(event.payload["text"]?.stringValue ?? "")
 
         case GatewayEvent.Kind.messageInterim:
@@ -107,15 +115,26 @@ public actor AgentTurnTracker: AgentInterfacing {
                     bubbles.append(Bubble(id: takeBubbleID(), text: text, pending: false))
                 }
             }
+            interimBoundaryPending = !bubbles.isEmpty
 
         case GatewayEvent.Kind.messageComplete:
             let text = event.payload["text"]?.stringValue ?? ""
             let transformed = event.payload["response_transformed"]?.truthy ?? false
+            let previewed = event.payload["response_previewed"]?.truthy ?? false
             if hasOpenBubble {
                 sealOpenBubble(finalText: text, captionOverride: transformed)
+            } else if previewed, interimBoundaryPending, let index = bubbles.indices.last {
+                // Already delivered as the interim (upstream 1bb66fc892: the
+                // Codex bridge routes its final through the interim path).
+                // One reply, already spoken: settle onto it — a rewrite only
+                // changes the caption, since the spoken text is append-only.
+                if text != bubbles[index].text, !text.isEmpty {
+                    bubbles[index].displayText = text
+                }
             } else if !text.isEmpty {
                 bubbles.append(Bubble(id: takeBubbleID(), text: text, pending: false))
             }
+            interimBoundaryPending = false
             busy = false
 
         case GatewayEvent.Kind.error:
@@ -146,6 +165,7 @@ public actor AgentTurnTracker: AgentInterfacing {
     public func reset(busy: Bool = false) {
         bubbles.removeAll()
         lastSpokenBubbleID = -1
+        interimBoundaryPending = false
         self.busy = busy
         notifyChange()
     }

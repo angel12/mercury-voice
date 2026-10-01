@@ -152,6 +152,67 @@ struct AgentTurnTrackerTests {
         #expect(await !tracker.isBusy)
     }
 
+    // MARK: response_previewed (issue #146 item 6, upstream 1bb66fc892)
+
+    /// The Codex app-server bridge delivers its final message as an interim
+    /// and the complete repeats it with `response_previewed: true`. That is
+    /// one reply, already spoken — not a second one.
+    @Test func aPreviewedFinalIsNotSpokenAgain() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Here is the answer.", "already_streamed": false}"#))
+        #expect(await tracker.pendingSpeech()?.text == "Here is the answer.")
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(
+            event: event(
+                "message.complete", #"{"text": "Here is the answer.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech() == nil)
+        #expect(await tracker.visibleAssistantText == "Here is the answer.")
+        #expect(await !tracker.isBusy)
+    }
+
+    /// A previewed final may be a rewrite sharing no prefix with the interim
+    /// (verify-on-stop): it settles onto the interim's caption, unspoken.
+    @Test func aPreviewedRewriteReplacesTheCaptionOnly() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Draft answer.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(
+            event: event("message.complete", #"{"text": "Final answer.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech() == nil)
+        #expect(await tracker.visibleAssistantText == "Final answer.")
+    }
+
+    /// After a new `message.start`, a previewed final is a distinct reply:
+    /// it must be spoken, never folded into the earlier interim.
+    @Test func aPreviewedFinalAfterANewStartIsItsOwnReply() async {
+        let tracker = makeTracker()
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Old segment.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+        await tracker.handle(event: event("message.start", "{}"))
+
+        await tracker.handle(
+            event: event("message.complete", #"{"text": "New reply.", "response_previewed": true}"#))
+        #expect(await tracker.pendingSpeech()?.text == "New reply.")
+    }
+
+    @Test func anUnflaggedFinalAfterAnInterimIsStillSpoken() async {
+        let tracker = makeTracker()
+        await tracker.handle(event: event("message.start", "{}"))
+        await tracker.handle(
+            event: event("message.interim", #"{"text": "Checking the logs.", "already_streamed": false}"#))
+        await tracker.consumePendingSpeech()
+
+        await tracker.handle(event: event("message.complete", #"{"text": "All clear."}"#))
+        #expect(await tracker.pendingSpeech()?.text == "All clear.")
+    }
+
     @Test func errorEventUnwedgesBusy() async {
         let tracker = makeTracker()
         await tracker.handle(event: event("message.start", "{}"))
