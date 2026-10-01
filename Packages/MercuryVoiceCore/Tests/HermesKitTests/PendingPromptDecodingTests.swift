@@ -185,6 +185,27 @@ struct PendingPromptDecodingTests {
         #expect(clarify.lockedAnswers == ["q1": "dev"])
     }
 
+    /// Issue #144 item 1 (upstream 5eea87882a): `clarify.lock` keeps a null
+    /// answer as a skip, and a replay reports it as `null`. Dropping it made
+    /// the question look open, so this app asked it again; it decodes as ""
+    /// instead, which the server also reads as skipped.
+    @Test func clarifyKeepsASkippedLockAsEmpty() throws {
+        let request = ServerRequest(
+            id: "srq-333333333333", method: "clarify",
+            params: try json(
+                """
+                {"session_id": "s1",
+                 "questions": [
+                   {"qid": "q0", "question": "Which env?"},
+                   {"qid": "q1", "question": "Which branch?"},
+                   {"qid": "q2", "question": "Anything else?"}
+                 ],
+                 "answers": {"q0": null, "q1": "main", "q2": 7}}
+                """))
+        let clarify = try #require(ClarifyRequest(serverRequest: request))
+        #expect(clarify.lockedAnswers == ["q0": "", "q1": "main"])
+    }
+
     /// A dropped question would still let the caller submit `{answers}` for
     /// the ones it did see — a batch that looks complete to the backend
     /// while actually short one answer. So one undecodable entry (here,

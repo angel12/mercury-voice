@@ -280,7 +280,9 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
     /// carry the one question instead.
     public var questions: [ClarifyQuestion]
     /// Already-answered questions of a batch being replayed
-    /// (`params.answers`), keyed by `qid`. Empty when nothing is locked.
+    /// (`params.answers`), keyed by `qid`. Empty when nothing is locked. A
+    /// skipped lock (`null` on the wire) is `""`, which the server also reads
+    /// as skipped — it is locked, never asked again.
     public var lockedAnswers: [String: String]
 
     public var id: String { requestID }
@@ -337,7 +339,10 @@ public struct ClarifyRequest: Sendable, Equatable, Identifiable {
         self.serverRequestID = request.id
         self.sessionID = request.sessionID
         self.lockedAnswers =
-            params["answers"]?.objectValue?.compactMapValues(\.stringValue) ?? [:]
+            params["answers"]?.objectValue?.compactMapValues { value in
+                if case .null = value { return "" }
+                return value.stringValue
+            } ?? [:]
 
         if let rawQuestions = params["questions"]?.arrayValue {
             let decodedQuestions = rawQuestions.compactMap(ClarifyQuestion.init(json:))
