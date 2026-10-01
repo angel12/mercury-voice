@@ -31,6 +31,7 @@
                 }
                 Section("Listening") {
                     TurnSilenceSlider()
+                    BargeInToggle()
                 }
                 Section("Sounds") {
                     Toggle("Conversation cues", isOn: $cuesEnabled)

@@ -37,7 +37,8 @@ struct ConversationEngineTests {
 
         init(
             micFailureIsFatal: Bool = true,
-            detachBargeCaptureWhileMuted: Bool = false
+            detachBargeCaptureWhileMuted: Bool = false,
+            bargeInEnabled: @escaping @Sendable () -> Bool = { true }
         ) {
             let clock = TestClock()
             let recorder = FakeRecorder()
@@ -70,7 +71,8 @@ struct ConversationEngineTests {
                     onTurnCaptured: { turnCues.bump() },
                     onThinkingTick: { thinkingTicks.bump() },
                     micFailureIsFatal: { micFailureIsFatal },
-                    onMicParked: { micParks.bump() }),
+                    onMicParked: { micParks.bump() },
+                    bargeInEnabled: bargeInEnabled),
                 clock: clock,
                 detachBargeCaptureWhileMuted: detachBargeCaptureWhileMuted)
         }

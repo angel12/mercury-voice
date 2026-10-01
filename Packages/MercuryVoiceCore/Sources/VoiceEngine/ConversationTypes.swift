@@ -226,6 +226,10 @@ public struct ConversationCallbacks: Sendable {
     /// "Send failed" notice. Spoken before the mic re-opens, so it is never
     /// heard by the next listen (issue #146).
     public var spokenSubmitFailure: @Sendable (any Error) -> String?
+    /// Whether talking over the agent interrupts it, read each time the
+    /// barge-in monitor would arm, so a change applies from the next reply
+    /// (`BargeInPreference` in the app; issue #146).
+    public var bargeInEnabled: @Sendable () -> Bool
 
     public init(
         onStopWord: @escaping @Sendable () -> Void = {},
@@ -236,7 +240,8 @@ public struct ConversationCallbacks: Sendable {
         micFailureIsFatal: @escaping @Sendable () async -> Bool = { true },
         onMicParked: @escaping @Sendable () -> Void = {},
         onMicrophoneDenied: @escaping @Sendable () -> Void = {},
-        spokenSubmitFailure: @escaping @Sendable (any Error) -> String? = { _ in nil }
+        spokenSubmitFailure: @escaping @Sendable (any Error) -> String? = { _ in nil },
+        bargeInEnabled: @escaping @Sendable () -> Bool = { true }
     ) {
         self.onStopWord = onStopWord
         self.onFatalError = onFatalError
@@ -247,6 +252,7 @@ public struct ConversationCallbacks: Sendable {
         self.onMicParked = onMicParked
         self.onMicrophoneDenied = onMicrophoneDenied
         self.spokenSubmitFailure = spokenSubmitFailure
+        self.bargeInEnabled = bargeInEnabled
     }
 }
 

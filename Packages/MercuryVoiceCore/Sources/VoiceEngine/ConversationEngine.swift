@@ -742,7 +742,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     // MARK: Barge-in
 
     private func ensureBargeMonitor() async {
-        guard !bargeMonitorActive, !micBlocked else { return }
+        guard !bargeMonitorActive, !micBlocked, callbacks.bargeInEnabled() else { return }
         bargeMonitorActive = true
         do {
             try await barge.start(

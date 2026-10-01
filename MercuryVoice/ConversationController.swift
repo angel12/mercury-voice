@@ -629,7 +629,8 @@ final class ConversationController {
                     #endif
                     return true
                 },
-                spokenSubmitFailure: AgentErrorCopy.spokenSubmitFailure),
+                spokenSubmitFailure: AgentErrorCopy.spokenSubmitFailure,
+                bargeInEnabled: { BargeInPreference.isEnabled }),
             clock: ContinuousClock())
         self.engine = engine
 

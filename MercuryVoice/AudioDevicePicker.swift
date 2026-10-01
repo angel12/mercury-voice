@@ -52,6 +52,22 @@ struct TurnSilenceSlider: View {
     }
 }
 
+/// "Interrupt by speaking" (issue #146), shown beside the end-of-turn pause.
+/// The engine reads it each time it would start listening for barge-in, so
+/// a change applies from the next reply.
+struct BargeInToggle: View {
+    @AppStorage(BargeInPreference.key) private var enabled = BargeInPreference.defaultEnabled
+
+    var body: some View {
+        Toggle("Interrupt by speaking", isOn: $enabled)
+        Text(
+            "Talking while Hermes is thinking or replying stops it and sends what you said. Turn off if speaker playback keeps interrupting itself; Stop still works."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+
 #if os(macOS)
     /// Speaker selector — macOS only; iOS output routing belongs to the
     /// system route picker.
@@ -119,6 +135,7 @@ struct TurnSilenceSlider: View {
                     }
                     Section("Listening") {
                         TurnSilenceSlider()
+                        BargeInToggle()
                     }
                     Section("Sounds") {
                         Toggle("Conversation cues", isOn: $cuesEnabled)
