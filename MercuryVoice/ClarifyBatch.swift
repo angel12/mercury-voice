@@ -1,3 +1,4 @@
+import Foundation
 import HermesKit
 
 /// Paging state for a batch `clarify` server request (contract ≥ 7,
@@ -17,10 +18,15 @@ struct ClarifyBatch: Equatable {
     private(set) var pending: [ClarifyQuestion]
     private(set) var index = 0
     private(set) var answers: [String: String]
+    /// The request asks exactly one question. Upstream sends every clarify
+    /// as `{questions:[…]}` (5eea87882a), so a lone question is a one-entry
+    /// batch; the sheet shows it without paging or "Skip all".
+    let isSingleQuestion: Bool
 
     init(_ request: ClarifyRequest) {
         self.pending = request.questions.filter { request.lockedAnswers[$0.qid] == nil }
         self.answers = request.lockedAnswers
+        self.isSingleQuestion = request.questions.count == 1
     }
 
     /// The question on screen, or nil once every pending question has been
@@ -78,6 +84,25 @@ enum ClarifySubmitStep: Equatable {
     case sendBatch([String: String])
     /// A single-question clarify.
     case sendSingle(String)
+
+    /// A multi-select answer. Batch answers are a JSON array string — the
+    /// only multi-select shape upstream reads (5eea87882a); anything else
+    /// counts as one typed answer. The single-question path predates that
+    /// contract and keeps the joined list.
+    init(picks: [String], batch: ClarifyBatch?) {
+        guard batch != nil else {
+            self = .sendSingle(picks.joined(separator: ", "))
+            return
+        }
+        self.init(answer: Self.jsonArray(picks), batch: batch)
+    }
+
+    private static func jsonArray(_ picks: [String]) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        let data = (try? encoder.encode(picks)) ?? Data("[]".utf8)
+        return String(decoding: data, as: UTF8.self)
+    }
 
     init(answer: String, batch: ClarifyBatch?) {
         guard var batch else {

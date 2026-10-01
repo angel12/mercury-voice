@@ -24,6 +24,11 @@ extension HermesConnection {
 
     /// `session.create` — `cwd` binds the session to a project directory;
     /// omit for "no workspace". The DB row appears lazily on first prompt.
+    ///
+    /// A cwd is always a project the user picked, so it goes out with
+    /// `cwd_explicit: true`; without it a named profile's `terminal.cwd`
+    /// wins (upstream a9972dc3f9). Backends that predate the key (66bc259712)
+    /// reject it with 4000 and get one retry without it.
     public func createSession(
         cwd: String? = nil, profile: String? = nil, title: String? = nil
     ) async throws -> SessionHandle {
@@ -31,11 +36,22 @@ extension HermesConnection {
             "cols": .number(Double(Self.cols)),
             "source": .string(Self.source),
         ]
-        if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
+        if let cwd, !cwd.isEmpty {
+            params["cwd"] = .string(cwd)
+            params["cwd_explicit"] = .bool(true)
+        }
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
         if let title, !title.isEmpty { params["title"] = .string(title) }
 
-        let result = try await request("session.create", params: .object(params))
+        let result: JSONValue
+        do {
+            result = try await request("session.create", params: .object(params))
+        } catch HermesError.rpcError(4000, let message, _)
+            where params["cwd_explicit"] != nil && message.contains("cwd_explicit")
+        {
+            params["cwd_explicit"] = nil
+            result = try await request("session.create", params: .object(params))
+        }
         guard let handle = SessionHandle(result: result) else {
             throw HermesError.malformedResponse("session.create returned no session_id")
         }

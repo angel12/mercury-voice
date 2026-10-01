@@ -57,6 +57,10 @@ public struct DirectSTTConfig: Sendable, Equatable {
     /// back to 60s at the call site, matching the desktop's
     /// `sttTimeoutSeconds`).
     public var timeoutS: Double?
+    /// `stt.hallucination_filter` — the relay path's Whisper-silence filter
+    /// shipped to the client; nil on older backends, which means "pass the
+    /// transcript through".
+    public var hallucinationFilter: STTHallucinationFilter?
 
     /// nil for relay verdicts, unknown wires, or malformed configs — all of
     /// which mean "use the relay endpoint".
@@ -78,6 +82,52 @@ public struct DirectSTTConfig: Sendable, Equatable {
         } else {
             self.timeoutS = nil
         }
+        self.hallucinationFilter = json["hallucination_filter"].flatMap(
+            STTHallucinationFilter.init(json:))
+    }
+}
+
+/// Whisper commonly hallucinates "Thank you." and friends on silent audio. The
+/// relay endpoint drops those server-side (`is_whisper_hallucination`,
+/// tools/voice_mode_transcript.py); upstream e49a6afe07 ships the same
+/// contract in voice-config so a client-direct transcript agrees with a
+/// relayed one. Matching follows the Python, not the desktop TS: only
+/// TRAILING `.`/`!` are stripped before the phrase lookup.
+public struct STTHallucinationFilter: Sendable, Equatable {
+    /// Exact known hallucinations, lowercase.
+    public var phrases: Set<String>
+    /// Repetitive filler ("Thank you. Thank you."), matched case-insensitively.
+    /// nil when absent or not a pattern ICU compiles — phrases still apply.
+    public var repeatRegex: String?
+
+    /// nil unless `json` is an object; `{"phrases": [], ...}` still filters
+    /// empty transcripts, as the relay does.
+    public init?(json: JSONValue) {
+        guard let object = json.objectValue else { return nil }
+        let phrases = object["phrases"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        self.phrases = Set(phrases.map { $0.lowercased() })
+        self.repeatRegex = object["repeat_regex"]?.stringValue.flatMap {
+            (try? NSRegularExpression(pattern: $0)) == nil ? nil : $0
+        }
+    }
+
+    /// True when `transcript` is silence or a known silence hallucination.
+    public func matches(_ transcript: String) -> Bool {
+        let cleaned = transcript.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cleaned.isEmpty { return true }
+        if phrases.contains(Self.droppingTrailingStops(cleaned)) { return true }
+        guard let repeatRegex,
+            let regex = try? NSRegularExpression(pattern: repeatRegex, options: .caseInsensitive)
+        else { return false }
+        let range = NSRange(cleaned.startIndex..., in: cleaned)
+        return regex.firstMatch(in: cleaned, range: range) != nil
+    }
+
+    /// Python's `rstrip('.!')`.
+    private static func droppingTrailingStops(_ text: String) -> String {
+        var text = Substring(text)
+        while let last = text.last, last == "." || last == "!" { text = text.dropLast() }
+        return String(text)
     }
 }
 

@@ -1253,11 +1253,11 @@ final class ConversationController {
     /// clarify by its request id.
     private enum PromptNotice {
         case approval(epoch: Int)
-        /// `isBatch` distinguishes a `questions`-carrying request (wording
-        /// always counts, even down to its last question — "1 questions" is
-        /// deliberate, matching `ClarifyRequest.questions` being non-empty)
-        /// from a single legacy/srq clarify, which keeps the singular
-        /// phrasing regardless. `remainingQuestions` is the unlocked count.
+        /// `isBatch` distinguishes a `questions`-carrying request, whose
+        /// wording counts its unlocked questions, from a single legacy/srq
+        /// clarify. One remaining question is always "a question": upstream
+        /// sends even a lone question as a one-entry batch (5eea87882a).
+        /// `remainingQuestions` is the unlocked count.
         case clarify(requestID: String, remainingQuestions: Int, isBatch: Bool)
         /// The front unanswerable request (issue #130), by srq id.
         case unanswerable(id: String, text: String)
@@ -1266,7 +1266,7 @@ final class ConversationController {
             switch self {
             case .approval: "Hermes is asking for approval to run a command."
             case .clarify(_, let remaining, let isBatch):
-                isBatch
+                isBatch && remaining > 1
                     ? "Hermes has \(remaining) questions for you."
                     : "Hermes has a question for you."
             case .unanswerable(_, let text): text

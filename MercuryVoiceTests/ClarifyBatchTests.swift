@@ -1,3 +1,4 @@
+import Foundation
 import HermesKit
 import Testing
 
@@ -116,5 +117,38 @@ struct ClarifyBatchTests {
         #expect(first == .sendBatch(["q1": "a1", "q2": "a2", "q3": "a3"]))
         #expect(retry == first)
         #expect(batch.current?.qid == "q3")
+    }
+
+    // MARK: Upstream 5eea87882a (issue #144 item 1)
+
+    /// A multi-select answer is read only as a JSON array; anything else is
+    /// one typed ("Other") answer, so "A, B" would reach the agent as a
+    /// single made-up choice.
+    @Test("a batch multi-select answer is sent as a JSON array")
+    func batchMultiSelectIsAJSONArray() throws {
+        let step = ClarifySubmitStep(
+            picks: ["Fast / cheap", #"Say "hi""#], batch: ClarifyBatch(request(qids: ["q0"])))
+        guard case .sendBatch(let answers) = step else {
+            Issue.record("expected sendBatch, got \(step)")
+            return
+        }
+        let encoded = try #require(answers["q0"])
+        let decoded = try JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String]
+        #expect(decoded == ["Fast / cheap", #"Say "hi""#])
+    }
+
+    /// The legacy single-question path predates the JSON-array contract.
+    @Test("a single-question multi-select keeps the joined answer")
+    func singleMultiSelectStaysJoined() {
+        #expect(ClarifySubmitStep(picks: ["A", "B"], batch: nil) == .sendSingle("A, B"))
+    }
+
+    @Test("a one-question request is not presented as a batch")
+    func oneQuestionIsSingle() {
+        #expect(ClarifyBatch(request(qids: ["q0"])).isSingleQuestion)
+        #expect(!ClarifyBatch(request()).isSingleQuestion)
+        // Still a batch while other questions are locked: Skip all keeps
+        // its cancel-all meaning there.
+        #expect(!ClarifyBatch(request(locked: ["q1": "a", "q2": "b"])).isSingleQuestion)
     }
 }

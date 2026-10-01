@@ -606,7 +606,7 @@ struct ClarifySheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Hermes asks", systemImage: "questionmark.bubble")
                 .font(.title2.bold())
-            if let batch {
+            if let batch, !batch.isSingleQuestion {
                 Text("Question \(batch.questionNumber) of \(batch.totalQuestions)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -629,9 +629,7 @@ struct ClarifySheet: View {
                                 if on { selected.insert(choice) } else { selected.remove(choice) }
                             }))
                 }
-                Button("Send") {
-                    submit(choices.filter(selected.contains).joined(separator: ", "))
-                }
+                Button("Send") { submit(picks: choices.filter(selected.contains)) }
                 .buttonStyle(.borderedProminent)
                 .disabled(selected.isEmpty)
             } else {
@@ -645,7 +643,7 @@ struct ClarifySheet: View {
                 }
             }
 
-            if batch != nil {
+            if let batch, !batch.isSingleQuestion {
                 HStack {
                     Button("Skip") { submit("") }
                         .buttonStyle(.borderless)
@@ -653,6 +651,11 @@ struct ClarifySheet: View {
                     Button("Skip all") { controller.respondClarify(answers: [:]) }
                         .buttonStyle(.borderless)
                 }
+            } else if batch != nil {
+                // A one-question batch: Skip answers it "" (skipped), the
+                // same as skipping a page; no cancel-all.
+                Button("Skip") { submit("") }
+                    .buttonStyle(.borderless)
             } else {
                 Button("Skip") { controller.respondClarify(answer: "") }
                     .buttonStyle(.borderless)
@@ -691,7 +694,14 @@ struct ClarifySheet: View {
     /// answers immediately, as before. The input survives a send so a failed
     /// one can be retried as-is (`ClarifySubmitStep.clearsInput`).
     private func submit(_ answer: String) {
-        let step = ClarifySubmitStep(answer: answer, batch: batch)
+        apply(ClarifySubmitStep(answer: answer, batch: batch))
+    }
+
+    private func submit(picks: [String]) {
+        apply(ClarifySubmitStep(picks: picks, batch: batch))
+    }
+
+    private func apply(_ step: ClarifySubmitStep) {
         if step.clearsInput {
             freeText = ""
             selected = []

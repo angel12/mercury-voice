@@ -445,7 +445,27 @@ struct R33ServerRequestPromptTests {
                 srqClarifyBatch(lockedAnswers: ["q1": "main"])))
         await controller.awaitPromptAnnouncements()
 
-        #expect(speech.spoken == ["Hermes has 1 questions for you."])
+        #expect(speech.spoken == ["Hermes has a question for you."])
+        await controller.teardown()
+    }
+
+    /// Upstream 5eea87882a: every clarify is `{questions:[…]}`, so a lone
+    /// question arrives as a one-entry batch and must not be announced as
+    /// "1 questions" (issue #144 item 1).
+    @Test("a one-question batch is announced as a single question")
+    func oneQuestionBatchNoticeIsSingular() async throws {
+        let service = ScriptedSessionService()
+        let speech = RecordingSpeech()
+        let controller = try await openedController(service: service, speech: speech)
+
+        controller.handle(
+            event: Fixtures.serverRequestEvent(
+                srqClarifyBatch(questions: [
+                    (qid: "q0", question: "Which branch?", choices: [], multiSelect: false)
+                ])))
+        await controller.awaitPromptAnnouncements()
+
+        #expect(speech.spoken == ["Hermes has a question for you."])
         await controller.teardown()
     }
 

@@ -126,28 +126,61 @@ struct DirectVoiceRequestTests {
 
     @Test func sttResponseParsing() throws {
         #expect(
-            DirectVoiceClient.parseSTTResponse(
+            try DirectVoiceClient.parseSTTResponse(
                 wire: .openAIMultipart, data: Data("  hello world \n".utf8)) == "hello world")
         #expect(
-            DirectVoiceClient.parseSTTResponse(
+            try DirectVoiceClient.parseSTTResponse(
                 wire: .xai, data: Data(#"{"text": " hi "}"#.utf8)) == "hi")
         #expect(
-            DirectVoiceClient.parseSTTResponse(wire: .elevenLabs, data: Data("junk".utf8)) == "")
+            try DirectVoiceClient.parseSTTResponse(wire: .elevenLabs, data: Data("junk".utf8))
+                == "")
     }
 
     @Test(arguments: ["stop", "", " hello world "])
     func openAICompatibleJSONTranscriptUsesText(text: String) throws {
         let data = try JSONEncoder().encode(["text": text])
         #expect(
-            DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: data)
+            try DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: data)
                 == text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    @Test(arguments: ["plain words", "{unfinished", "{\"unrelated\":true}"])
-    func openAITextWithoutTranscriptFieldIsPreserved(text: String) {
+    @Test(arguments: ["plain words", "{unfinished"])
+    func openAITextWithoutTranscriptFieldIsPreserved(text: String) throws {
         #expect(
-            DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: Data(text.utf8))
+            try DirectVoiceClient.parseSTTResponse(wire: .openAIMultipart, data: Data(text.utf8))
                 == text)
+    }
+
+    // MARK: - Structured STT responses without text (issue #144 item 3)
+
+    /// Upstream 59b2aeef6c: a structured (JSON object) response whose `text`
+    /// is missing or not a string is an error — the provider's `error` when
+    /// it has one — never a transcript. Before, the openai-multipart wire
+    /// handed the raw JSON body to the agent as the user's words.
+    @Test(arguments: [
+        (#"{"text": null, "error": "Transcription failed"}"#, "Transcription failed"),
+        (#"{"error": {"message": "audio too short"}}"#, "audio too short"),
+        (#"{"unrelated": true}"#, "Transcription response contained no text"),
+        (#"{"text": 42}"#, "Transcription response contained no text"),
+    ])
+    func structuredResponseWithoutTextThrows(body: String, detail: String) {
+        for wire in [DirectSTTConfig.Wire.openAIMultipart, .xai, .elevenLabs] {
+            #expect {
+                try DirectVoiceClient.parseSTTResponse(
+                    wire: wire, data: Data(body.utf8), provider: "groq STT")
+            } throws: { error in
+                guard case DirectVoiceError.noTranscript(let name, let got) = error else {
+                    return false
+                }
+                return name == "groq STT" && got == detail
+            }
+        }
+    }
+
+    @Test func noTranscriptErrorReadsAsAProviderFailure() {
+        let error = DirectVoiceError.noTranscript(
+            name: "groq STT", detail: "Transcription failed")
+        #expect(error.errorDescription == "groq STT returned no transcript: Transcription failed")
     }
 
     @Test func openAISpeechRequest() throws {
@@ -280,5 +313,45 @@ struct DirectVoiceRequestTests {
         #expect(DirectVoiceClient.fileName(forMIME: "audio/wav") == "recording.wav")
         #expect(DirectVoiceClient.fileName(forMIME: "audio/mpeg") == "recording.mp3")
         #expect(DirectVoiceClient.fileName(forMIME: "audio/webm;codecs=opus") == "recording.webm")
+    }
+}
+
+/// Issue #144 item 4: `transcribe` applies the config's silence-hallucination
+/// filter, so a client-direct transcript agrees with a relayed one.
+@Suite("Client-direct STT hallucination filter")
+struct DirectSTTHallucinationTests {
+    private func config(port: UInt16, withFilter: Bool) throws -> DirectSTTConfig {
+        var stt: [String: JSONValue] = [
+            "mode": "direct", "wire": "openai-multipart", "provider": "openai",
+            "base_url": .string("http://127.0.0.1:\(port)/v1"), "api_key": "sk-test",
+        ]
+        if withFilter {
+            stt["hallucination_filter"] = [
+                "phrases": ["thank you", "bye"],
+                "repeat_regex": .string(#"^(?:thank you|thanks|bye|you|ok|okay|the end|[.,!\s])+$"#),
+            ]
+        }
+        return try #require(DirectSTTConfig(json: .object(stt)))
+    }
+
+    private func transcribe(_ body: String, withFilter: Bool) async throws -> String {
+        let server = try await ScriptedHTTPServer.start(status: 200, body: Data(body.utf8))
+        defer { server.stop() }
+        return try await DirectVoiceClient().transcribe(
+            config: config(port: server.port, withFilter: withFilter),
+            audio: Data("AUDIO".utf8), mimeType: "audio/wav")
+    }
+
+    @Test func hallucinationOnSilenceBecomesSilence() async throws {
+        #expect(try await transcribe("Thank you.", withFilter: true) == "")
+        #expect(try await transcribe("Thank you. Thank you.", withFilter: true) == "")
+    }
+
+    @Test func realSpeechIsKept() async throws {
+        #expect(try await transcribe("Thank you for that", withFilter: true) == "Thank you for that")
+    }
+
+    @Test func olderBackendWithoutFilterPassesTranscriptThrough() async throws {
+        #expect(try await transcribe("Thank you.", withFilter: false) == "Thank you.")
     }
 }

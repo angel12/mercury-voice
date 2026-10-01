@@ -258,11 +258,17 @@ public enum DirectVoiceError: Error, LocalizedError {
     /// silently relayed for STT — re-running the same request through the
     /// gateway would fail the same way, slower, and hide the real error.
     case provider(name: String, status: Int, detail: String)
+    /// A 2xx STT answer that was a structured object with no string `text`:
+    /// the provider's own `error`, or "Transcription response contained no
+    /// text". Never handed on as a transcript (upstream 59b2aeef6c).
+    case noTranscript(name: String, detail: String)
 
     public var errorDescription: String? {
         switch self {
         case .provider(let name, let status, let detail):
             return "\(name) error (HTTP \(status)): \(detail)"
+        case .noTranscript(let name, let detail):
+            return "\(name) returned no transcript: \(detail)"
         }
     }
 }
@@ -288,8 +294,14 @@ public struct DirectVoiceClient: Sendable {
         let boundary = "hermes-voice-\(UUID().uuidString)"
         let request = Self.sttRequest(
             config: config, audio: audio, mimeType: mimeType, boundary: boundary)
-        let data = try await perform(request, provider: "\(config.provider) STT")
-        return Self.parseSTTResponse(wire: config.wire, data: data)
+        let provider = "\(config.provider) STT"
+        let data = try await perform(request, provider: provider)
+        let transcript = try Self.parseSTTResponse(
+            wire: config.wire, data: data, provider: provider)
+        // Silence hallucination ("Thank you." on quiet audio) is silence, as
+        // on the relay path — not a phantom turn.
+        if config.hallucinationFilter?.matches(transcript) == true { return "" }
+        return transcript
     }
 
     static func sttRequest(
@@ -338,10 +350,25 @@ public struct DirectVoiceClient: Sendable {
         return request
     }
 
-    static func parseSTTResponse(wire: DirectSTTConfig.Wire, data: Data) -> String {
+    /// A JSON object must carry a string `text` (possibly empty — silence);
+    /// one without it is the provider reporting a failure and throws
+    /// `noTranscript`, matching upstream's `_extract_transcript_text`. Only
+    /// a non-object body is a plain-text transcript, and only on the
+    /// openai-multipart wire (`response_format=text`).
+    static func parseSTTResponse(
+        wire: DirectSTTConfig.Wire, data: Data, provider: String = "STT"
+    ) throws -> String {
         let json = try? JSONDecoder().decode(JSONValue.self, from: data)
-        if let text = json?["text"]?.stringValue {
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let object = json?.objectValue {
+            if let text = object["text"]?.stringValue {
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let error = object["error"]?["message"]?.stringValue ?? object["error"]?.stringValue
+            throw DirectVoiceError.noTranscript(
+                name: provider,
+                detail: HTTPErrorDetail.displayed(
+                    error.flatMap { $0.isEmpty ? nil : $0 }
+                        ?? "Transcription response contained no text"))
         }
         switch wire {
         case .openAIMultipart:

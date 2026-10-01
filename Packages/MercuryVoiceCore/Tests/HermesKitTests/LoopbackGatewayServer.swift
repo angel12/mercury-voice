@@ -31,6 +31,9 @@ final class LoopbackGatewayServer: @unchecked Sendable {
     /// it explicitly via `answerCapabilities(asError:)`, to pin down the
     /// ordering against `.phase(.ready)`.
     private let autoAnswersCapabilities: Bool
+    /// Answers any other request: the full JSON-RPC reply text for a frame,
+    /// or nil to leave it unanswered.
+    private let onRequest: @Sendable (JSONValue) -> String?
     private var peers: [ObjectIdentifier: Peer] = [:]
     private var _upgradeAttempts = 0
     private var _receivedFrames: [JSONValue] = []
@@ -60,7 +63,8 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         autoAnswersCapabilities: Bool = true,
         onOpen: @escaping @Sendable (LoopbackGatewayServer) -> Void = { server in
             server.sendEvent(type: "gateway.ready")
-        }
+        },
+        onRequest: @escaping @Sendable (JSONValue) -> String? = { _ in nil }
     ) async throws -> LoopbackGatewayServer {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
@@ -69,7 +73,7 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         let server = LoopbackGatewayServer(
             listener: listener, refuseUpgradeWith: refuseUpgradeWith,
             dropsUpgrade: dropsUpgrade, autoAnswersCapabilities: autoAnswersCapabilities,
-            onOpen: onOpen)
+            onRequest: onRequest, onOpen: onOpen)
         try await server.waitUntilReady()
         return server
     }
@@ -79,12 +83,14 @@ final class LoopbackGatewayServer: @unchecked Sendable {
         refuseUpgradeWith: Int?,
         dropsUpgrade: Bool,
         autoAnswersCapabilities: Bool,
+        onRequest: @escaping @Sendable (JSONValue) -> String?,
         onOpen: @escaping @Sendable (LoopbackGatewayServer) -> Void
     ) {
         self.listener = listener
         self.refuseUpgradeWith = refuseUpgradeWith
         self.dropsUpgrade = dropsUpgrade
         self.autoAnswersCapabilities = autoAnswersCapabilities
+        self.onRequest = onRequest
         self.onOpen = onOpen
         // Installed before start(): a started NWListener without a
         // newConnectionHandler fails with EINVAL.
@@ -257,7 +263,10 @@ final class LoopbackGatewayServer: @unchecked Sendable {
                     _pendingCapabilities = (requestID, connection)
                 }
             }
-            guard isCapabilities, let requestID else { continue }
+            guard isCapabilities, let requestID else {
+                if requestID != nil, let reply = onRequest(frame) { send(reply, to: connection) }
+                continue
+            }
             if autoAnswersCapabilities {
                 send(#"{"jsonrpc":"2.0","id":\#(requestID),"result":{}}"#, to: connection)
             }

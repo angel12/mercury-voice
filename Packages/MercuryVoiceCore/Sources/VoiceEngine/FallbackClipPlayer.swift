@@ -54,7 +54,13 @@ typealias ClipFactory =
 /// Single-use, and terminal after `stop()`: both callers mint one of these per
 /// clip and can be interrupted on the actor hop that reaches `play`, so a Stop
 /// that lands before the clip is even built has to stay decided (issue #65).
-final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
+///
+/// Explicitly `nonisolated`: since the macOS 27 / iOS 27 SDKs annotate
+/// `AVAudioPlayerDelegate` as `@MainActor`, conforming to it would otherwise
+/// infer main-actor isolation for the whole class. Thread safety here comes
+/// from `lock`, and the delegate callbacks only resolve a continuation under
+/// it, so they are safe from whichever thread AVFoundation calls them on.
+nonisolated final class FallbackClipPlayer: NSObject, AVAudioPlayerDelegate, FallbackClipPlaying,
     @unchecked Sendable
 {
     /// Recursive because the start now runs under this lock: a clip that
