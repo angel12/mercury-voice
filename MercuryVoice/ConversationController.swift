@@ -1143,6 +1143,29 @@ final class ConversationController {
                 toolTicker = nil
             }
 
+        case GatewayEvent.Kind.approvalCancelled:
+            // Broadcast: the backend deny-resolved pending approvals on an
+            // interrupt, reap or teardown (issue #146). `request.cancel`
+            // usually took an srq sheet down already; this catches a legacy
+            // `approval.request` sheet, which has no srq id to match. The
+            // ids are the approval queue's own `request_id`s, so a cancelled
+            // id never clears a newer approval; no ids at all clears the
+            // session's approval wholesale, as the desktop does.
+            let runtime = event.payload["session_id"]?.stringValue
+            let stored = event.payload["stored_session_id"]?.stringValue
+            let isOurs =
+                (runtime != nil && runtime == sessionBox.runtimeID)
+                || (stored != nil && stored == sessionBox.storedID)
+            guard isOurs, let current = approval else { break }
+            let ids = (event.payload["request_ids"]?.arrayValue ?? [])
+                .compactMap(\.stringValue).filter { !$0.isEmpty }
+            let matches = ids.isEmpty || current.requestID.map(ids.contains) == true
+            guard matches else { break }
+            approval = nil
+            approvalEpoch += 1
+            promptSendError = nil
+            resumeIfUnprompted()
+
         case GatewayEvent.Kind.sessionReclaimed:
             // Broadcast (no session_id on the frame): the server reaped a
             // session out from under its client — idle TTL, LRU cap, or the

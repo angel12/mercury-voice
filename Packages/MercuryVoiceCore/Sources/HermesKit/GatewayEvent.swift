@@ -55,6 +55,9 @@ public struct GatewayEvent: Sendable, Equatable {
         public static let subagentStart = "subagent.start"
         public static let subagentComplete = "subagent.complete"
         public static let sessionReclaimed = "session.reclaimed"
+        /// Broadcast: an interrupt, reap or teardown deny-resolved pending
+        /// approvals (upstream 591e3a7ce1).
+        public static let approvalCancelled = "approval.cancelled"
         public static let error = "error"
         /// Client-local: a server→client request routed as an event
         /// (`GatewayEvent(serverRequest:)`). Never appears on the wire.
