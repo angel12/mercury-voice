@@ -17,6 +17,29 @@ public struct HermesRESTClient: Sendable {
     /// `GET /api/profiles` walks skill trees and can take tens of seconds.
     public static let profilesTimeout: TimeInterval = 60
 
+    /// Relay audio timeouts scale with the payload, as upstream's desktop
+    /// client does (`apps/desktop/src/api/system.ts`): a 180 s floor covers
+    /// a cold local model load, a 600 s cap bounds a wedged request.
+    static let audioMinTimeoutMs = 180_000
+    static let audioMaxTimeoutMs = 600_000
+
+    /// `POST /api/audio/transcribe` budget: 0.1 ms per data-URL char (~2 s
+    /// per second of audio), clamped to the floor and cap.
+    static func transcribeTimeout(dataURLLength: Int) -> TimeInterval {
+        let estimatedMs = (max(dataURLLength, 0) + 9) / 10
+        return clampedAudioTimeout(ms: estimatedMs)
+    }
+
+    /// `POST /api/audio/speak` budget: 35 ms per text char, clamped to the
+    /// floor and cap.
+    static func speakTimeout(textLength: Int) -> TimeInterval {
+        clampedAudioTimeout(ms: max(textLength, 0) * 35)
+    }
+
+    private static func clampedAudioTimeout(ms: Int) -> TimeInterval {
+        TimeInterval(min(audioMaxTimeoutMs, max(audioMinTimeoutMs, ms))) / 1000
+    }
+
     public init(endpoint: ServerEndpoint, authenticator: HermesAuthenticator) {
         self.endpoint = endpoint
         self.authenticator = authenticator
@@ -103,7 +126,7 @@ public struct HermesRESTClient: Sendable {
             "/api/audio/transcribe",
             query: profileQuery(profile),
             body: body,
-            timeout: 120)
+            timeout: Self.transcribeTimeout(dataURLLength: dataURL.count))
         return TranscriptionResult(
             transcript: json["transcript"]?.stringValue ?? "",
             provider: json["provider"]?.stringValue)
@@ -116,7 +139,7 @@ public struct HermesRESTClient: Sendable {
             "/api/audio/speak",
             query: profileQuery(profile),
             body: ["text": .string(text)],
-            timeout: 120)
+            timeout: Self.speakTimeout(textLength: text.count))
         guard let dataURL = json["data_url"]?.stringValue else {
             throw HermesError.malformedResponse("speak returned no data_url")
         }
