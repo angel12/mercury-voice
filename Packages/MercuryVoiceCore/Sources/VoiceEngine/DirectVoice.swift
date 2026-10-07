@@ -318,8 +318,14 @@ public struct DirectVoiceClient: Sendable {
             if let language = config.language { fields.append(("language", language)) }
         case .xai:
             path = "/stt"
-            fields.append(("format", "true"))
-            if let language = config.language { fields.append(("language", language)) }
+            // xAI rejects `format=true` without a language (HTTP 400,
+            // upstream d1152d797c), so auto-detect sends neither — the
+            // desktop's `xaiSttForm`. The model is pinned by voice-config.
+            if let model = config.model { fields.append(("model", model)) }
+            if let language = config.language {
+                fields.append(("language", language))
+                fields.append(("format", "true"))
+            }
         case .elevenLabs:
             path = "/speech-to-text"
             if let model = config.model { fields.append(("model_id", model)) }

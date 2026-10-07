@@ -40,7 +40,8 @@ public struct DirectSTTConfig: Sendable, Equatable {
         /// compatibles (groq/mistral/deepinfra); requests plain text, but
         /// also accepts JSON `{text}` from providers ignoring that format.
         case openAIMultipart = "openai-multipart"
-        /// `POST {base}/stt`, multipart + `format=true`, Bearer → `{text}`.
+        /// `POST {base}/stt`, multipart (+ `language` and `format=true` when
+        /// a language resolves), Bearer → `{text}`.
         case xai = "xai-stt"
         /// `POST {base}/speech-to-text`, multipart, `xi-api-key` → `{text}`.
         case elevenLabs = "elevenlabs-stt"
@@ -76,7 +77,8 @@ public struct DirectSTTConfig: Sendable, Equatable {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.model = json["model"]?.stringValue
-        self.language = json["language"]?.stringValue
+        // "" means auto-detect, same as absent.
+        self.language = json["language"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
         if let timeoutS = json["timeout_s"]?.doubleValue, timeoutS > 0 {
             self.timeoutS = timeoutS
         } else {
