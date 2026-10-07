@@ -44,6 +44,10 @@ public actor HermesConnection {
     private var supervisor: Task<Void, Never>?
     private var supervisorLifetime: UUID?
     private var everConnected = false
+    /// `prompt.submit` carries `voice_turn` until this backend rejects it
+    /// (see `submitPrompt`); re-armed on every new gateway connection, since
+    /// the backend may have been upgraded in between.
+    var sendsVoiceTurn = true
     private var reconnectPoke: CheckedContinuation<Void, Never>?
     private var backoffTimer: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<Update>.Continuation] = [:]
@@ -255,6 +259,7 @@ public actor HermesConnection {
             }
 
             gateway = client
+            sendsVoiceTurn = true
 
             // Subscribe before the capabilities round-trip below: `events()`
             // registers synchronously but `GatewayClient` does not buffer for
