@@ -21,15 +21,22 @@ private func directVoiceBaseURL(_ raw: String) -> URL? {
 public struct VoiceClientConfig: Sendable, Equatable {
     public var stt: DirectSTTConfig?
     public var tts: DirectTTSConfig?
+    /// `stt.streaming` — the host can transcribe live over
+    /// `/api/audio/transcribe-stream` (upstream 00adf69d92). Carried on relay
+    /// and direct verdicts alike: provider keys stay on the host, so it is
+    /// independent of `voice.client_direct`. False on older backends.
+    public var sttStreaming: Bool
 
     public init(json: JSONValue) {
         self.stt = (json["stt"]).flatMap(DirectSTTConfig.init(json:))
         self.tts = (json["tts"]).flatMap(DirectTTSConfig.init(json:))
+        self.sttStreaming = json["stt"]?["streaming"]?.boolValue == true
     }
 
-    public init(stt: DirectSTTConfig?, tts: DirectTTSConfig?) {
+    public init(stt: DirectSTTConfig?, tts: DirectTTSConfig?, sttStreaming: Bool = false) {
         self.stt = stt
         self.tts = tts
+        self.sttStreaming = sttStreaming
     }
 }
 
