@@ -130,6 +130,12 @@ extension HermesConnection {
     /// reply arrives only via events; never await this for completion. Set
     /// `interrupted` on the first submit after a barge-in so the backend
     /// prepends a "your spoken reply was cut off" note for the model.
+    ///
+    /// Every app turn is spoken, so it goes out with `voice_turn: true`: the
+    /// backend runs it on the `auxiliary.voice_chat` model with reasoning off
+    /// by default (upstream 6cc1efd8f9). Backends that predate the key reject
+    /// it with 4000 before the handler runs; the turn is retried once without
+    /// it and the key stays off for the rest of this gateway connection.
     public func submitPrompt(
         sessionID: String, text: String, interrupted: Bool = false
     ) async throws {
@@ -138,8 +144,17 @@ extension HermesConnection {
             "text": .string(text),
         ]
         if interrupted { params["interrupted"] = .bool(true) }
+        if sendsVoiceTurn { params["voice_turn"] = .bool(true) }
         // Desktop uses a 30-minute timeout here.
-        _ = try await request("prompt.submit", params: .object(params), timeout: 1800)
+        do {
+            _ = try await request("prompt.submit", params: .object(params), timeout: 1800)
+        } catch HermesError.rpcError(4000, let message, _)
+            where params["voice_turn"] != nil && message.contains("voice_turn")
+        {
+            sendsVoiceTurn = false
+            params["voice_turn"] = nil
+            _ = try await request("prompt.submit", params: .object(params), timeout: 1800)
+        }
     }
 
     /// Cancel the in-flight turn (used on barge-in while still generating).

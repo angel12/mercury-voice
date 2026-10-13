@@ -73,12 +73,14 @@ struct DirectVoiceRequestTests {
         try JSONDecoder().decode(JSONValue.self, from: Data(string.utf8))
     }
 
-    private func sttConfig(wire: String, model: String? = "m1") throws -> DirectSTTConfig {
+    private func sttConfig(
+        wire: String, model: String? = "m1", language: String? = "en"
+    ) throws -> DirectSTTConfig {
         var fields = """
             {"mode": "direct", "wire": "\(wire)", "provider": "p",
-             "base_url": "https://api.example.com/v1", "api_key": "sk-test",
-             "language": "en"
+             "base_url": "https://api.example.com/v1", "api_key": "sk-test"
             """
+        if let language { fields += #", "language": "\#(language)""# }
         if let model { fields += #", "model": "\#(model)""# }
         fields += "}"
         return try #require(DirectSTTConfig(json: json(fields)))
@@ -108,7 +110,32 @@ struct DirectVoiceRequestTests {
         #expect(request.url?.absoluteString == "https://api.example.com/v1/stt")
         let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
         #expect(body.contains("name=\"format\"\r\n\r\ntrue"))
+        #expect(body.contains("name=\"language\"\r\n\r\nen"))
         #expect(!body.contains("name=\"model\""))
+    }
+
+    /// Issue #148 (upstream d1152d797c): xAI answers 400 to `format=true`
+    /// without a language, so auto-detect sends neither.
+    @Test(arguments: [String?.none, ""])
+    func xaiAutoDetectOmitsFormatAndLanguage(language: String?) throws {
+        let config = try sttConfig(wire: "xai-stt", model: nil, language: language)
+        #expect(config.language == nil)
+        let request = DirectVoiceClient.sttRequest(
+            config: config, audio: Data("A".utf8), mimeType: "audio/wav", boundary: "BND")
+
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        #expect(!body.contains("name=\"format\""))
+        #expect(!body.contains("name=\"language\""))
+    }
+
+    /// Issue #148 (upstream 56b0f3cb55): voice-config pins the xAI model.
+    @Test func xaiRequestSendsPinnedModel() throws {
+        let config = try sttConfig(wire: "xai-stt", model: "grok-voice-transcribe-2.0")
+        let request = DirectVoiceClient.sttRequest(
+            config: config, audio: Data("A".utf8), mimeType: "audio/wav", boundary: "BND")
+
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        #expect(body.contains("name=\"model\"\r\n\r\ngrok-voice-transcribe-2.0"))
     }
 
     @Test func elevenLabsRequestUsesXiKeyAndFieldNames() throws {
