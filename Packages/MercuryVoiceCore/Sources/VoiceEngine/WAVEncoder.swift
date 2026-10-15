@@ -54,6 +54,13 @@ public enum WAVEncoder {
         data.append(contentsOf: Array("data".utf8))
         appendUInt32(&data, UInt32(dataSize))
 
+        data.append(pcm16LE(samples))
+        return data
+    }
+
+    /// Raw s16le samples, no header — the live transcription socket's wire.
+    static func pcm16LE(_ samples: [Float]) -> Data {
+        var data = Data(capacity: samples.count * 2)
         for sample in samples {
             let clamped = max(-1, min(1, sample))
             let value = Int16(clamped * 32767)

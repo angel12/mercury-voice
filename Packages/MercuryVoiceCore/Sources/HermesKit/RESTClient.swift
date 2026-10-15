@@ -169,6 +169,17 @@ public struct HermesRESTClient: Sendable {
         return endpoint.webSocketURL("/api/audio/speak-stream", query: query)
     }
 
+    /// ws(s) URL for the live transcription socket
+    /// (`/api/audio/transcribe-stream`). Build one per dial, like
+    /// `speakStreamURL`.
+    public func transcribeStreamURL(profile: String?) async throws -> URL {
+        var query = try await authenticator.webSocketAuthQuery()
+        if let profile, !profile.isEmpty {
+            query.append(URLQueryItem(name: "profile", value: profile))
+        }
+        return endpoint.webSocketURL("/api/audio/transcribe-stream", query: query)
+    }
+
     /// `POST /api/audio/tts-lease` — acquire (`active: true`) or release
     /// (`active: false`) the named surface's claim on the server-side TTS
     /// model, so the backend can warm it on acquire and unload it once no

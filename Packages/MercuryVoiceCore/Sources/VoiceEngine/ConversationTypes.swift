@@ -101,10 +101,15 @@ public protocol Transcribing: Sendable {
     /// capturing). Must return promptly — it runs on the listen path; any
     /// real work belongs in a task `transcribe` can wait for.
     func prepare() async
+    /// The listening mic just opened: start transcribing it live, or nil
+    /// when this transcriber can't. Must return promptly, like `prepare`.
+    /// Barge-in captures never stream — they arrive whole, with pre-roll.
+    func startLive() async -> (any LiveTranscribing)?
 }
 
 extension Transcribing {
     public func prepare() async {}
+    public func startLive() async -> (any LiveTranscribing)? { nil }
 }
 
 public enum SpeechStreamOutcome: Sendable, Equatable {

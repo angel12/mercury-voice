@@ -593,7 +593,7 @@ final class ConversationController {
             bargeMonitor: BargeInMonitor(capture: capture),
             transcriber: RestTranscriber(
                 rest: connection.rest, profile: profile, voiceConfig: voiceStore,
-                sttLease: sttLeaseName),
+                sttLease: sttLeaseName, liveCapture: capture),
             microphone: SystemMicrophoneAuthorization())
     }
 

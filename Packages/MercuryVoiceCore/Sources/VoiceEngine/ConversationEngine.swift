@@ -46,6 +46,9 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
     private var responseID: String?
     private var spokenSourceLength = 0
     private var speechSession: (any SpeechStreaming)?
+    /// The listening turn's live transcription (issue #150), from mic open
+    /// until the turn closes; nil when the transcriber can't stream.
+    private var liveTurn: (any LiveTranscribing)?
     /// The reply text being spoken this turn, kept for the self-echo check on
     /// barge captures (issue #12).
     private var spokenReplyText: String?
@@ -165,7 +168,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         speechTask = nil
         await dropSpeechSession()
         await speech.stopPlayback()
-        await recorder.cancel()
+        await cancelRecording()
         setStatus(.idle)
     }
 
@@ -186,7 +189,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             // cancelled recording.
             stopRequested = true
             clearTurnTimeout()
-            await recorder.cancel()
+            await cancelRecording()
             // handleTurn may have taken over during the await; leave the
             // status to it (it settles to idle when it consumes the latch).
             if status == .listening { setStatus(.idle) }
@@ -220,7 +223,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         muted.toggle()
         if muted {
             clearTurnTimeout()
-            await recorder.cancel()
+            await cancelRecording()
             await suspendBargeMonitor()
             if status == .listening { setStatus(.idle) } else { publishState() }
         } else {
@@ -238,7 +241,7 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         paused = newValue
         if paused {
             clearTurnTimeout()
-            await recorder.cancel()
+            await cancelRecording()
             await suspendBargeMonitor()
             if status == .listening { setStatus(.idle) } else { publishState() }
         } else {
@@ -312,10 +315,15 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         }
         // The engine may have been torn down while the mic was opening.
         guard enabled, !micBlocked else {
-            await recorder.cancel()
+            await cancelRecording()
             return
         }
         setStatus(.listening)
+        await cancelLiveTurn()
+        let live = await transcriber.startLive()
+        // A Stop, mute or turn close may have landed during the hop; a turn
+        // that no longer owns the mic must not keep streaming it.
+        if status == .listening { liveTurn = live } else { await live?.cancel() }
         await transcriber.prepare()
 
         // A stale hard-cap timer from an earlier cycle must never fire
@@ -333,6 +341,19 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
             guard !Task.isCancelled else { return }
             await self.turnTimerFired(generation: generation)
         }
+    }
+
+    /// Every way a listening turn is abandoned: the recording and its live
+    /// transcription go together.
+    private func cancelRecording() async {
+        await cancelLiveTurn()
+        await recorder.cancel()
+    }
+
+    private func cancelLiveTurn() async {
+        guard let live = liveTurn else { return }
+        liveTurn = nil
+        await live.cancel()
     }
 
     private func turnTimerFired(generation: Int) async {
@@ -405,10 +426,16 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
         clearTurnTimeout()
         setStatus(.transcribing)
         let epoch = lifetimeEpoch
+        let live = liveTurn
+        liveTurn = nil
         let result = await recorder.stop()
-        guard epoch == lifetimeEpoch else { return }
+        guard epoch == lifetimeEpoch else {
+            await live?.cancel()
+            return
+        }
 
         guard let result, result.heardSpeech || forceTranscribe else {
+            await live?.cancel()
             let stopped = consumeStopRequest()
             // Never heard speech — quietly re-arm (unless Stop landed while
             // the turn was closing; the user asked for quiet).
@@ -423,7 +450,11 @@ public actor ConversationEngine<C: Clock> where C.Duration == Duration {
 
         let transcript: String
         do {
-            transcript = try await transcriber.transcribe(result)
+            if let live {
+                transcript = try await live.finish(result)
+            } else {
+                transcript = try await transcriber.transcribe(result)
+            }
         } catch {
             guard epoch == lifetimeEpoch else { return }
             let stopped = consumeStopRequest()

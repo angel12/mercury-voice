@@ -328,11 +328,64 @@ final class FakeTranscriber: Transcribing, @unchecked Sendable {
         locked { _prepareCount += 1 }
     }
 
+    private var _transcribeCount = 0
+    /// Whole-utterance transcriptions (the non-live path).
+    var transcribeCount: Int { locked { _transcribeCount } }
+
     func transcribe(_ utterance: RecordedUtterance) async throws -> String {
         let next: Result<String, any Error> = locked {
-            results.isEmpty ? .success("") : results.removeFirst()
+            _transcribeCount += 1
+            return results.isEmpty ? .success("") : results.removeFirst()
         }
         return try next.get()
+    }
+
+    // MARK: Live (issue #150)
+
+    private var _liveEnabled = false
+    private var _liveTranscripts: [String] = []
+    private var _liveTurns: [FakeLiveTurn] = []
+    /// When set, every listening turn gets a live turn.
+    var liveEnabled: Bool {
+        get { locked { _liveEnabled } }
+        set { locked { _liveEnabled = newValue } }
+    }
+    var liveTurns: [FakeLiveTurn] { locked { _liveTurns } }
+
+    /// The next live turn's final transcript.
+    func queueLive(_ transcript: String) {
+        locked { _liveTranscripts.append(transcript) }
+    }
+
+    func startLive() async -> (any LiveTranscribing)? {
+        locked {
+            guard _liveEnabled else { return nil }
+            let turn = FakeLiveTurn(
+                transcript: _liveTranscripts.isEmpty ? "" : _liveTranscripts.removeFirst())
+            _liveTurns.append(turn)
+            return turn
+        }
+    }
+}
+
+final class FakeLiveTurn: LiveTranscribing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let transcript: String
+    private var _finished = false
+    private var _cancelled = false
+
+    init(transcript: String) { self.transcript = transcript }
+
+    var finished: Bool { lock.withLock { _finished } }
+    var cancelled: Bool { lock.withLock { _cancelled } }
+
+    func finish(_ utterance: RecordedUtterance) async throws -> String {
+        lock.withLock { _finished = true }
+        return transcript
+    }
+
+    func cancel() async {
+        lock.withLock { _cancelled = true }
     }
 }
 

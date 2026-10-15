@@ -59,6 +59,8 @@ public actor VoiceConfigStore {
 
     public func stt() async -> DirectSTTConfig? { await config()?.stt }
     public func tts() async -> DirectTTSConfig? { await config()?.tts }
+    /// Whether the host offers live transcription (`stt.streaming`).
+    public func sttStreaming() async -> Bool { await config()?.sttStreaming ?? false }
 
     /// Drop cached success/unsupported entries. An in-flight lookup that
     /// completes afterwards does not populate the cache; new lookups do not

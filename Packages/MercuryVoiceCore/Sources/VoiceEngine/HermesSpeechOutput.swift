@@ -143,6 +143,9 @@ public actor HermesSpeechOutput: SpeechPlaying {
 
 /// The real `Transcribing`: provider-direct when the gateway hands out a
 /// client-callable STT config, `POST /api/audio/transcribe` relay otherwise.
+/// Given the mic, listening turns are also streamed live to the host's
+/// `/api/audio/transcribe-stream` when it advertises `stt.streaming`, with
+/// the above as the fallback (issue #150).
 /// Empty transcript = silence (success). A direct provider REJECTION throws
 /// rather than silently relaying — the configured provider said no, and
 /// re-running the same request through the gateway would just fail again
@@ -154,17 +157,39 @@ public struct RestTranscriber: Transcribing {
     private let direct = DirectVoiceClient()
     /// nil without a lease name: no warm-up, as before issue #146.
     private let warmup: STTWarmup?
+    /// nil without a mic to tap: no live transcription.
+    private let liveCapture: (any AudioCaptureStreaming)?
+    private let liveConnect: @Sendable () async -> (any LiveSTTSocket)?
 
     /// `sttLease` names this surface's `POST /api/audio/stt-lease` claim
     /// (one per conversation); the owner releases it when the conversation
-    /// ends.
+    /// ends. `liveCapture` is the mic the listening turns stream from.
     public init(
         rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore? = nil,
-        sttLease: String? = nil
+        sttLease: String? = nil, liveCapture: AudioCaptureService? = nil
+    ) {
+        self.init(
+            rest: rest, profile: profile, voiceConfig: voiceConfig, sttLease: sttLease,
+            liveCapture: liveCapture as (any AudioCaptureStreaming)?,
+            liveConnect: {
+                guard await voiceConfig?.sttStreaming() == true,
+                    let url = try? await rest.transcribeStreamURL(profile: profile)
+                else { return nil }
+                return URLSessionLiveSTTSocket(url: url)
+            })
+    }
+
+    /// Test seam: inject the mic and the live socket.
+    init(
+        rest: HermesRESTClient, profile: String?, voiceConfig: VoiceConfigStore?,
+        sttLease: String?, liveCapture: (any AudioCaptureStreaming)?,
+        liveConnect: @escaping @Sendable () async -> (any LiveSTTSocket)?
     ) {
         self.rest = rest
         self.profile = profile
         self.voiceConfig = voiceConfig
+        self.liveCapture = liveCapture
+        self.liveConnect = liveConnect
         self.warmup = sttLease.map { lease in
             STTWarmup(
                 // Client-direct STT never touches the backend's model.
@@ -175,6 +200,20 @@ public struct RestTranscriber: Transcribing {
 
     public func prepare() async {
         await warmup?.start()
+    }
+
+    public func startLive() async -> (any LiveTranscribing)? {
+        guard let liveCapture else { return nil }
+        let voiceConfig = voiceConfig
+        let turn = LiveTranscriptionTurn(
+            capture: liveCapture,
+            connect: liveConnect,
+            // Only a direct verdict carries the filter; the host's streaming
+            // path does not apply it either.
+            filter: { await voiceConfig?.stt()?.hallucinationFilter },
+            fallback: { try await self.transcribe($0) })
+        await turn.begin()
+        return turn
     }
 
     public func transcribe(_ utterance: RecordedUtterance) async throws -> String {
