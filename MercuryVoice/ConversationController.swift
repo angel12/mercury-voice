@@ -945,6 +945,9 @@ final class ConversationController {
         GatewayEvent.Kind.approvalRequest,
         GatewayEvent.Kind.clarifyRequest,
         GatewayEvent.Kind.clarifyExpire,
+        // Session authority (v0.23): a prompt resolved anywhere.
+        GatewayEvent.Kind.approvalSettled,
+        GatewayEvent.Kind.clarifySettled,
         // Contract ≥ 7 (issue #125): the same two sheets, raised as
         // server→client requests and withdrawn by `request.cancel`.
         GatewayEvent.Kind.serverRequest,
@@ -1023,6 +1026,30 @@ final class ConversationController {
         case GatewayEvent.Kind.clarifyExpire:
             if clarify?.requestID == event.payload["request_id"]?.stringValue {
                 clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+            }
+
+        case GatewayEvent.Kind.clarifySettled:
+            // Session authority (v0.23): another viewer, an interrupt or the
+            // timeout resolved this prompt. `prompt_id` is the request id the
+            // authority's `clarify.request` carried, so only that sheet goes.
+            if let promptID = event.payload["prompt_id"]?.stringValue,
+                clarify?.requestID == promptID
+            {
+                clarify = nil
+                promptSendError = nil
+                resumeIfUnprompted()
+            }
+
+        case GatewayEvent.Kind.approvalSettled:
+            // Same, for an approval: matched by `prompt_id`, which is the
+            // authority's `approval.request` id (`ApprovalRequest.requestID`).
+            if let promptID = event.payload["prompt_id"]?.stringValue,
+                approval?.requestID == promptID
+            {
+                approval = nil
+                approvalEpoch += 1
                 promptSendError = nil
                 resumeIfUnprompted()
             }
@@ -1865,7 +1892,7 @@ final class ConversationController {
                 _ = try await $0.answerServerRequest(
                     id: serverRequestID, result: .object(["choice": .string(choice)]))
             } else {
-                try await $0.respondApproval(sessionID: request.sessionID, choice: choice)
+                try await $0.respondApproval(request, choice: choice)
             }
         } onConfirmed: { [weak self] in
             guard let self, self.approvalEpoch == epoch else { return }
@@ -1886,7 +1913,7 @@ final class ConversationController {
                 _ = try await $0.answerServerRequest(
                     id: serverRequestID, result: .object(["answer": .string(answer)]))
             } else {
-                try await $0.respondClarify(requestID: requestID, answer: answer)
+                try await $0.respondClarify(request, answer: answer)
             }
         } onConfirmed: { [weak self] in
             guard let self, self.clarify?.requestID == requestID else { return }

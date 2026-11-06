@@ -201,16 +201,18 @@ final class ScriptedSessionService: SessionServicing, @unchecked Sendable {
         return .closed
     }
 
-    func respondApproval(sessionID: String, choice: String) async throws {
+    func respondApproval(_ approval: ApprovalRequest, choice: String) async throws {
         lock.withLock {
-            _promptResponses.append(.approvalRespond(sessionID: sessionID, choice: choice))
+            _promptResponses.append(
+                .approvalRespond(sessionID: approval.sessionID, choice: choice))
         }
         if let promptResponseGate { await promptResponseGate.arrive() }
     }
 
-    func respondClarify(requestID: String, answer: String) async throws {
+    func respondClarify(_ clarify: ClarifyRequest, answer: String) async throws {
         lock.withLock {
-            _promptResponses.append(.clarifyRespond(requestID: requestID, answer: answer))
+            _promptResponses.append(
+                .clarifyRespond(requestID: clarify.requestID, answer: answer))
         }
         if let promptResponseGate { await promptResponseGate.arrive() }
     }

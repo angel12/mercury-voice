@@ -48,6 +48,18 @@ public actor HermesConnection {
     /// (see `submitPrompt`); re-armed on every new gateway connection, since
     /// the backend may have been upgraded in between.
     var sendsVoiceTurn = true
+    /// The current socket landed on a v0.23 session authority (its
+    /// `gateway.ready` said so); session calls then go out in the canonical
+    /// shapes (`AuthorityWire`). Re-read on every new gateway connection.
+    var speaksSessionAuthority = false
+    /// Session authority: this socket's `subscription_id` per session, from
+    /// create/resume, which `session.detach` must name. Subscriptions die
+    /// with the socket, so this is cleared on every new connection.
+    var authoritySubscriptions: [String: String] = [:]
+    /// Session authority: the newest `execution_generation` seen per session
+    /// (create/resume/submit results and event frames), which
+    /// `session.interrupt` is fenced by.
+    var executionGenerations: [String: Int] = [:]
     private var reconnectPoke: CheckedContinuation<Void, Never>?
     private var backoffTimer: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<Update>.Continuation] = [:]
@@ -156,6 +168,12 @@ public actor HermesConnection {
         return try await gateway.request(method, params: params, timeout: timeout)
     }
 
+    /// Keep the newest generation per session; frames and results can
+    /// arrive out of order relative to each other.
+    func noteExecutionGeneration(_ generation: Int, for sessionID: String) {
+        executionGenerations[sessionID] = max(executionGenerations[sessionID] ?? generation, generation)
+    }
+
     /// `replay_epoch` from the current socket's `gateway.ready`; nil while
     /// disconnected or against a backend without the replay contract.
     public var replayEpoch: String? {
@@ -260,6 +278,8 @@ public actor HermesConnection {
 
             gateway = client
             sendsVoiceTurn = true
+            speaksSessionAuthority = await client.sessionAuthority
+            authoritySubscriptions = [:]
 
             // Subscribe before the capabilities round-trip below: `events()`
             // registers synchronously but `GatewayClient` does not buffer for
@@ -318,6 +338,9 @@ public actor HermesConnection {
             for await event in events {
                 if let supervisorCheckpoint { await supervisorCheckpoint(.eventReceived) }
                 if !ownsSupervisor(lifetime) { break }
+                if let sessionID = event.sessionID, let generation = event.executionGeneration {
+                    noteExecutionGeneration(generation, for: sessionID)
+                }
                 publish(.event(event))
             }
             if let supervisorCheckpoint { await supervisorCheckpoint(.eventsEnded) }

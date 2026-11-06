@@ -43,6 +43,12 @@ extension HermesConnection {
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
         if let title, !title.isEmpty { params["title"] = .string(title) }
 
+        if speaksSessionAuthority {
+            let result = try await request(
+                "session.create", params: .object(AuthorityWire.createParams(params)))
+            return try adoptAuthoritySnapshot(result, method: "session.create")
+        }
+
         let result: JSONValue
         do {
             result = try await request("session.create", params: .object(params))
@@ -54,6 +60,25 @@ extension HermesConnection {
         }
         guard let handle = SessionHandle(result: result) else {
             throw HermesError.malformedResponse("session.create returned no session_id")
+        }
+        return handle
+    }
+
+    /// A canonical create/resume snapshot: remember this socket's
+    /// subscription and the session's generation, then hand the rest of the
+    /// app the legacy payload shape it decodes.
+    private func adoptAuthoritySnapshot(
+        _ result: JSONValue, method: String
+    ) throws -> SessionHandle {
+        let normalized = AuthorityWire.legacySnapshot(result)
+        guard let handle = SessionHandle(result: normalized) else {
+            throw HermesError.malformedResponse("\(method) returned no session_id")
+        }
+        if let subscription = result["subscription_id"]?.stringValue, !subscription.isEmpty {
+            authoritySubscriptions[handle.runtimeID] = subscription
+        }
+        if let generation = result["execution_generation"]?.intValue {
+            noteExecutionGeneration(generation, for: handle.runtimeID)
         }
         return handle
     }
@@ -80,7 +105,15 @@ extension HermesConnection {
         ]
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
 
-        let result = try await request("session.resume", params: .object(params), timeout: 120)
+        let raw = try await request("session.resume", params: .object(params), timeout: 120)
+        let result: JSONValue
+        if speaksSessionAuthority {
+            // The canonical resume tolerates every flag above as sent.
+            result = AuthorityWire.legacySnapshot(raw)
+            _ = try adoptAuthoritySnapshot(raw, method: "session.resume")
+        } else {
+            result = raw
+        }
         guard var handle = SessionHandle(result: result) else {
             throw HermesError.malformedResponse("session.resume returned no session_id")
         }
@@ -112,7 +145,24 @@ extension HermesConnection {
     /// `session.resume` just did.
     ///
     /// Throws on a backend without the method, and on any malformed payload.
+    ///
+    /// A session authority serves no `session.activate`; there the same
+    /// re-read is a `session.resume` on this socket (`AuthorityWire`), whose
+    /// snapshot is mapped onto the live-session payload shape.
     public func activateSession(sessionID: String) async throws -> LiveSessionSnapshot {
+        if speaksSessionAuthority {
+            let raw = try await request(
+                "session.resume", params: AuthorityWire.activateParams(sessionID: sessionID),
+                timeout: 120)
+            let handle = try adoptAuthoritySnapshot(raw, method: "session.resume")
+            guard handle.runtimeID == sessionID,
+                let snapshot = LiveSessionSnapshot(result: AuthorityWire.legacySnapshot(raw))
+            else {
+                throw HermesError.malformedResponse(
+                    "session.resume did not return a live-session payload")
+            }
+            return snapshot
+        }
         let result = try await request(
             "session.activate",
             params: [
@@ -144,6 +194,20 @@ extension HermesConnection {
             "text": .string(text),
         ]
         if interrupted { params["interrupted"] = .bool(true) }
+        if speaksSessionAuthority {
+            // The authority knows voice_turn, so there is no retry to make;
+            // the submission id is what makes the admission idempotent.
+            params["voice_turn"] = .bool(true)
+            let receipt = try await request(
+                "prompt.submit",
+                params: .object(
+                    AuthorityWire.submitParams(params, submissionID: UUID().uuidString)),
+                timeout: 1800)
+            if let generation = receipt["execution_generation"]?.intValue {
+                noteExecutionGeneration(generation, for: sessionID)
+            }
+            return
+        }
         if sendsVoiceTurn { params["voice_turn"] = .bool(true) }
         // Desktop uses a 30-minute timeout here.
         do {
@@ -158,7 +222,23 @@ extension HermesConnection {
     }
 
     /// Cancel the in-flight turn (used on barge-in while still generating).
+    ///
+    /// A session authority fences it by `execution_generation`: the newest
+    /// one this connection has seen for the session goes with it.
     public func interruptSession(sessionID: String) async throws {
+        if speaksSessionAuthority {
+            guard let generation = executionGenerations[sessionID] else {
+                throw HermesError.malformedResponse(
+                    "no execution_generation known for \(sessionID); cannot interrupt")
+            }
+            let handle = try await request(
+                "session.interrupt",
+                params: AuthorityWire.interruptParams(sessionID: sessionID, generation: generation))
+            if let next = handle["execution_generation"]?.intValue {
+                noteExecutionGeneration(next, for: sessionID)
+            }
+            return
+        }
         _ = try await request("session.interrupt", params: ["session_id": .string(sessionID)])
     }
 
@@ -166,8 +246,15 @@ extension HermesConnection {
     /// an unconfirmed or failed close means the backend may still hold the
     /// session's sockets and profile DB handles. Every outcome is logged so
     /// leak investigations don't have to guess whether End reached the server.
+    ///
+    /// A session authority serves no `session.close`: leaving is
+    /// `session.detach` of this socket's subscription, confirmed by
+    /// `detached: true`. The session itself stays the owner's to keep.
     @discardableResult
     public func closeSession(sessionID: String) async -> SessionCloseOutcome {
+        if speaksSessionAuthority {
+            return await detachSession(sessionID: sessionID)
+        }
         do {
             let result = try await request(
                 "session.close", params: ["session_id": .string(sessionID)])
@@ -184,6 +271,34 @@ extension HermesConnection {
             let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
             Self.logger.error(
                 "session.close failed for \(sessionID, privacy: .public): \(reason, privacy: .public)"
+            )
+            return .failed(reason)
+        }
+    }
+
+    private func detachSession(sessionID: String) async -> SessionCloseOutcome {
+        guard let subscription = authoritySubscriptions[sessionID] else {
+            Self.logger.error(
+                "session.detach skipped for \(sessionID, privacy: .public): no subscription on this socket")
+            return .failed("no subscription on this socket")
+        }
+        do {
+            let result = try await request(
+                "session.detach",
+                params: AuthorityWire.detachParams(sessionID: sessionID, subscriptionID: subscription))
+            authoritySubscriptions[sessionID] = nil
+            if result["detached"]?.truthy == true {
+                Self.logger.info("session.detach confirmed for \(sessionID, privacy: .public)")
+                return .closed
+            }
+            Self.logger.error(
+                "session.detach NOT confirmed for \(sessionID, privacy: .public): \("\(result)", privacy: .public)"
+            )
+            return .unconfirmed
+        } catch {
+            let reason = (error as? HermesError)?.errorDescription ?? "\(error)"
+            Self.logger.error(
+                "session.detach failed for \(sessionID, privacy: .public): \(reason, privacy: .public)"
             )
             return .failed(reason)
         }
@@ -247,10 +362,29 @@ extension HermesConnection {
     /// Contract-6 backends only — an `ApprovalRequest` with a
     /// `serverRequestID` came from a contract ≥ 7 server request and must be
     /// answered with `answerServerRequest` instead.
-    public func respondApproval(sessionID: String, choice: String) async throws {
+    ///
+    /// On a session authority the response names the prompt instead:
+    /// `{session_id, execution_generation, prompt_id, choice}`, with the
+    /// prompt's own id and generation.
+    public func respondApproval(_ approval: ApprovalRequest, choice: String) async throws {
+        if speaksSessionAuthority {
+            guard let promptID = approval.requestID,
+                let generation = approval.executionGeneration
+                    ?? executionGenerations[approval.sessionID]
+            else {
+                throw HermesError.malformedResponse(
+                    "approval has no prompt_id/execution_generation to answer")
+            }
+            _ = try await request(
+                "approval.respond",
+                params: AuthorityWire.approvalParams(
+                    sessionID: approval.sessionID, generation: generation,
+                    promptID: promptID, choice: choice))
+            return
+        }
         _ = try await request(
             "approval.respond",
-            params: ["session_id": .string(sessionID), "choice": .string(choice)])
+            params: ["session_id": .string(approval.sessionID), "choice": .string(choice)])
     }
 
     /// `clarify.respond` — empty answer = skip. A late respond after expiry
@@ -258,10 +392,27 @@ extension HermesConnection {
     /// only — a `ClarifyRequest` with a `serverRequestID` came from a
     /// contract ≥ 7 server request and must be answered with
     /// `answerServerRequest` instead.
-    public func respondClarify(requestID: String, answer: String) async throws {
+    ///
+    /// On a session authority: `{session_id, execution_generation,
+    /// prompt_id, answer}`, the prompt id being `requestID`.
+    public func respondClarify(_ clarify: ClarifyRequest, answer: String) async throws {
+        if speaksSessionAuthority {
+            guard let sessionID = clarify.sessionID,
+                let generation = clarify.executionGeneration ?? executionGenerations[sessionID]
+            else {
+                throw HermesError.malformedResponse(
+                    "clarify has no session_id/execution_generation to answer")
+            }
+            _ = try await request(
+                "clarify.respond",
+                params: AuthorityWire.clarifyParams(
+                    sessionID: sessionID, generation: generation,
+                    promptID: clarify.requestID, answer: answer))
+            return
+        }
         _ = try await request(
             "clarify.respond",
-            params: ["request_id": .string(requestID), "answer": .string(answer)])
+            params: ["request_id": .string(clarify.requestID), "answer": .string(answer)])
     }
 
     /// `request.answer {id, result}` — answers an open server→client request

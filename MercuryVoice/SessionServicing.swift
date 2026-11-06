@@ -32,8 +32,8 @@ protocol SessionServicing: Sendable {
     @discardableResult
     func closeSession(sessionID: String) async -> SessionCloseOutcome
 
-    func respondApproval(sessionID: String, choice: String) async throws
-    func respondClarify(requestID: String, answer: String) async throws
+    func respondApproval(_ approval: ApprovalRequest, choice: String) async throws
+    func respondClarify(_ clarify: ClarifyRequest, answer: String) async throws
     func answerServerRequest(id: String, result: JSONValue) async throws -> ServerRequestAnswer
 
     /// `POST /api/audio/tts-lease` (contract ≥ 7) — acquire/release this
