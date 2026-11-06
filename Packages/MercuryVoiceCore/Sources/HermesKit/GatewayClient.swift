@@ -76,6 +76,11 @@ public actor GatewayClient {
     public private(set) var closeCause: CloseCause = .other
     /// `replay_epoch` from this socket's `gateway.ready` (nil on old backends).
     public private(set) var replayEpoch: String?
+    /// This socket's `gateway.ready` said `session_authority: true` (v0.23+):
+    /// it landed on the gateway's own listener, whose session verbs speak the
+    /// canonical `hermes-gateway-v1` wire (`AuthorityWire`). Always false
+    /// against standalone `hermes serve`.
+    public private(set) var sessionAuthority = false
     /// This socket's backend counts a 4404 as one client abstaining rather
     /// than as the answer (`client.capabilities` → `declines_not_shown`,
     /// upstream e33f1a0faf). Only then is a window-owned bridge declined.
@@ -443,6 +448,7 @@ public actor GatewayClient {
                 // Seq numbering identity for the WS replay contract; a later
                 // mismatch on session.events.since means the backend restarted.
                 replayEpoch = event.payload["replay_epoch"]?.stringValue
+                sessionAuthority = event.payload["session_authority"]?.boolValue == true
                 if state == .connecting {
                     state = .ready
                     for cont in readyWaiters { cont.resume() }
